@@ -128,6 +128,12 @@ uv run asr equiv <trial>/agent/sessions/projects/<slug>/<sid>.jsonl <cut_line> \
 With `--fake`, the resume proxy answers every request with `end_turn` and logs the raw and rewritten first request.
 No key is needed and no model is called.
 
+Use `--original-trial-dir <trial>` so the resumed agent gets the same non-secret env and kwargs as the original run.
+If the original config used `${VAR}` templates (for example `CLAUDE_CODE_MAX_OUTPUT_TOKENS`), `launch` fills them from
+your shell or drops them with a warning. Pass the original value with `--agent-env VAR=value`, otherwise request
+parameters such as `max_tokens` differ from the original run. Compare the whole first request, not only `equiv`
+(which checks the message prefix).
+
 ### 5. Real resume
 
 ```bash

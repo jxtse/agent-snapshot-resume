@@ -57,6 +57,8 @@ uv run asr launch --bundle bundles/<run_id> --task-dir <task 目录> --snapshot-
 uv run asr sandboxes; uv run asr sandboxes --kill-id <id>; uv run asr delete-snapshot <snapshot_id>
 ```
 
+`launch` 建议加 `--original-trial-dir <原 trial 目录>`，让续跑的 agent 沿用原始运行中不含密钥的 env 和 kwargs。原配置里 `${VAR}` 形式的值（例如 `CLAUDE_CODE_MAX_OUTPUT_TOKENS`）会从当前 shell 读取，读不到就丢弃并给出警告。这时要用 `--agent-env VAR=值` 补上原值，否则 `max_tokens` 这类请求参数会和原始运行不同。`equiv` 只检查消息前缀，参数是否一致要另外对比整条首请求。
+
 选 k 时看 `bundle.json` 里的 `resume_cost`:`bg_inflight` 和 `subagents_inflight` 最好都是 0,也就是第 k 步时没有还在跑的后台任务和子 agent。
 
 ## 配置项
