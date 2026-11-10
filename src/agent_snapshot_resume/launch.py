@@ -54,11 +54,30 @@ def original_agent_settings(trial_dir: str | None) -> tuple[dict[str, str], dict
     return env, kwargs
 
 
+def check_shared_snapshot(source: dict[str, Any], bundle: Path) -> None:
+    """Allow a snapshot prepared from another bundle only if both bundles cut the same trial at the same point with
+    the same replay plan (snapshot_cut_identity); otherwise refuse."""
+    from .bundle import snapshot_cut_identity
+
+    mine = snapshot_cut_identity(bundle)
+    theirs = source.get("cut_identity")
+    if theirs is None and source.get("bundle") and (Path(source["bundle"]) / "bundle.json").is_file():
+        theirs = snapshot_cut_identity(Path(source["bundle"]))
+    if theirs != mine:
+        raise SystemExit("snapshot state was prepared from a different bundle (cut identity differs)")
+    if source.get("agent_version") and mine.get("agent_version_orig") and \
+            source["agent_version"] != mine["agent_version_orig"]:
+        raise SystemExit(f"snapshot has agent {source['agent_version']}, bundle needs {mine['agent_version_orig']}")
+    print(f"note: sharing snapshot {source.get('snapshot_id')} prepared from bundle {source['run_id']} "
+          "(identical cut identity)", file=sys.stderr)
+
+
 def build_job_config(*, adapter, bundle: Path, task_dir: Path, job_name: str, jobs_dir: Path,
                      snapshot_state: Path | None = None, snapshot_id: str | None = None, fake: bool = False,
                      verifier: bool = True, model: str | None = None, upstream_url: str | None = None,
                      extra_env: dict[str, str] | None = None, extra_kwargs: dict[str, Any] | None = None,
-                     original_trial_dir: str | None = None, setup_timeout_s: float = 1200.0) -> dict[str, Any]:
+                     original_trial_dir: str | None = None, setup_timeout_s: float = 1200.0,
+                     passthrough_args: list[str] | None = None) -> dict[str, Any]:
     bundle, meta = load_bundle(bundle)
     bundle = bundle.resolve()
     task_dir = task_dir.resolve()
@@ -72,7 +91,7 @@ def build_job_config(*, adapter, bundle: Path, task_dir: Path, job_name: str, jo
         if not source.get("snapshot_id") or not source.get("replay_gate_passed"):
             raise SystemExit("snapshot source has not passed the replay gates")
         if source.get("run_id") and source["run_id"] != meta["run_id"]:
-            raise SystemExit("snapshot state was prepared from a different bundle")
+            check_shared_snapshot(source, bundle)
         hashes = verifier_hashes(task_dir)
         env_kwargs.update(snapshot_id=source["snapshot_id"], expected_fingerprint=source["fingerprint_source"],
                           fingerprint_command=source.get("fingerprint_command"),
@@ -89,6 +108,9 @@ def build_job_config(*, adapter, bundle: Path, task_dir: Path, job_name: str, jo
     upstream_url = upstream_url or config.upstream_url()
     kwargs = {**orig_kwargs, **(extra_kwargs or {}), "version": meta.get("agent_version_orig") or adapter.version,
               "resume_bundle": str(bundle), "upstream_fake": bool(fake)}
+    if passthrough_args:
+        from .proxy.runtime import validate_passthrough_args
+        kwargs["passthrough_args"] = validate_passthrough_args(passthrough_args)
     agent: dict[str, Any] = {"import_path": adapter.harbor_import_path,
                              "model_name": model or config.model_override() or meta.get("model"),
                              "override_timeout_sec": float(meta["agent_budget_s"]),

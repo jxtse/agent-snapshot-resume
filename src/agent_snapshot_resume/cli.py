@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shlex
 import sys
 from pathlib import Path
 
@@ -94,7 +95,8 @@ def cmd_launch(a):
                            jobs_dir=Path(a.jobs_dir), snapshot_state=Path(a.snapshot_state) if a.snapshot_state else None,
                            snapshot_id=a.snapshot_id, fake=a.fake, verifier=not a.no_verifier, model=a.model,
                            upstream_url=a.upstream_url, extra_env=_kv(a.agent_env),
-                           original_trial_dir=a.original_trial_dir or meta.get("trial_dir"))
+                           original_trial_dir=a.original_trial_dir or meta.get("trial_dir"),
+                           passthrough_args=shlex.split(a.passthrough_args) if a.passthrough_args else None)
     validate_job_config(cfg)
     runs = Path(a.runs_dir) / job
     runs.mkdir(parents=True, exist_ok=True)
@@ -226,6 +228,8 @@ def build_parser():
     p.add_argument("--upstream-url", help="default: ASR_UPSTREAM_URL")
     p.add_argument("--original-trial-dir", help="copy non-secret agent env/kwargs from <trial>/config.json")
     p.add_argument("--agent-env", action="append", metavar="KEY=VALUE", help="extra non-secret agent env (repeatable)")
+    p.add_argument("--passthrough-args", help="extra in-sandbox passthrough proxy flags, e.g. "
+                   "'--drop-fields metadata --strip-is-error' (whitelisted)")
     p.add_argument("--fake", action="store_true", help="resume proxy answers end_turn; no model call, no key")
     p.add_argument("--no-verifier", action="store_true")
     p.add_argument("--dry-run", action="store_true", help="write and print job.json, do not start Harbor")

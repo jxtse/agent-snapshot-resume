@@ -147,8 +147,10 @@ class SnapshotResumeAgentMixin:
                 raise RuntimeError(f"{config.UPSTREAM_KEY_ENV} is not set in the Harbor process environment")
             # The key travels only as the env of this single exec (redacted by Harbor's logger: name contains KEY)
             # and from there into the proxy over a pipe. See proxy/runtime.py.
-            await self.exec_as_root(environment, command=runtime.passthrough_start_command(url, self.PASSTHROUGH_PORT),
-                                    env={runtime.KEY_ENV_IN_SANDBOX: key})
+            extra = runtime.validate_passthrough_args(getattr(self.options, "passthrough_args", None) or [])
+            await self.exec_as_root(environment, command=runtime.passthrough_start_command(
+                url, self.PASSTHROUGH_PORT, extra=" ".join(shlex.quote(x) for x in extra)),
+                env={runtime.KEY_ENV_IN_SANDBOX: key})
         resume_proxy = Path(runtime.HERE / "resume_proxy.py")
         await self.exec_as_root(environment, command=f"mkdir -p {runtime.PROXY_DIR}/resume/specs")
         await environment.upload_file(resume_proxy, f"{runtime.PROXY_DIR}/resume/resume_proxy.py")
@@ -156,6 +158,7 @@ class SnapshotResumeAgentMixin:
         await self.exec_as_root(environment, command=runtime.resume_start_command(self.RESUME_PORT))
         (logs / "setup.json").write_text(json.dumps({
             "proxies_s": round(time.time() - t0, 1),
+            "passthrough_args": getattr(self.options, "passthrough_args", None) or [],
             "resume_proxy_sha256": hashlib.sha256(resume_proxy.read_bytes()).hexdigest(),
             "upstream_fake": bool(self.options.upstream_fake)}, indent=1))
 

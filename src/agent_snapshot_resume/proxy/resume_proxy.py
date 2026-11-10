@@ -127,6 +127,10 @@ def rewrite(body, spec):
         acts.append(f"drop_post_sentinel_msgs:{e - s - 1}")
     new = msgs[:lo] + msgs[e:]
     acts.append(f"drop_sentinel_user@{s}")
+    # Claude Code puts a prompt-cache breakpoint on the last block of the last message. At resume time that is a
+    # dropped resume-time block (2.1.280: the post-sentinel environment/date note; 2.1.207: the sentinel turn), so
+    # carry it to the last block of the new last message, as the original run's request at step k had it.
+    removed_cc = [b["cache_control"] for m in msgs[lo:e] for b in _blocks(m) if isinstance(b, dict) and "cache_control" in b]
     tgt = lo - 1
     # CC can retain historical system reminders between tool results and resume scaffolding.
     # Keep those messages, but reach the adjacent user result to remove only the exact synthetic cue.
@@ -144,6 +148,13 @@ def rewrite(body, spec):
     elif spec.get("mode") == "hint" and spec.get("hint"):
         new.insert(lo, {"role": "user", "content": [{"type": "text", "text": f"<system-reminder>\n{spec['hint']}\n</system-reminder>"}]})
         acts.append("inject_hint_new_msg")
+    if removed_cc and new and not any("cache_control" in b for b in _blocks(new[-1]) if isinstance(b, dict)):
+        last = new[-1]
+        bl = [dict(b) for b in _blocks(last)]
+        if bl:
+            bl[-1]["cache_control"] = removed_cc[-1]
+            new[-1] = dict(last, content=bl)
+            acts.append("move_cache_breakpoint")
     if spec.get("pin_date") and new:
         bl = _blocks(new[0])
         for b in bl:

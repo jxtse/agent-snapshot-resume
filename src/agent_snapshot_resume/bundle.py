@@ -53,6 +53,20 @@ def sentinel_for(run_id: str) -> str:
     return SENTINEL_PREFIX + hashlib.sha1(run_id.encode()).hexdigest()[:10]
 
 
+def snapshot_cut_identity(bundle_dir: Path) -> dict[str, Any]:
+    """What a step-k environment snapshot depends on. Bundles with equal identity (e.g. the mode=same and mode=hint
+    bundles of one trial at one k) can share one snapshot: the replay plan, cut, fingerprint roots and agent version
+    are identical; only the session seed / proxy spec (uploaded at launch, not part of the snapshot) differ."""
+    bundle_dir = Path(bundle_dir)
+    meta = json.loads((bundle_dir / "bundle.json").read_text())
+    return {"trial": meta["trial"], "session_sha256": meta["session_sha256"], "cut_line": meta["cut_line"],
+            "resume_atif_step": meta["resume_atif_step"], "agent": meta.get("agent"),
+            "agent_version_orig": meta.get("agent_version_orig"), "fingerprint_roots": meta.get("fingerprint_roots"),
+            "fingerprint_optional_roots": meta.get("fingerprint_optional_roots"),
+            "plan_sha256": hashlib.sha256((bundle_dir / "plan.json").read_bytes()).hexdigest(),
+            "replay_reviewed_exceptions": meta.get("replay_reviewed_exceptions") or {}}
+
+
 def build(*, adapter, trial_dir: Path, atif_step: int, out: Path, mode: str = "same", hint: str | None = None,
           agent_timeout: float | None = None, task_dir: Path | None = None, run_id: str | None = None,
           model: str | None = None, pin_date: bool = True, fingerprint_roots: list[str] | None = None,

@@ -1,4 +1,4 @@
-"""Claude Code adapter (validated with Claude Code 2.1.207, linux-x64).
+"""Claude Code adapter (validated with Claude Code 2.1.207 and 2.1.280, linux-x64).
 
 Host side: `ClaudeCodeAdapter` (session discovery, IR, truncation point, aux files, pinned install).
 Sandbox side: `ClaudeCodeSnapshotResume`, a Harbor agent. Job config:
@@ -14,8 +14,14 @@ What `claude --resume <sid> --print <prompt>` (2.1.207) adds to the model contex
   * sometimes resume-time system notes after the prompt (e.g. "<file> was modified" when the replay changed a file
     Claude Code had cached).
 Claude Code persists these into the session, so they recur on every later request; the proxy rewrites every request.
+2.1.280 (checked with --fake runs against the original runs' proxy logs) injects the same two texts, plus a system
+message after the sentinel turn ("# Environment ... Shell ... OS Version ... <total_tokens> ... The date has changed.
+Today's date is now <today>") that carries the request's trailing prompt-cache breakpoint. The proxy drops that
+message (post-sentinel rule) and moves the breakpoint to the new last message; the rewritten first request then has
+the same byte length as the original run's request at step k (metadata dropped, as by the original route's proxy).
 Do not use a different Claude Code version than the original run: 2.1.280, for example, resumes a 2.1.207 session
 but exposes a different tool list (no TaskCreate/TaskUpdate/TaskList, adds ListAgents), so the context changes.
+The version comes from the bundle (agent_version_orig); prepare-snapshot installs that version by default.
 """
 from __future__ import annotations
 
@@ -35,7 +41,8 @@ from .base import AgentAdapter, SnapshotResumeAgentMixin, bounded_remote_command
 
 # sha256 of the official linux-x64 binary, from
 # https://downloads.claude.ai/claude-code-releases/<version>/manifest.json (platforms.linux-x64.checksum)
-CC_SHA256 = {"2.1.207": "85e7e988a392d859f90802ca21fb26e89d3c9ab527f5ed0b08df3955e34d5c83"}
+CC_SHA256 = {"2.1.207": "85e7e988a392d859f90802ca21fb26e89d3c9ab527f5ed0b08df3955e34d5c83",
+             "2.1.280": "1e08503dbdf3c2cb0d706d32f3408277388d1c76ef108673e8fe42c1b322925b"}
 CC_DEFAULT_VERSION = "2.1.207"
 CONTINUE_TXT = "Continue from where you left off."
 SYNTH_TXT = "No response requested."
@@ -222,6 +229,9 @@ class ClaudeCodeSnapshotResumeOptions(ClaudeCodeOptions):
     resume_bundle: str | None = Field(default=None)
     upstream_fake: bool = Field(default=False)
     upstream_url: str | None = Field(default=None)
+    # Extra flags for the in-sandbox passthrough proxy, e.g. ["--drop-fields", "metadata", "--strip-is-error"] to
+    # reproduce a route that needed them (whitelisted in proxy.runtime.validate_passthrough_args).
+    passthrough_args: list[str] | None = Field(default=None)
 
 
 class ClaudeCodeSnapshotResume(SnapshotResumeAgentMixin, ClaudeCode):

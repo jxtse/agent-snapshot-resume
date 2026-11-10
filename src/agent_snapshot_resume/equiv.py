@@ -129,27 +129,30 @@ def check(session_path, cut, req_path, hint=None, sentinel=None):
     matched = []
     extras = []
     mism = []
+    full_text = []  # full text of each extra block (the preview is truncated; hints can be longer than it)
     for blk, mi in got:
         if j < len(ref) and blk == ref[j]:
             matched.append(mi)
             j += 1
         else:
+            text = blk[2] if isinstance(blk[2], str) else str(blk[2])
+            full_text.append(text)
             extras.append({"msg_index": mi, "role": blk[0], "type": blk[1], "class": classify_extra(blk),
-                           "preview": (blk[2] if isinstance(blk[2], str) else str(blk[2]))[:300]})
+                           "preview": text[:300]})
     missing = ref[j:]
     if missing:
         nxt = missing[0]
         mism.append({"first_missing_ref_index": j, "role": nxt[0], "type": nxt[1], "preview": str(nxt[2])[:300]})
     artifacts = [e for e in extras if e["class"] == "RESUME_ARTIFACT"]
     sent_left = bool(sentinel) and any(sentinel in json.dumps(m, ensure_ascii=False) for m in msgs)
-    hint_blocks = [e for e in extras if hint and hint in e["preview"]] if hint else []
+    hint_blocks = [e for e, text in zip(extras, full_text) if hint in text] if hint else []
     last = msgs[-1]
     last_is_tr = last["role"] == "user" and any(isinstance(last["content"], list) and b.get("type") == "tool_result" for b in last["content"])
     ok = (not missing and not artifacts and not sent_left and (len(hint_blocks) == 1 if hint else True))
     # attachment correspondence: CC renders persisted attachments as system messages / reminders
     att = [d["attachment"].get("type") for d in lines[:cut] if d.get("type") == "attachment"]
-    rendered_att = [e for e in extras if e["class"] not in ("cc_currentDate_reminder", "RESUME_ARTIFACT")
-                    and not (hint and hint in e["preview"])]
+    rendered_att = [e for e, text in zip(extras, full_text)
+                    if e["class"] not in ("cc_currentDate_reminder", "RESUME_ARTIFACT") and not (hint and hint in text)]
     att_ok = len(rendered_att) <= len(att)
     ok = ok and att_ok
     return {

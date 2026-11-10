@@ -91,7 +91,10 @@ call ids, and that every result has an accepted fidelity:
   `bundle.json["replay_reviewed_exceptions"][call_id]`, bound to `sha256(command)`. Supported kinds:
   `hardware_probe`, `hardware_probe_and_python_build_stamp`, `shell_memory_probe`, `terminal_grep_no_match`,
   `terminal_grep_with_shell_time`, `original_timeout_partial_output`, `cprofile_timings`,
-  `cprofile_reviewed_aggregate_counts`. Each kind checks that only that specific benign difference exists.
+  `cprofile_reviewed_aggregate_counts`, `ls_dot_entries` (`ls -l` whose `.`/`..` rows and `total` differ because
+  the source filesystem lists them and the original did not; all other rows equal field by field),
+  `unseeded_rng_numbers` (read-only probe using an unseeded RNG; same text with numbers masked). Each kind checks
+  that only that specific benign difference exists. Record a `reason` next to each exception.
 
 ### Clone (`sandbox/snapshot_env.py`)
 
@@ -126,6 +129,20 @@ The resumed agent runs as one long command. If the RPC stream breaks, the comman
    Claude Code had cached.
 
 Claude Code writes these into the session, so they appear again in **every** later request.
+
+2.1.280 adds the same 1–3 and, after the sentinel, a system message (`# Environment … OS Version … <total_tokens>
+… The date has changed. Today's date is now <today>`) that carries the request's trailing prompt-cache breakpoint.
+The proxy drops it (post-sentinel rule, step 3 below) and moves the breakpoint to the new last message. Checked with
+`--fake` runs: the rewritten first request has the same byte length as the original run's request at step *k*
+(after the original route's `--drop-fields metadata --strip-is-error`), or that plus the hint block in `hint` mode.
+
+### Sharing one snapshot between bundles
+
+The snapshot depends only on the cut, not on the mode or hint. `launch` accepts a snapshot state prepared from
+another bundle only if `bundle.snapshot_cut_identity()` is equal for both bundles: same trial, session sha256,
+cut line, ATIF step, agent and version, fingerprint roots, plan sha256 and reviewed exceptions. So build the `same`
+and `hint` bundles of a trial at the same *k* (with the same `--fingerprint-root`s and the same reviewed exceptions),
+prepare one snapshot from either, and launch both from it.
 
 ### Resume proxy (`proxy/resume_proxy.py`, port 4031)
 

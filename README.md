@@ -134,6 +134,11 @@ your shell or drops them with a warning. Pass the original value with `--agent-e
 parameters such as `max_tokens` differ from the original run. Compare the whole first request, not only `equiv`
 (which checks the message prefix).
 
+If the original route started its in-sandbox proxy with extra flags (for example `--drop-fields metadata
+--strip-is-error` for a backend that rejects those fields), pass them with
+`--passthrough-args '--drop-fields metadata --strip-is-error'` (whitelisted flags only). A `same` and a `hint` bundle
+cut at the same step can share one snapshot (see [docs/design.md](docs/design.md#sharing-one-snapshot-between-bundles)).
+
 ### 5. Real resume
 
 ```bash

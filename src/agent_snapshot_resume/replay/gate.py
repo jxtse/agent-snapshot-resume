@@ -105,10 +105,29 @@ def validate_replay(plan, report, rc, reviewed_exceptions=None):
                 review.get('command_sha256') == hashlib.sha256(command.encode()).hexdigest() and
                 'cProfile.Profile()' in command and result.get('rc') == 0 and not result.get('stderr_full') and
                 (profile_old == profile_new or aggregate_reviewed))
-            if not (hardware_only or memory_only or terminal_grep_only or profile_only or timed_grep or timeout_same):
+            # `ls -l[a]` of directories: some sandbox filesystems (image layers lazily mounted) omit the `.`/`..`
+            # entries, which also changes the `total` block count. Every other row must be byte-identical.
+            ls_dot = re.compile(r'^d\S+\s+\d+\s+\S+\s+\S+\s+\d+\s+\S+\s+\d+\s+\S+\s\.{1,2}$')
+            # ls re-pads columns to the widest entry, so rows are compared as whitespace-split fields.
+            no_dots = lambda lines: [l.split() for l in lines
+                                     if not ls_dot.fullmatch(l) and not re.fullmatch(r'total \d+', l)]
+            ls_dot_only = (review.get('kind') == 'ls_dot_entries' and bound and
+                re.search(r'\bls\s+-\w*l', command) is not None and result.get('rc') == 0 and
+                not result.get('stderr_full') and not action.get('is_error') and
+                no_dots(old) == no_dots(new) and len(no_dots(old)) > 0)
+            # Unseeded RNG in a read-only probe: same text with every number masked, explicitly reviewed.
+            num_re = re.compile(r'-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?')
+            unseeded = (review.get('kind') == 'unseeded_rng_numbers' and bound and fidelity == 'numbers_differ' and
+                'random' in command and 'seed' not in command and result.get('rc') == 0 and
+                not result.get('stderr_full') and not action.get('is_error') and
+                num_re.sub('<n>', '\n'.join(old)) == num_re.sub('<n>', '\n'.join(new)))
+            if not (hardware_only or memory_only or terminal_grep_only or profile_only or timed_grep or timeout_same
+                    or ls_dot_only or unseeded):
                 raise RuntimeError('Unaccepted replay fidelity '+str(fidelity)+': '+action['call_id'])
             exit_reviewed = terminal_grep_only or timed_grep or timeout_same
-            result['reviewed_exception'] = ('identical full stdout; command-bound terminal grep no-match returns1 while original CC reported non-error' if terminal_grep_only else
+            result['reviewed_exception'] = ('identical ls rows; only the filesystem-dependent ./.. entries and total block count differ' if ls_dot_only else
+                'unseeded RNG probe: identical text with numbers masked; reviewed as not affecting task state' if unseeded else
+                'identical full stdout; command-bound terminal grep no-match returns1 while original CC reported non-error' if terminal_grep_only else
                 'same original timeout deadline and full partial scientific output; shell timing differences only' if timeout_same else
                 'identical scientific stdout; command-bound terminal grep returns1 and stderr contains only shell clocks' if timed_grep else
                 'identical scientific output and profiled function identities/counts; explicitly bound aggregate profiler-count difference plus timings' if profile_only and aggregate_reviewed else
