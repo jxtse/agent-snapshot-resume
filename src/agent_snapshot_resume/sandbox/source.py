@@ -105,11 +105,49 @@ def _snapshot_and_kill(sbx, rec, step, run, fingerprint_cmd, expected_fingerprin
     step("fingerprint", t)
     t = time.time()
     rec["snapshot_dispatch_started"] = True
-    snap = sbx.create_snapshot(request_timeout=300)
-    rec["snapshot_id"] = snap.snapshot_id
-    rec["snapshot_names"] = list(snap.names or [])
+    try:
+        snap = sbx.create_snapshot(request_timeout=300)
+        snapshot_id, names = snap.snapshot_id, list(snap.names or [])
+    except Exception as exc:  # noqa: BLE001
+        # The create call can lose its response (e.g. an HTTP/2 stream reset) after the service accepted it.
+        # Never dispatch a second snapshot: look up the one this sandbox produced instead.
+        rec["snapshot_create_error"] = repr(exc)[:300]
+        found = recover_snapshot_receipt(sbx)
+        if found is None:
+            raise
+        snapshot_id, names = found
+        rec["snapshot_receipt_recovered"] = True
+    rec["snapshot_id"] = snapshot_id
+    rec["snapshot_names"] = names
     rec["snapshot_created_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-    step("snapshot", t, snapshot_id=snap.snapshot_id)
+    step("snapshot", t, snapshot_id=snapshot_id)
+
+
+def recover_snapshot_receipt(sbx, attempts: int = 30, delay_s: float = 10.0):
+    """Return (snapshot_id, names) of the single snapshot of this sandbox, or None. Fails closed on ambiguity."""
+    for _ in range(attempts):
+        try:
+            items = sbx.list_snapshots().next_items()
+        except Exception:  # noqa: BLE001
+            items = None
+        if items is not None and len(items) > 1:
+            raise RuntimeError(f"{len(items)} snapshots exist for this source sandbox; resolve by hand")
+        if items:
+            return items[0].snapshot_id, list(items[0].names or [])
+        time.sleep(delay_s)
+    return None
+
+
+def kill_source(sbx, attempts: int = 30, delay_s: float = 10.0) -> None:
+    """Kill the source sandbox, waiting while the service still reports it as snapshotting (HTTP 409)."""
+    for i in range(attempts):
+        try:
+            sbx.kill()
+            return
+        except Exception as exc:  # noqa: BLE001
+            if "409" not in str(exc) or i == attempts - 1:
+                raise
+            time.sleep(delay_s)
 
 
 def prepare_source(*, adapter, task_dir: Path, bundle: Path, template: str, tag: str, state_dir: Path,
@@ -206,7 +244,7 @@ def prepare_source(*, adapter, task_dir: Path, bundle: Path, template: str, tag:
             step("retained_source_requires_gate_review_or_cleanup", t)
         else:
             try:
-                sbx.kill()
+                kill_source(sbx)
                 step("kill_source", t)
             except Exception as e:  # noqa: BLE001
                 step("kill_source_failed", t, error=repr(e)[:300])
@@ -287,7 +325,7 @@ def finish_prepared_source(state_path: Path, *, observe_timeout_s: int = 10800) 
     _collect_gate_evidence(sb, rec, report, save)
     _snapshot_and_kill(sb, rec, step, run, fingerprint_cmd)
     t = time.time()
-    sb.kill()
+    kill_source(sb)
     rec["source_retained_for_audit"] = False
     step("kill_source", t)
     return rec
