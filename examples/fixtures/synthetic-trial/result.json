@@ -1,0 +1,14 @@
+{
+ "task_name": "example/sum-task",
+ "trial_name": "synthetic-trial",
+ "verifier_result": {
+  "rewards": {
+   "reward": 0.0
+  }
+ },
+ "config": {
+  "agent": {
+   "model_name": "test-model"
+  }
+ }
+}

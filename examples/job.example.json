@@ -1,0 +1,36 @@
+{
+ "_comment": "Shape of the job config `asr launch` writes. Prefer generating it with `asr launch --dry-run`; placeholders are in <angle brackets>. No credential belongs here.",
+ "job_name": "asr-<run_id>",
+ "jobs_dir": "<abs path>/jobs",
+ "n_concurrent_trials": 1,
+ "retry": {"max_retries": 0},
+ "agent_timeout_multiplier": 1.0,
+ "environment": {
+  "import_path": "agent_snapshot_resume.sandbox.snapshot_env:SnapshotCloneEnvironment",
+  "kwargs": {
+   "owner": "asr",
+   "snapshot_id": "<snapshot id from state/snapshot-<tag>.json>",
+   "expected_fingerprint": "files=<n>\n<sha256 recorded on the source sandbox>",
+   "fingerprint_command": "<command recorded on the source sandbox>",
+   "expected_auxiliary_hashes": {},
+   "expected_verifier_hashes": {"/tests/test.sh": "<sha256 of the local task's tests/test.sh>"}
+  }
+ },
+ "agents": [
+  {
+   "import_path": "agent_snapshot_resume.agents.claude_code:ClaudeCodeSnapshotResume",
+   "model_name": "<model the original run used>",
+   "override_timeout_sec": 0.0,
+   "override_setup_timeout_sec": 1200.0,
+   "extra_allowed_hosts": ["<host of ASR_UPSTREAM_URL>"],
+   "kwargs": {
+    "version": "2.1.207",
+    "resume_bundle": "<abs path>/bundles/<run_id>",
+    "upstream_fake": false,
+    "upstream_url": "<ASR_UPSTREAM_URL>"
+   },
+   "env": {"API_TIMEOUT_MS": "3600000", "IS_SANDBOX": "1"}
+  }
+ ],
+ "tasks": [{"path": "<abs path to the Harbor task dir>"}]
+}

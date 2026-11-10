@@ -1,0 +1,36 @@
+[project]
+name = "agent-snapshot-resume"
+version = "0.1.0"
+description = "Resume an agent trajectory from step k: sandbox snapshot + truncated native session + context-preserving proxy"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Jinxiang Xie" }]
+requires-python = ">=3.12"
+# Pinned on purpose: Harbor derives E2B template names from the task dir contents with version-specific rules, so a
+# different Harbor version may not find templates registered with this one.
+dependencies = [
+  "harbor[e2b]==0.23.0",
+  "e2b==2.32.0",
+  "python-dotenv>=1.1",
+  "aiohttp>=3.10",
+  "certifi",
+]
+
+[project.scripts]
+asr = "agent_snapshot_resume.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["uv_build>=0.8.0,<0.13"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "agent_snapshot_resume"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["live: needs real sandbox credentials (skipped unless ASR_LIVE_TESTS=1)"]
+filterwarnings = ["ignore:It is recommended to use web.AppKey"]

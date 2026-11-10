@@ -1,0 +1,15 @@
+{
+ "agent": {
+  "name": "claude-code",
+  "model_name": "test-model",
+  "kwargs": {
+   "version": "2.1.207"
+  },
+  "env": {
+   "ANTHROPIC_API_KEY": "${ANTHROPIC_API_KEY}",
+   "ANTHROPIC_BASE_URL": "https://api.example.com",
+   "API_TIMEOUT_MS": "3600000"
+  }
+ },
+ "trial_name": "synthetic-trial"
+}
