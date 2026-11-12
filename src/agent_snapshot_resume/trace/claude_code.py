@@ -73,7 +73,9 @@ def _content_text(c):
 
 
 _PERSIST_RE = re.compile(r"(?:saved to|Full output saved to|persisted to)[:\s]+(\S+/tool-results/\S+)", re.I)
-_BG_RE = re.compile(r"Command running in background with ID: (\w+)\. Output is being written to: (\S+?)\.?(?:\s|$)")
+# Explicit run_in_background, and (CC >= 2.1.2xx) auto-backgrounding after the 120 s Bash timeout.
+_BG_RE = re.compile(r"(?:Command running in background with ID: (\w+)|moved to the background \(ID: (\w+)\))\. "
+                    r"Output is being written to: (\S+?)\.?(?:\s|$)")
 
 
 def load_trial(trial_dir, agent_timeout_s=None, task=None, reward=None):
@@ -217,8 +219,8 @@ def load_trial(trial_dir, agent_timeout_s=None, task=None, reward=None):
                             o["truncated"] = True
                         bm = _BG_RE.search(txt[:600])
                         if bm:
-                            o["background_task_id"] = bm.group(1)
-                            o["background_output_file"] = bm.group(2)
+                            o["background_task_id"] = bm.group(1) or bm.group(2)
+                            o["background_output_file"] = bm.group(3)
                         ci = calls.get(o["call_id"])
                         if ci:
                             o["tool"] = ci[1].get("name")

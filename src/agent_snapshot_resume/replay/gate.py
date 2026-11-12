@@ -121,11 +121,29 @@ def validate_replay(plan, report, rc, reviewed_exceptions=None):
                 'random' in command and 'seed' not in command and result.get('rc') == 0 and
                 not result.get('stderr_full') and not action.get('is_error') and
                 num_re.sub('<n>', '\n'.join(old)) == num_re.sub('<n>', '\n'.join(new)))
+            # CC showed only a <persisted-output> preview of a large output; the full original output is the bundled
+            # tool-results file. Accept when the replayed stdout hashes to that file's reviewed sha256 and the
+            # original preview is a prefix of the replayed stdout.
+            prev = re.search(r'Preview \(first [^)]*\):\n(.*)', action.get('orig_text', ''), re.S)
+            persisted_same = (review.get('kind') == 'persisted_output_identical' and bound and
+                fidelity == 'persisted_preview' and result.get('rc') == 0 and not result.get('stderr_full') and
+                not action.get('is_error') and prev is not None and
+                hashlib.sha256(result.get('stdout_full', '').encode()).hexdigest() == review.get('persisted_output_sha256') and
+                result.get('stdout_full', '').startswith(prev.group(1)[:1500]))
+            # Read-only probe that picks glob.glob(...)[0] without sorting: the directory order of the sandbox
+            # filesystem decides which file is inspected. Accept only command-bound, reviewed read-only probes.
+            writes = re.compile(r"open\([^)]*['\"][wa]b?['\"]|\.to_(?:csv|parquet|pickle|json)\(|savefig|np\.save|"
+                                r"\.write\(|mkdir|>\s*/|\brm\b|\bmv\b|\bcp\b|shutil|os\.remove|unlink")
+            glob_order = (review.get('kind') == 'readonly_unsorted_glob_pick' and bound and
+                fidelity in ('differs', 'numbers_differ') and re.search(r'glob\.glob\([^)]*\)\[0\]', command) is not None and
+                writes.search(command) is None and result.get('rc') == 0 and not action.get('is_error'))
             if not (hardware_only or memory_only or terminal_grep_only or profile_only or timed_grep or timeout_same
-                    or ls_dot_only or unseeded):
+                    or ls_dot_only or unseeded or persisted_same or glob_order):
                 raise RuntimeError('Unaccepted replay fidelity '+str(fidelity)+': '+action['call_id'])
             exit_reviewed = terminal_grep_only or timed_grep or timeout_same
-            result['reviewed_exception'] = ('identical ls rows; only the filesystem-dependent ./.. entries and total block count differ' if ls_dot_only else
+            result['reviewed_exception'] = ('replayed stdout identical to the persisted full original output (CC showed a preview)' if persisted_same else
+                'read-only probe; unsorted glob(...)[0] picked a different file in this filesystem order' if glob_order else
+                'identical ls rows; only the filesystem-dependent ./.. entries and total block count differ' if ls_dot_only else
                 'unseeded RNG probe: identical text with numbers masked; reviewed as not affecting task state' if unseeded else
                 'identical full stdout; command-bound terminal grep no-match returns1 while original CC reported non-error' if terminal_grep_only else
                 'same original timeout deadline and full partial scientific output; shell timing differences only' if timeout_same else
