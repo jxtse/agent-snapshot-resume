@@ -70,11 +70,13 @@ def snapshot_cut_identity(bundle_dir: Path) -> dict[str, Any]:
 def build(*, adapter, trial_dir: Path, atif_step: int, out: Path, mode: str = "same", hint: str | None = None,
           agent_timeout: float | None = None, task_dir: Path | None = None, run_id: str | None = None,
           model: str | None = None, pin_date: bool = True, fingerprint_roots: list[str] | None = None,
-          force: bool = False) -> tuple[Path, dict[str, Any]]:
+          force: bool = False, persist_hint: bool = False) -> tuple[Path, dict[str, Any]]:
     if mode not in ("same", "hint"):
         raise SystemExit("--mode must be same or hint")
     if mode == "hint" and not hint:
         raise SystemExit("--mode hint needs --hint-file")
+    if persist_hint and mode != "hint":
+        raise SystemExit("--persist-hint needs --mode hint")
     trial_dir = Path(trial_dir).resolve()
     trial = trial_dir.name
     result = _trial_result(trial_dir)
@@ -151,6 +153,8 @@ def build(*, adapter, trial_dir: Path, atif_step: int, out: Path, mode: str = "s
     spec = {"mode": mode, "sentinel": sentinel, "hint": hint if mode == "hint" else None,
             "upstream": "http://127.0.0.1:4013", "model": None, "pin_date": orig_date if pin_date else None,
             "resume_artifacts": dict(adapter.resume_artifacts)}
+    if persist_hint:
+        spec["persist_hint"] = True  # re-inject the hint on the compaction summary once the sentinel is gone
     with open(bdir / "proxy_spec.json", "w") as f:
         json.dump(spec, f, indent=1)
     return bdir, meta

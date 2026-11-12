@@ -173,6 +173,18 @@ Stable Harbor import paths:
 - `agent_snapshot_resume.agents.claude_code:ClaudeCodeSnapshotResume`
 - `agent_snapshot_resume.sandbox.fc_env:SandboxEnvironment` / `:VpcSandboxEnvironment` (plain FC runs, no resume)
 
+## Hints that survive context compaction (`--persist-hint`)
+
+A `--mode hint` bundle injects the hint as a `<system-reminder>` block on the fork turn. The resume proxy finds that
+turn by the sentinel prompt; once the agent auto-compacts its context, the sentinel turn is summarised away and the
+hint would silently disappear from every later request. Build the bundle with `--persist-hint` to keep it: when a
+request has no sentinel but carries a compaction summary (a user message containing "This session is being continued
+from a previous conversation"), the proxy appends the same hint block once to the latest such message (moving that
+message's cache breakpoint onto it). It never duplicates the hint (if the hint text is already present verbatim it does
+nothing) and leaves requests without a summary (e.g. sub-agent requests) untouched. Every `requests.jsonl` record
+carries `hint_blocks`, `hint_occurrences`, `compact_summary` and system/tools fingerprints, and the first request after
+each compaction is saved as `post_compaction_request_<i>.json`, so persistence can be audited per request.
+
 ## What "equivalent" means
 
 `asr equiv` compares the rewritten first request with the original session prefix (`lines[:cut]`). The rule:

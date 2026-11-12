@@ -33,7 +33,8 @@ def cmd_build_bundle(a):
     bdir, meta = build(adapter=_adapter(a.agent), trial_dir=Path(a.trial_dir), atif_step=a.step, out=Path(a.out),
                        mode=a.mode, hint=hint, agent_timeout=a.agent_timeout,
                        task_dir=Path(a.task_dir) if a.task_dir else None, run_id=a.run_id, model=a.model,
-                       pin_date=not a.no_pin_date, fingerprint_roots=a.fingerprint_root or None, force=a.force)
+                       pin_date=not a.no_pin_date, fingerprint_roots=a.fingerprint_root or None, force=a.force,
+                       persist_hint=a.persist_hint)
     print(bdir)
     print(json.dumps({k: meta[k] for k in ("run_id", "task", "cut_line", "agent_budget_s", "n_replay_actions",
                                            "aux_counts")}, ensure_ascii=False))
@@ -183,6 +184,8 @@ def build_parser():
     p.add_argument("--agent", default="claude-code")
     p.add_argument("--mode", choices=["same", "hint"], default="same")
     p.add_argument("--hint-file")
+    p.add_argument("--persist-hint", action="store_true",
+                   help="mode=hint: keep the hint after the agent compacts its context (re-injected on the summary)")
     p.add_argument("--agent-timeout", type=float, help="task agent timeout in s (default: from task.toml)")
     p.add_argument("--task-dir", help="Harbor task dir (for task.toml)")
     p.add_argument("--run-id")

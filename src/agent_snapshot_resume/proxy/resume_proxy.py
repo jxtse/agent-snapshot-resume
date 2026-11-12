@@ -20,6 +20,9 @@ Rewrites EVERY /v1/messages body (the agent re-sends its persisted resume artifa
   4. drop the exact 'Continue from where you left off.' text block from the user message before it
   5. mode=hint: append ONE text block '<system-reminder>\n<hint>\n</system-reminder>' to that user message
   6. pin_date: rewrite "Today's date is YYYY-MM-DD." in the first user message to the original run date
+  7. mode=hint + persist_hint: once the agent's own context compaction has removed the sentinel turn, append the
+     same hint block ONCE to the (latest) compact-summary user message, so every later main-agent request still
+     carries the hint exactly once (requests without sentinel and without summary, e.g. sub-agents, are untouched)
 The proxy never handles credentials: it forwards the agent's (dummy) auth header to the passthrough proxy, which
 replaces it. Logs: <log_dir>/<run_id>/requests.jsonl, first_request_{raw,rewritten}.json (auth headers removed).
 
@@ -92,6 +95,58 @@ def check_chained_history(body, spec):
             raise ValueError('Resume sentinel remains in model-visible history')
 
 
+COMPACT_SUMMARY_PREFIX = "This session is being continued from a previous conversation"
+
+
+def hint_block_text(hint):
+    return f"<system-reminder>\n{hint}\n</system-reminder>"
+
+
+def _text_of(b):
+    return (b.get("text") or "") if isinstance(b, dict) and b.get("type") == "text" else ""
+
+
+def find_compact_summary(msgs):
+    """Index of the latest user message carrying the agent's compaction summary, else None."""
+    idx = None
+    for i, m in enumerate(msgs):
+        if m.get("role") == "user" and any(COMPACT_SUMMARY_PREFIX in _text_of(b) for b in _blocks(m)):
+            idx = i
+    return idx
+
+
+def hint_stats(body, hint):
+    """(exact hint blocks, verbatim hint occurrences in all message text) of a request body."""
+    if not hint:
+        return 0, 0
+    blk = hint_block_text(hint)
+    texts = [_text_of(b) for m in body.get("messages") or [] for b in _blocks(m)]
+    return sum(t == blk for t in texts), sum(t.count(hint) for t in texts)
+
+
+def reinject_after_compaction(body, spec, acts):
+    """Post-compaction persistence: the sentinel turn is gone (summarised away) -> put the hint on the summary."""
+    msgs = body.get("messages") or []
+    c = find_compact_summary(msgs)
+    if c is None:
+        acts.append("no_anchor")
+        return body
+    hint = spec["hint"]
+    bl = [dict(b) for b in _blocks(msgs[c])]
+    if any(hint in _text_of(b) for m in msgs for b in _blocks(m)):
+        acts.append("hint_already_present")  # e.g. the summary quotes it verbatim: never duplicate
+        return body
+    blk = {"type": "text", "text": hint_block_text(hint)}
+    # keep a cache breakpoint (if any) on the message's last block
+    if bl and "cache_control" in bl[-1]:
+        cc = bl[-1].pop("cache_control")
+        blk["cache_control"] = cc
+    new = list(msgs)
+    new[c] = dict(msgs[c], content=bl + [blk])
+    acts.append(f"reinject_hint_after_compaction@{c}")
+    return dict(body, messages=new)
+
+
 def rewrite(body, spec):
     """Return (new_body, actions). Pure function; unit-testable."""
     if spec.get("require_text_only"):
@@ -105,6 +160,8 @@ def rewrite(body, spec):
         if spec.get('require_sentinel'):
             raise ValueError('Required resume sentinel missing; refusing unverified continuation')
         acts.append("sentinel_not_found")
+        if spec.get("mode") == "hint" and spec.get("hint") and spec.get("persist_hint"):
+            body = reinject_after_compaction(body, spec, acts)
         return body, acts
     dropped = []
     # extra (non-sentinel) blocks CC attached to the sentinel turn at resume time
@@ -142,11 +199,11 @@ def rewrite(body, spec):
         if len(keep) != len(bl):
             acts.append("drop_continue_block")
         if spec.get("mode") == "hint" and spec.get("hint"):
-            keep = keep + [{"type": "text", "text": f"<system-reminder>\n{spec['hint']}\n</system-reminder>"}]
+            keep = keep + [{"type": "text", "text": hint_block_text(spec['hint'])}]
             acts.append("inject_hint")
         new[tgt] = dict(new[tgt], content=keep)
     elif spec.get("mode") == "hint" and spec.get("hint"):
-        new.insert(lo, {"role": "user", "content": [{"type": "text", "text": f"<system-reminder>\n{spec['hint']}\n</system-reminder>"}]})
+        new.insert(lo, {"role": "user", "content": [{"type": "text", "text": hint_block_text(spec['hint'])}]})
         acts.append("inject_hint_new_msg")
     if removed_cc and new and not any("cache_control" in b for b in _blocks(new[-1]) if isinstance(b, dict)):
         last = new[-1]
@@ -171,6 +228,18 @@ def rewrite(body, spec):
     if dropped:
         acts.append({"dropped_blocks": dropped})
     return body, acts
+
+
+def request_fingerprint(body, spec):
+    """Per-request evidence fields: hint counts and a system/tools fingerprint (main agent vs sub-agent)."""
+    sysv = body.get("system")
+    sys_txt = sysv if isinstance(sysv, str) else "".join(_text_of(b) for b in (sysv or []))
+    tools = sorted(t.get("name", "") for t in body.get("tools") or [] if isinstance(t, dict))
+    blocks, occ = hint_stats(body, spec.get("hint") if spec.get("mode") == "hint" else None)
+    return {"hint_blocks": blocks, "hint_occurrences": occ,
+            "sys_sha": hashlib.sha256(sys_txt[:4000].encode()).hexdigest()[:12],
+            "tools_sha": hashlib.sha256(json.dumps(tools).encode()).hexdigest()[:12], "n_tools": len(tools),
+            "compact_summary": find_compact_summary(body.get("messages") or []) is not None}
 
 
 def load_spec(app, run_id):
@@ -249,6 +318,14 @@ async def handle(request):
         out_body = json.dumps(nd, ensure_ascii=False).encode()
         rec.update({"n": n, "model": nd.get("model"), "n_messages_in": len(d.get("messages") or []),
                     "n_messages_out": len(nd.get("messages") or []), "actions": acts, "bytes": len(out_body)})
+        rec.update(request_fingerprint(nd, spec))
+        if any(isinstance(a, str) and a.startswith("reinject_hint_after_compaction") for a in acts):
+            c = find_compact_summary(nd.get("messages") or [])
+            key = hashlib.sha256(json.dumps(nd["messages"][c], ensure_ascii=False).encode()).hexdigest()[:12]
+            if key not in app["compact_seen"].setdefault(run_id, set()):
+                app["compact_seen"][run_id].add(key)
+                wlog(app, run_id, f"post_compaction_request_{len(app['compact_seen'][run_id])}.json",
+                     {"n": n, "body": nd, "actions": acts}, mode="w")
         if spec.get("upstream") == "fake":
             rec["status"] = 200
             wlog(app, run_id, "requests.jsonl", rec)
@@ -310,7 +387,8 @@ def main():
     ap.add_argument("--log-dir", required=True)
     a = ap.parse_args()
     app = web.Application(client_max_size=1 << 30)
-    app.update(spec_dir=os.path.expanduser(a.spec_dir), log_dir=os.path.expanduser(a.log_dir), specs={}, counts={})
+    app.update(spec_dir=os.path.expanduser(a.spec_dir), log_dir=os.path.expanduser(a.log_dir), specs={}, counts={},
+               compact_seen={})
 
     async def on_start(app):
         app["session"] = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, sock_read=3600), auto_decompress=False)
