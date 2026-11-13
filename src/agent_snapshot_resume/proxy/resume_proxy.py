@@ -12,14 +12,19 @@ Per-run spec: <spec_dir>/<run_id>.json
    "resume_artifacts": {"continue_text": "...", "synthetic_assistant_text": "..."},   # adapter-specific; the
                                          # defaults are what Claude Code 2.1.207 `--resume --print` injects
    "require_sentinel", "require_text_only", "expected_first_request_sha256", "required_hint_blocks",
-   "hint_anchors", "forbidden_sentinels": optional gates (see rewrite() / check_chained_history())}
+   "hint_anchors", "forbidden_sentinels": optional gates (see rewrite() / check_chained_history()),
+   "max_model_requests": N,            # refuse model request N+1 and later (bounded continuation)
+   "first_request_parity": {"req_bytes", "model", "n_messages", "max_tokens", "thinking", "n_tools", "route"}
+                                         # fail-closed gate: the first rewritten request minus hint blocks, as the
+                                         # original route logged it, must equal the original request at the cut}
 Rewrites EVERY /v1/messages body (the agent re-sends its persisted resume artifacts on each turn):
   1. find the user message containing a text block with the sentinel -> drop it
   2. drop the preceding synthetic assistant message (e.g. 'No response requested.')
   3. drop notes the agent appended after the sentinel turn at resume time (e.g. '<file> was modified')
   4. drop the exact 'Continue from where you left off.' text block from the user message before it
   5. mode=hint: append ONE text block '<system-reminder>\n<hint>\n</system-reminder>' to that user message
-  6. pin_date: rewrite "Today's date is YYYY-MM-DD." in the first user message to the original run date
+  6. pin_date: rewrite "Today's date is YYYY-MM-DD." in the first user message to the original run date (never in a
+     compaction summary; the content keeps its shape: string or block list)
   7. mode=hint + persist_hint: once the agent's own context compaction has removed the sentinel turn, append the
      same hint block ONCE to the (latest) compact-summary user message, so every later main-agent request still
      carries the hint exactly once (requests without sentinel and without summary, e.g. sub-agents, are untouched)
@@ -28,7 +33,7 @@ replaces it. Logs: <log_dir>/<run_id>/requests.jsonl, first_request_{raw,rewritt
 
     python resume_proxy.py --port 4031 --spec-dir /opt/asr-proxy/resume/specs --log-dir /logs/agent/resume-proxy
 """
-import argparse, asyncio, hashlib, json, os, re, time
+import argparse, asyncio, copy, hashlib, json, os, re, time
 
 import aiohttp
 from aiohttp import web
@@ -147,6 +152,116 @@ def reinject_after_compaction(body, spec, acts):
     return dict(body, messages=new)
 
 
+# ------------------------------------------------------------------ request parity (see agent_snapshot_resume.parity)
+def route_from_passthrough_args(args):
+    """The request transformations of the passthrough proxy flags (only the ones that change request bytes)."""
+    args = list(args or [])
+    route = {"drop_fields": [], "strip_is_error": False, "strip_thinking": False}
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--drop-fields" and i + 1 < len(args):
+            route["drop_fields"] = [x for x in args[i + 1].split(",") if x]
+            i += 1
+        elif a == "--strip-is-error":
+            route["strip_is_error"] = True
+        elif a == "--strip-thinking":
+            route["strip_thinking"] = True
+        i += 1
+    return route
+
+
+def remove_hint_blocks(body, hints):
+    """Copy of body without the exact injected hint blocks. A breakpoint carried by a removed block goes back to the
+    preceding block of the same message (where Claude Code had it before the injection)."""
+    blocks = {hint_block_text(h) for h in hints if h}
+    d = copy.deepcopy(body)
+    n = 0
+    if not blocks:
+        return d, 0
+    for m in d.get("messages") or []:
+        c = m.get("content")
+        if not isinstance(c, list):
+            continue
+        keep = []
+        for b in c:
+            if isinstance(b, dict) and b.get("type") == "text" and b.get("text") in blocks:
+                n += 1
+                if "cache_control" in b and keep and isinstance(keep[-1], dict):
+                    keep[-1] = dict(keep[-1], cache_control=b["cache_control"])
+                continue
+            keep.append(b)
+        m["content"] = keep
+    return d, n
+
+
+def route_bytes(body, route):
+    """Byte length of body as the original route's passthrough proxy logged it (req_bytes)."""
+    d = copy.deepcopy(body)
+    active = bool(route.get("drop_fields") or route.get("strip_is_error") or route.get("strip_thinking"))
+    for k in route.get("drop_fields") or []:
+        d.pop(k, None)
+    for m in d.get("messages") or []:
+        c = m.get("content")
+        if not isinstance(c, list):
+            continue
+        keep = []
+        for b in c:
+            if isinstance(b, dict) and route.get("strip_thinking") and b.get("type") in ("thinking", "redacted_thinking"):
+                continue
+            if isinstance(b, dict) and route.get("strip_is_error") and b.get("type") == "tool_result":
+                b.pop("is_error", None)
+            keep.append(b)
+        m["content"] = keep
+    if active:
+        return len(json.dumps(d, ensure_ascii=False).encode())
+    return len(json.dumps(d, ensure_ascii=False, separators=(",", ":")).encode())
+
+
+def compare_parity(body, expected, route=None,
+            hints=None):
+    """Parity report of a (rewritten) first request body against the expected original request fields."""
+    route = route if route is not None else expected.get("route") or {}
+    stripped, n_hint = remove_hint_blocks(body, hints or [])
+    got = {"req_bytes": route_bytes(stripped, route), "model": body.get("model"),
+           "n_messages": len(body.get("messages") or []), "max_tokens": body.get("max_tokens"),
+           "thinking": body.get("thinking"), "n_tools": len(body.get("tools") or [])}
+    diffs = {k: {"got": got[k], "expected": expected.get(k)} for k in got if got[k] != expected.get(k)}
+    return {"ok": not diffs, "diffs": diffs, "got": got, "expected": {k: expected.get(k) for k in got},
+            "hint_blocks_removed": n_hint, "byte_diff": got["req_bytes"] - (expected.get("req_bytes") or 0)}
+
+
+def spec_hints(spec):
+    """All hints a request may carry: the chain's earlier hints (spec "prior_hints", oldest first) + this run's."""
+    hs = list(spec.get("prior_hints") or [])
+    if spec.get("mode") == "hint" and spec.get("hint"):
+        hs.append(spec["hint"])
+    return hs
+
+
+def pin_date_in_message(msg, pin_date, acts):
+    """Rewrite the first "Today's date is ..." in msg to pin_date. Keeps the content's shape: a string stays a
+    string (after a compaction the first message is the summary, sent as a plain string; turning it into a block
+    list would change the request bytes). Messages without a date are returned unchanged."""
+    repl = f"Today's date is {pin_date}."
+    c = msg.get("content")
+    if any(COMPACT_SUMMARY_PREFIX in _text_of(b) for b in _blocks(msg)):
+        return msg  # never edit a compaction summary (its date reminder is a separate, persisted system message)
+    if isinstance(c, str):
+        if DATE_RE.search(c):
+            acts.append("pin_date")
+            return dict(msg, content=DATE_RE.sub(repl, c, count=1))
+        return msg
+    if not isinstance(c, list):
+        return msg
+    for i, b in enumerate(c):
+        if isinstance(b, dict) and b.get("type") == "text" and DATE_RE.search(b.get("text") or ""):
+            nb = dict(b, text=DATE_RE.sub(repl, b["text"], count=1))
+            acts.append("pin_date")
+            return dict(msg, content=c[:i] + [nb] + c[i + 1:])
+    return msg
+
+
 def rewrite(body, spec):
     """Return (new_body, actions). Pure function; unit-testable."""
     if spec.get("require_text_only"):
@@ -213,13 +328,7 @@ def rewrite(body, spec):
             new[-1] = dict(last, content=bl)
             acts.append("move_cache_breakpoint")
     if spec.get("pin_date") and new:
-        bl = _blocks(new[0])
-        for b in bl:
-            if b.get("type") == "text" and DATE_RE.search(b.get("text") or ""):
-                b["text"] = DATE_RE.sub(f"Today's date is {spec['pin_date']}.", b["text"], count=1)
-                acts.append("pin_date")
-                break
-        new[0] = dict(new[0], content=bl)
+        new[0] = pin_date_in_message(new[0], spec["pin_date"], acts)
     if spec.get("model"):
         body["model"] = spec["model"]
         acts.append("override_model")
@@ -299,11 +408,28 @@ async def handle(request):
         d = json.loads(body)
         n = app["counts"].get(run_id, 0)
         app["counts"][run_id] = n + 1
+        cap = spec.get("max_model_requests")
+        if cap and n >= int(cap):
+            # bounded continuation (e.g. a parity probe): refuse further model calls; the agent ends with an error
+            rec.update(n=n, status=400, local_gate_error=f"max_model_requests={cap} reached")
+            wlog(app, run_id, "requests.jsonl", rec)
+            return web.json_response({"type": "error", "error": {"type": "invalid_request_error",
+                                      "message": f"resume proxy: max_model_requests={cap} reached"}}, status=400)
         if n == 0:
             hdr = {k: v for k, v in request.headers.items() if k.lower() not in AUTH}
             wlog(app, run_id, "first_request_raw.json", {"headers": hdr, "body": d}, mode="w")
         try:
             nd, acts = rewrite(d, spec)
+            if n == 0 and spec.get("first_request_parity"):
+                # Fail closed unless the first resumed request equals the original run's request at the cut
+                # (bytes as logged by the original route, model/max_tokens/thinking/tool count/message count).
+                exp = spec["first_request_parity"]
+                rep = compare_parity(nd, exp, exp.get("route") or {}, spec_hints(spec))
+                wlog(app, run_id, "first_request_parity.json", rep, mode="w")
+                if not rep["ok"]:
+                    raise ValueError("First resumed request differs from the original request at the cut: "
+                                     + json.dumps(rep["diffs"], ensure_ascii=False)[:600])
+                acts.append("first_request_parity_passed")
             if spec.get('expected_first_request_sha256') and not spec.get('_first_request_validated'):
                 if request_digest(nd) != spec['expected_first_request_sha256']:
                     raise ValueError('First model request differs from the frozen fake-resume request')

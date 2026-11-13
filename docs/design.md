@@ -76,7 +76,14 @@ Harbor's `override_timeout_sec`. The sandbox also enforces it itself (`bounded_r
   calls: skipped.
 - Output comparison classes: `exact`, `normalized` (whitespace/ANSI), `same_lines_reordered` (stdout/stderr
   interleaving), `volatile_only` (addresses, dates, timings), `address_and_order_only`,
-  `line_alignment_and_order_only`, `numbers_differ`, `differs`.
+  `line_alignment_and_order_only`, `numbers_differ`, `differs`. An empty successful result equals Claude Code's
+  `(Bash completed with no output)`.
+- Background output files get the agent's completion trailer (`plan.json["bg_output_trailer"]`; Claude Code 2.1.280
+  appends `\n[exited with code N]\n`), so later reads of the file see the same bytes.
+- Pacing: a replayed foreground command that leaves processes running (`nohup … &`) keeps its process group alive.
+  While it is alive, each later `Bash` action waits until the original time gap since that command has elapsed
+  (bounded by `--exec-cap`; recorded as `paced_wait_s`), so polls and log reads see a comparable progress point.
+  Replay otherwise runs back to back.
 
 ### Replay gate
 
@@ -85,16 +92,39 @@ call ids, and that every result has an accepted fidelity:
 
 - accepted: `exact`, `normalized`, `same_lines_reordered`, `volatile_only`, `address_and_order_only`,
   `line_alignment_and_order_only`, `error_reproduced`, `orig_error_not_applied`;
-- background jobs: completed, rc 0, output file restored with a hash;
+- background jobs: same terminal status as the original (`completed` → rc 0, `failed` → rc ≠ 0), output file
+  restored with a hash;
 - the exit status of an `exec` (error or not) must match the original;
+- **automatic equivalence** (no review; each class narrow and checked on the full output, `automatic_equivalence`
+  in the report): `ls_dot_entries_only`, `cc_grep_no_match` (last pipeline stage grep returns 1, Claude Code showed a
+  non-error, stdout identical), `readonly_listing_order_only` (command without writes lists a directory; each
+  output line has the same tokens), `shell_diagnostic_prefix_only` (`/bin/bash: eval: line N:` vs
+  `bash: -c: line M:`), `shell_time_report_only` (`time`/`TIMEFORMAT`/`/usr/bin/time` report lines removed, rest
+  identical after volatile masking), `cprofile_timings_only` (same profile rows and call counts; timing columns
+  differ), `volatile_and_order_only`, `agent_state_read_only` (read-only command fails with "No such file" on the
+  agent's own `/logs/agent`/session files, which are seeded at launch), `timing_lines_only` (command measures time;
+  every differing number directly follows a duration label or precedes a time unit);
 - `numbers_differ` / `differs` are accepted only with a **reviewed exception** in
   `bundle.json["replay_reviewed_exceptions"][call_id]`, bound to `sha256(command)`. Supported kinds:
   `hardware_probe`, `hardware_probe_and_python_build_stamp`, `shell_memory_probe`, `terminal_grep_no_match`,
   `terminal_grep_with_shell_time`, `original_timeout_partial_output`, `cprofile_timings`,
   `cprofile_reviewed_aggregate_counts`, `ls_dot_entries` (`ls -l` whose `.`/`..` rows and `total` differ because
   the source filesystem lists them and the original did not; all other rows equal field by field),
-  `unseeded_rng_numbers` (read-only probe using an unseeded RNG; same text with numbers masked). Each kind checks
-  that only that specific benign difference exists. Record a `reason` next to each exception.
+  `unseeded_rng_numbers` (read-only probe using an unseeded RNG; same text with numbers masked),
+  `unlabelled_timing_number` (command measures time; exactly one number differs), `listing_order_line` (same
+  items listed in another order by a command that also writes files; the reviewer checks the writes are
+  order-independent). Each kind checks that only that specific benign difference exists. Record a `note` next to
+  each exception.
+
+### Screening cuts offline (`asr screen`)
+
+`asr screen --trial-dir T --cut-line L` (repeatable, or `--step`) builds the replay plan of each candidate cut and
+lists what may make the replay diverge, without a sandbox: `bg_inflight` / `subagent_inflight` (block), reads of a
+background job's output while it was still running (block) or after it finished (info), shell background jobs and
+polls (`pace_dependent_read`), `unseeded_rng`, `network`, `glob_order`, `hash_order`, `agent_state_read`,
+`web_or_unsupported`, `wall_clock` / `orig_timeout` / `long_replay` / `compactions` (info) and `missing_original`
+(the original request at the cut was not located, so the parity gate cannot run). Verdict: `block`, `review` (warns
+only) or `ok`. A warn is not a failure: the replay gate decides; the screen tells you where to look.
 
 ### Clone (`sandbox/snapshot_env.py`)
 
@@ -132,9 +162,34 @@ Claude Code writes these into the session, so they appear again in **every** lat
 
 2.1.280 adds the same 1–3 and, after the sentinel, a system message (`# Environment … OS Version … <total_tokens>
 … The date has changed. Today's date is now <today>`) that carries the request's trailing prompt-cache breakpoint.
-The proxy drops it (post-sentinel rule, step 3 below) and moves the breakpoint to the new last message. Checked with
-`--fake` runs: the rewritten first request has the same byte length as the original run's request at step *k*
-(after the original route's `--drop-fields metadata --strip-is-error`), or that plus the hint block in `hint` mode.
+The proxy drops it (post-sentinel rule, step 3 below) and moves the breakpoint to the new last message.
+
+### Cuts after context compactions
+
+A session with `compact_boundary` system lines is rebuilt by `claude --resume` (2.1.280, checked against real
+sessions with a fake upstream) exactly as the original run's request after the compaction: the compact summary
+user message (a plain string), the persisted date reminder as a system message, the preserved messages
+(`compactMetadata.preservedMessages`), the later turns, with attachments rendered as system messages or as
+`<system-reminder>` suffixes of tool results. Two things needed care:
+
+- `pin_date` must not reshape the first message: after a compaction it is the summary, sent as a string; turning it
+  into a block list adds bytes. The proxy keeps the content's shape and never edits a compaction summary.
+- `asr equiv` rebuilds the reference context the same way (`equiv.context_lines`: after the last boundary, the
+  summary, then the preserved messages, then later lines) and accepts `<system-reminder>` text appended to a
+  tool_result's string content (counted against the prefix's attachments).
+
+### First-request parity gate
+
+`build-bundle` locates the original run's request that produced step *k* in the original passthrough proxy log
+(`agent/model-proxy/requests-*.jsonl`) by step *k*'s token usage, which is unique per request; counting assistant
+messages is wrong when failed attempts or compactions were logged. It records `orig_request_at_k` (index,
+`req_bytes`, model, n_messages, max_tokens, thinking, n_tools) in `bundle.json`. At launch the agent puts it into the
+resume proxy spec (`first_request_parity`, with the request transformations of `--passthrough-args`). The proxy
+rejects the first request with 400, before anything is sent upstream, unless the rewritten body minus the injected
+hint block(s), serialised as the original route logged it, has exactly the original `req_bytes`, and model,
+n_messages, max_tokens, thinking and tool count are equal. The report is `first_request_parity.json`.
+`--parity-gate auto` (default) gates whenever the bundle has the record, `require` refuses to launch without it,
+`off` disables it. `asr parity <bundle> <first_request_rewritten.json>` runs the same check offline.
 
 ### Sharing one snapshot between bundles
 
@@ -158,8 +213,9 @@ On every `/v1/messages` request it:
 
 Requests without the sentinel, such as subagent calls, pass through unchanged (`sentinel_not_found`). Optional gates
 in the spec: `require_sentinel`, `require_text_only`, `expected_first_request_sha256` (the first request must hash
-to a known value, `metadata` excluded, or it is rejected with 400 and never sent upstream), and
-`required_hint_blocks` / `hint_anchors` / `forbidden_sentinels` for chained resumes.
+to a known value, `metadata` excluded, or it is rejected with 400 and never sent upstream), `first_request_parity`
+(above), `max_model_requests` (refuse request N+1, for bounded probes), and `required_hint_blocks` /
+`hint_anchors` / `forbidden_sentinels` for chained resumes.
 
 The resume artifact texts come from the adapter (`proxy_spec.json["resume_artifacts"]`), so other agents can reuse
 the proxy. `upstream: "fake"` returns a canned `end_turn` reply (dry run).

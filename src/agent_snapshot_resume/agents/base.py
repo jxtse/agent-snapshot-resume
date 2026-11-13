@@ -62,6 +62,10 @@ class AgentAdapter(ABC):
         """Copy auxiliary files the resumed agent needs into out_dir (bundle/aux). Returns counts per kind."""
         return {}
 
+    def bg_output_trailer(self, ir: dict[str, Any], raw_lines: list[str]) -> str | None:
+        """Text the agent appends to a finished background task's output file ("{rc}" = exit code), or None."""
+        return None
+
     @abstractmethod
     def install_commands(self, version: str | None = None) -> list[tuple[str, str, int]]:
         """[(step_name, shell_command, timeout_s)] run as root in the source sandbox. Must verify sha256."""
@@ -136,6 +140,19 @@ class SnapshotResumeAgentMixin:
         spec.pop("key_file", None)
         if spec.get("model"):
             raise ValueError("proxy-side model override is not supported; set the agent model in the job config")
+        gate = getattr(self.options, "parity_gate", "auto") or "auto"
+        if gate != "off":
+            from ..proxy.resume_proxy import route_from_passthrough_args
+            exp = meta.get("orig_request_at_k")
+            if exp:
+                spec["first_request_parity"] = dict(exp, route=route_from_passthrough_args(
+                    getattr(self.options, "passthrough_args", None) or []))
+            elif gate == "require":
+                raise RuntimeError("parity_gate=require but the bundle has no orig_request_at_k (original proxy log "
+                                   f"missing or ambiguous: {meta.get('orig_request_locate_error')}); "
+                                   "use parity_gate=auto/off to run without the first-request parity gate")
+        if getattr(self.options, "max_model_requests", None):
+            spec["max_model_requests"] = int(self.options.max_model_requests)
         (logs / "proxy_spec.json").write_text(json.dumps(spec, ensure_ascii=False, indent=1))
         t0 = time.time()
         if not self.options.upstream_fake:

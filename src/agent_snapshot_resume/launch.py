@@ -77,7 +77,8 @@ def build_job_config(*, adapter, bundle: Path, task_dir: Path, job_name: str, jo
                      verifier: bool = True, model: str | None = None, upstream_url: str | None = None,
                      extra_env: dict[str, str] | None = None, extra_kwargs: dict[str, Any] | None = None,
                      original_trial_dir: str | None = None, setup_timeout_s: float = 1200.0,
-                     passthrough_args: list[str] | None = None) -> dict[str, Any]:
+                     passthrough_args: list[str] | None = None, parity_gate: str = "auto",
+                     max_model_requests: int | None = None) -> dict[str, Any]:
     bundle, meta = load_bundle(bundle)
     bundle = bundle.resolve()
     task_dir = task_dir.resolve()
@@ -107,7 +108,14 @@ def build_job_config(*, adapter, bundle: Path, task_dir: Path, job_name: str, jo
     agent_env = {**getattr(adapter, "default_env", {}), **orig_env, **(extra_env or {})}
     upstream_url = upstream_url or config.upstream_url()
     kwargs = {**orig_kwargs, **(extra_kwargs or {}), "version": meta.get("agent_version_orig") or adapter.version,
-              "resume_bundle": str(bundle), "upstream_fake": bool(fake)}
+              "resume_bundle": str(bundle), "upstream_fake": bool(fake), "parity_gate": parity_gate}
+    if parity_gate == "require" and not meta.get("orig_request_at_k"):
+        raise SystemExit("--parity-gate require: bundle has no orig_request_at_k "
+                         f"({meta.get('orig_request_locate_error')})")
+    if max_model_requests is not None:
+        if max_model_requests < 1:
+            raise SystemExit("--max-model-requests must be >= 1")
+        kwargs["max_model_requests"] = int(max_model_requests)
     if passthrough_args:
         from .proxy.runtime import validate_passthrough_args
         kwargs["passthrough_args"] = validate_passthrough_args(passthrough_args)

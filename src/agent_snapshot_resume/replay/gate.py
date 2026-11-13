@@ -1,7 +1,8 @@
 """Fail-closed gates for source replay and restored task/auxiliary files.
 
 validate_replay(plan, report, rc, reviewed_exceptions) raises unless every planned action replayed with an accepted
-fidelity. Outputs that differ only in known-benign ways (hardware/memory probes, shell clocks, cProfile timings,
+fidelity. Two generic classes are accepted without review (`automatic_equivalence`: ls `.`/`..` rows, timing lines of
+commands that measure wall time). Other outputs that differ only in known-benign ways (hardware/memory probes, shell clocks, cProfile timings,
 terminal `| grep` no-match exit codes, original timeouts) are accepted ONLY when the bundle lists a reviewed exception
 bound to the exact command's sha256 (bundle.json `replay_reviewed_exceptions`: {call_id: {kind, command_sha256, ...}}).
 """
@@ -33,6 +34,174 @@ def profile_without_times(text):
     return science, header.groups(), count.groups(), sorted(rows)
 
 
+import re  # noqa: E402
+
+WRITES = re.compile(r"open\([^)]*['\"][wax]b?\+?['\"]|\.to_(?:csv|parquet|pickle|json|hdf|feather)\(|savefig|"
+                    r"np\.save|\.write(?:_text|_bytes)?\(|\.dump\(|mkdir|>\s*\S|\btee\b|\brm\b|\bmv\b|\bcp\b|"
+                    r"shutil|os\.remove|unlink|\bsed\s+-i|pip3?\s+install")
+
+
+TIMING_BEFORE = r"(?i)\b(?:time|timing|elapsed|took|duration|runtime|wall(?:time)?|wall[ -]clock|in)\s*[:=]?\s*$"
+TIMING_AFTER = r"(?i)^\s*(?:s|sec|secs|seconds|ms|min|minutes)\b"
+
+
+def _only_timing_numbers_differ(a, b):
+    """Same line with every differing number directly labelled as a duration ("time 0.85", "took 3.2 s")."""
+    import re
+    num = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
+    ma, mb = list(num.finditer(a)), list(num.finditer(b))
+    if len(ma) != len(mb) or num.sub("#", a) != num.sub("#", b):
+        return False
+    for x, y in zip(ma, mb):
+        if x.group() == y.group():
+            continue
+        if not (re.search(TIMING_BEFORE, a[:x.start()]) or re.search(TIMING_AFTER, a[x.end():])):
+            return False
+    return True
+TIMING_CALL = r"time\.time\(|perf_counter|time\.monotonic|process_time|timeit|datetime\.now\(|\btime\s+(?:python|bash|\./)"
+
+
+def _replayed_text(result):
+    """The tool_result text Claude Code would have shown for the replayed command (see replay_inside)."""
+    from .replay_inside import cc_bash_text
+    new = cc_bash_text({"stdout": result.get("stdout_full", ""), "stderr": result.get("stderr_full", "")})
+    rc = result.get("rc")
+    if rc not in (None, 0) and not new.startswith("Exit code"):
+        new = f"Exit code {rc}\n" + new
+    return new
+
+
+def _heredoc_split(command):
+    """(shell text, heredoc bodies) of a command; the bodies of `<<'EOF' ... EOF` blocks are program text."""
+    import re
+    shell, bodies, rest = [], [], command
+    while True:
+        m = re.search(r"<<-?\s*['\"]?(\w+)['\"]?[^\n]*\n", rest)
+        if not m:
+            shell.append(rest)
+            break
+        shell.append(rest[:m.end()])
+        end = re.search(r"(?m)^\s*" + re.escape(m.group(1)) + r"\s*$", rest[m.end():])
+        if not end:
+            bodies.append(rest[m.end():])
+            break
+        bodies.append(rest[m.end():m.end() + end.start()])
+        rest = rest[m.end() + end.end():]
+    return "".join(shell), "\n".join(bodies)
+
+
+def _shell_part(command):
+    s = _heredoc_split(command)[0]
+    return s.replace("2>&1", "").replace(">/dev/null", "").replace("> /dev/null", "").replace("2>/dev/null", "")
+
+
+def _heredoc_part(command):
+    return _heredoc_split(command)[1]
+
+
+def automatic_equivalence(action, result):
+    """Generic, review-free acceptance classes for replay outputs that differ only in ways that cannot reflect a
+    different task state. Returns a reason string or None. Each class is narrow and checked on the full output:
+      cc_grep_no_match      last pipeline stage is grep/rg, replay rc=1 (no match), the original was not an error (CC
+                            renders that case as success) and the full stdout is identical; no stderr.
+      ls_dot_entries_only   `ls -l*` listings whose only difference is the `.`/`..` rows and `total` block counts
+                            (some sandbox filesystems omit them); every other line identical up to column padding.
+      readonly_listing_order_only
+                            a read-only command (no file writes, redirections, installs) that lists a directory
+                            (glob/listdir/walk/iterdir/find); every output line has the same tokens, only their order
+                            within the line differs (ties broken by filesystem order).
+      shell_diagnostic_prefix_only
+                            bash's own error prefix differs (`/bin/bash: eval: line 18:` vs `bash: -c: line 9:`),
+                            the rest identical (possibly reordered, as stderr is interleaved differently).
+      shell_time_report_only
+                            the command uses the shell `time` keyword (TIMEFORMAT) or /usr/bin/time; after removing
+                            the timing report lines and blank lines the output is identical in order (after the
+                            replayer's volatile masking of dates/addresses/durations).
+      volatile_and_order_only
+                            the replayer's volatile masking (addresses, dates, durations) and line reordering
+                            (stderr interleaving) together make the outputs equal.
+      agent_state_read_only a command without writes that reads the agent's own session/log files (seeded at
+                            launch, absent during replay) and failed with "No such file" for such a path.
+      cprofile_timings_only a cProfile/pstats table (possibly truncated by head) with identical rows: call counts and
+                            function identities in the same order; only the four timing columns and the header's
+                            total seconds differ. All non-table lines identical.
+      timing_lines_only     the command measures wall time (time.time()/perf_counter/...), the exit outcome is the
+                            same, and every differing number sits directly after a duration label ("time", "took",
+                            "elapsed", ...) or before a time unit ("s", "ms", ...); everything else byte-identical
+                            after whitespace normalisation.
+    """
+    import re
+    from .replay_inside import norm
+    if result.get("status") != "ran" or result.get("timeout"):
+        return None
+    command = (action.get("args") or {}).get("command", "")
+    # Claude Code reports a command whose last pipeline stage is grep/rg returning 1 (no match) as a non-error.
+    last = command.rstrip().splitlines()[-1] if command.strip() else ""
+    if (result.get("rc") == 1 and not action.get("is_error") and re.search(r"\|\s*(?:grep|rg|egrep)\s", last)
+            and not result.get("stderr_full")
+            and norm(action.get("orig_text") or "") == norm(result.get("stdout_full", ""))):
+        return "cc_grep_no_match"
+    # a command without writes that reads the agent's own session/logs: they are seeded at launch, not during replay
+    if (re.search(r"/logs/agent/|CLAUDE_CONFIG_DIR|\.claude/projects/", command) and not WRITES.search(_shell_part(command))
+            and not WRITES.search(_heredoc_part(command).replace(">", "")) and result.get("rc") not in (None, 0)
+            and re.search(r"No such file or directory:? '?(?:/logs/agent/|\S*\.claude/)", result.get("stderr_full", ""))):
+        return "agent_state_read_only"
+    if bool(result.get("rc")) != bool(action.get("is_error")):
+        return None
+    old = norm(action.get("orig_text") or "").splitlines()
+    new = norm(_replayed_text(result)).splitlines()
+    ls_dot = re.compile(r"^d\S+\s+\d+\s+\S+\s+\S+\s+\d+\s+\S+\s+\d+\s+\S+\s\.{1,2}$")
+    if re.search(r"\bls\s+-\w*l", command):
+        strip = lambda ls: [l.split() for l in ls if not ls_dot.fullmatch(l) and not re.fullmatch(r"total \d+", l)]
+        if strip(old) == strip(new) and strip(old) and any(ls_dot.fullmatch(l) for l in old + new):
+            return "ls_dot_entries_only"
+    listing = re.search(r"\b(?:glob\.i?glob|os\.listdir|os\.scandir|os\.walk)\(|\.(?:r?glob|iterdir)\(|\bfind\s",
+                        command)
+    if (listing and not WRITES.search(_shell_part(command)) and not WRITES.search(_heredoc_part(command).replace(">", ""))
+            and len(old) == len(new) and old != new
+            and all(sorted(a.split()) == sorted(b.split()) for a, b in zip(old, new))):
+        return "readonly_listing_order_only"
+    # bash diagnostics carry the shell's own location prefix, which depends on how the command was invoked
+    # (Claude Code: `/bin/bash: eval: line 18:`, replay: `bash: -c: line 9:`); stderr may land elsewhere in the text
+    diag = re.compile(r"^(?:/bin/|/usr/bin/)?bash:(?: eval:| -c:)? line \d+: ")
+    if any(diag.match(l) for l in old + new):
+        d_old = [diag.sub("bash: line <n>: ", l) for l in old]
+        d_new = [diag.sub("bash: line <n>: ", l) for l in new]
+        if d_old == d_new or sorted(d_old) == sorted(d_new):
+            return "shell_diagnostic_prefix_only"
+    # `time cmd` / TIMEFORMAT / /usr/bin/time reports go to stderr, which Claude Code interleaves differently
+    if re.search(r"(?:^|[;&|(]\s*)time\s|\bTIMEFORMAT=|/usr/bin/time\b", command, re.M):
+        tfmt = re.search(r"TIMEFORMAT=['\"]?([^'\";]*)", command)
+        rep = [re.compile(r"^(?:real|user|sys)\s+\d+m\d+(?:\.\d+)?s$|^(?:real|user|sys)\s+\d+(?:\.\d+)?$")]
+        if tfmt:
+            pat = re.escape(tfmt.group(1).strip())
+            pat = re.sub(r"%\\?\d?l?[RUSP]", r"\\d+(?:\\.\\d+)?", pat.replace("\\%", "%"))
+            rep.append(re.compile("^" + pat + "$"))
+        drop = lambda ls: [l for l in ls if l.strip() and not any(r.match(l.strip()) for r in rep)]
+        n_rep = sum(1 for l in old + new if l.strip() and any(r.match(l.strip()) for r in rep))
+        from .replay_inside import volatile_free
+        if n_rep and (drop(old) == drop(new) or
+                      volatile_free("\n".join(drop(old))) == volatile_free("\n".join(drop(new)))):
+            return "shell_time_report_only"
+    # addresses/dates/timings masked AND stderr interleaved differently: each alone is accepted by the replayer
+    from .replay_inside import volatile_free
+    vo = sorted(volatile_free("\n".join(old)).splitlines())
+    vn = sorted(volatile_free("\n".join(new)).splitlines())
+    if vo == vn and old != new:
+        return "volatile_and_order_only"
+    if re.search(r"\bcProfile\b|\bprofile\.run\(|pstats", command) and len(old) == len(new):
+        row = re.compile(r"\s*(\d+(?:/\d+)?)\s+(?:\d+\.\d+\s+){4}(.+)")
+        hdr = re.compile(r"(\s*\d+ function calls(?: \(\d+ primitive calls\))? in )\d+(?:\.\d+)?( seconds)")
+        key = lambda l: (row.fullmatch(l).groups() if row.fullmatch(l) else ("", hdr.sub(r"\1<t>\2", l)))
+        if any(row.fullmatch(l) for l in old) and [key(l) for l in old] == [key(l) for l in new]:
+            return "cprofile_timings_only"
+    if re.search(TIMING_CALL, command) and len(old) == len(new):
+        diff = [(a, b) for a, b in zip(old, new) if a != b]
+        if diff and all(_only_timing_numbers_differ(a, b) for a, b in diff):
+            return "timing_lines_only"
+    return None
+
+
 def validate_replay(plan, report, rc, reviewed_exceptions=None):
     reviewed_exceptions = reviewed_exceptions or {}
     if str(rc).strip() != '0' or len(report.get('results', [])) != len(plan['actions']):
@@ -45,14 +214,20 @@ def validate_replay(plan, report, rc, reviewed_exceptions=None):
         fidelity=result.get('fidelity')
         exit_reviewed = False
         if action['side_effect']=='exec_background':
-            if not (action.get('bg_finished_before_k',True) and action.get('bg_status')=='completed'
-                    and result.get('rc')==0 and fidelity=='bg_rerun_foreground'
+            # completed -> rc 0; failed (Claude Code: non-zero exit) -> non-zero rc, same as the original task status
+            status_same = ((action.get('bg_status') == 'completed' and result.get('rc') == 0) or
+                           (action.get('bg_status') == 'failed' and result.get('rc') not in (None, 0)))
+            if not (action.get('bg_finished_before_k',True) and status_same
+                    and fidelity=='bg_rerun_foreground'
                     and result.get('background_output_file')==action.get('background_output_file')
                     and result.get('background_output_sha256')):
                 raise RuntimeError('Completed background output not restored: '+action['call_id'])
         elif (action['side_effect']=='task_mgmt' and action.get('tool') in ('TaskCreate','TaskUpdate')
               and fidelity=='task_mgmt_restored_from_session'):
             result['deferred_gate'] = 'session auxiliary files must be hash-verified after clone seeding, before CC starts'
+        elif fidelity not in allowed and action['side_effect'] == 'exec' and automatic_equivalence(action, result):
+            result['automatic_equivalence'] = automatic_equivalence(action, result)
+            exit_reviewed = result['automatic_equivalence'] in ('cc_grep_no_match', 'agent_state_read_only')
         elif fidelity not in allowed:
             import hashlib, re
             review = reviewed_exceptions.get(action['call_id'], {})
@@ -137,11 +312,27 @@ def validate_replay(plan, report, rc, reviewed_exceptions=None):
             glob_order = (review.get('kind') == 'readonly_unsorted_glob_pick' and bound and
                 fidelity in ('differs', 'numbers_differ') and re.search(r'glob\.glob\([^)]*\)\[0\]', command) is not None and
                 writes.search(command) is None and result.get('rc') == 0 and not action.get('is_error'))
+            # One unlabelled duration printed by a command that measures wall time (e.g. `print(fit(x), time.time()-t)`)
+            num_re2 = re.compile(r'[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?')
+            diff_nums = ([(x.group(), y.group()) for a_, b_ in zip(old, new) for x, y in
+                          zip(num_re2.finditer(a_), num_re2.finditer(b_)) if x.group() != y.group()]
+                         if len(old) == len(new) else None)
+            timing_number = (review.get('kind') == 'unlabelled_timing_number' and bound and
+                re.search(TIMING_CALL, command) is not None and diff_nums is not None and len(diff_nums) == 1 and
+                num_re2.sub('#', '\n'.join(old)) == num_re2.sub('#', '\n'.join(new)) and
+                bool(result.get('rc')) == bool(action.get('is_error')))
+            # Same items listed in a different (filesystem) order by a command that also writes files: reviewed,
+            # because the reviewer must check that the writes do not depend on that order.
+            listing_line = (review.get('kind') == 'listing_order_line' and bound and len(old) == len(new) and
+                all(sorted(re.findall(r"[\w.-]+", a_)) == sorted(re.findall(r"[\w.-]+", b_)) for a_, b_ in zip(old, new))
+                and bool(result.get('rc')) == bool(action.get('is_error')))
             if not (hardware_only or memory_only or terminal_grep_only or profile_only or timed_grep or timeout_same
-                    or ls_dot_only or unseeded or persisted_same or glob_order):
+                    or ls_dot_only or unseeded or persisted_same or glob_order or timing_number or listing_line):
                 raise RuntimeError('Unaccepted replay fidelity '+str(fidelity)+': '+action['call_id'])
             exit_reviewed = terminal_grep_only or timed_grep or timeout_same
-            result['reviewed_exception'] = ('replayed stdout identical to the persisted full original output (CC showed a preview)' if persisted_same else
+            result['reviewed_exception'] = ('single unlabelled wall-time number differs (command measures time)' if timing_number else
+                'same items listed in a different filesystem order; writes reviewed as order-independent' if listing_line else
+                'replayed stdout identical to the persisted full original output (CC showed a preview)' if persisted_same else
                 'read-only probe; unsorted glob(...)[0] picked a different file in this filesystem order' if glob_order else
                 'identical ls rows; only the filesystem-dependent ./.. entries and total block count differ' if ls_dot_only else
                 'unseeded RNG probe: identical text with numbers masked; reviewed as not affecting task state' if unseeded else

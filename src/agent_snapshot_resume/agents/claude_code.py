@@ -63,6 +63,13 @@ class ClaudeCodeAdapter(AgentAdapter):
     default_env = BASE_ENV
     harbor_import_path = "agent_snapshot_resume.agents.claude_code:ClaudeCodeSnapshotResume"
 
+    def bg_output_trailer(self, ir, raw_lines):
+        """Claude Code (seen in 2.1.280) ends a finished background task's output file with "\n[exited with code N]\n".
+        Used when the session shows it (a read of such a file) or the version is known to write it."""
+        seen = any("[exited with code " in l for l in raw_lines)
+        v = tuple(int(x) for x in re.findall(r"\d+", ir.get("cc_version") or "")[:3]) or (0,)
+        return "\n[exited with code {rc}]\n" if seen or v >= (2, 1, 280) else None
+
     def find_session(self, trial_dir: Path) -> Path:
         cands = sorted(glob.glob(os.path.join(trial_dir, "agent", "sessions", "projects", "*", "*.jsonl")))
         if not cands:
@@ -232,6 +239,11 @@ class ClaudeCodeSnapshotResumeOptions(ClaudeCodeOptions):
     # Extra flags for the in-sandbox passthrough proxy, e.g. ["--drop-fields", "metadata", "--strip-is-error"] to
     # reproduce a route that needed them (whitelisted in proxy.runtime.validate_passthrough_args).
     passthrough_args: list[str] | None = Field(default=None)
+    # First-request parity gate in the resume proxy (fail closed): "auto" (default: gate whenever the bundle recorded
+    # the original request at the cut), "require" (refuse to run without that record), "off".
+    parity_gate: str = Field(default="auto")
+    # Stop the continuation after this many model requests, sub-agents included (the resume proxy refuses later ones).
+    max_model_requests: int | None = Field(default=None)
 
 
 class ClaudeCodeSnapshotResume(SnapshotResumeAgentMixin, ClaudeCode):

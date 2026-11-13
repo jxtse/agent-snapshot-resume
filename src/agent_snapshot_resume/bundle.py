@@ -21,6 +21,7 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
+from . import parity
 from .trace import ir as trace_ir
 
 SENTINEL_PREFIX = "ZZZ_RESUME_SENTINEL_"
@@ -67,10 +68,39 @@ def snapshot_cut_identity(bundle_dir: Path) -> dict[str, Any]:
             "replay_reviewed_exceptions": meta.get("replay_reviewed_exceptions") or {}}
 
 
-def build(*, adapter, trial_dir: Path, atif_step: int, out: Path, mode: str = "same", hint: str | None = None,
+def plan_with_observations(ir: dict[str, Any], k: int) -> dict[str, Any]:
+    """Replay plan for steps < k with each action's original observation text attached (`orig_text`)."""
+    plan = trace_ir.replay_plan(ir, k)
+    obs: dict[str, Any] = {}
+    for s in ir["steps"][:k]:
+        for e in s["events"]:
+            if e["type"] == "observation":
+                obs[e["call_id"]] = e["text"]
+    for sc in ir["sidechains"]:
+        for c in sc["tool_calls"]:
+            obs.setdefault(c["call_id"], c.get("observation_text"))
+    for a in plan["actions"]:
+        a["orig_text"] = obs.get(a["call_id"])
+    return plan
+
+
+def step_for_cut_line(ir: dict[str, Any], cut_line: int, trimmed=None) -> int:
+    """ATIF step id of the agent step that starts at session line cut_line (0-based; = number of prefix lines kept).
+    Accepts the step's first line or its trimmed cut (adapter.cut_line, e.g. without trailing bookkeeping lines)."""
+    for st in ir["steps"]:
+        if st["source"] == "agent" and (st["line_range"][0] == cut_line or
+                                        (trimmed is not None and trimmed(st["index"]) == cut_line)):
+            return st["atif_step_id"]
+    near = sorted((abs(st["line_range"][0] - cut_line), st["line_range"][0], st["atif_step_id"])
+                  for st in ir["steps"] if st["source"] == "agent")[:4]
+    raise SystemExit(f"no agent step starts at session line {cut_line}; nearest (line, step): "
+                     f"{[(ln, sid) for _, ln, sid in near]}")
+
+
+def build(*, adapter, trial_dir: Path, atif_step: int | None, out: Path, mode: str = "same", hint: str | None = None,
           agent_timeout: float | None = None, task_dir: Path | None = None, run_id: str | None = None,
           model: str | None = None, pin_date: bool = True, fingerprint_roots: list[str] | None = None,
-          force: bool = False, persist_hint: bool = False) -> tuple[Path, dict[str, Any]]:
+          force: bool = False, persist_hint: bool = False, cut_line: int | None = None) -> tuple[Path, dict[str, Any]]:
     if mode not in ("same", "hint"):
         raise SystemExit("--mode must be same or hint")
     if mode == "hint" and not hint:
@@ -86,30 +116,26 @@ def build(*, adapter, trial_dir: Path, atif_step: int, out: Path, mode: str = "s
     ir = adapter.load_trace(trial_dir, agent_timeout_s=timeout, task=task, reward=reward)
     if ir.get("error"):
         raise SystemExit(f"{trial}: {ir['error']}")
+    if (atif_step is None) == (cut_line is None):
+        raise SystemExit("give exactly one of --step / --cut-line")
+    sess_path = trial_dir / ir["sources"]["session_jsonl"]
+    with open(sess_path, encoding="utf-8") as f:
+        raw_lines = [l for l in f.read().split("\n") if l.strip()]
+    if atif_step is None:
+        atif_step = step_for_cut_line(ir, int(cut_line), lambda i: adapter.cut_line(raw_lines, ir, i))
     k = trace_ir.step_index(ir, atif_step)
     st = ir["steps"][k]
     if st["source"] != "agent":
         raise SystemExit("resume step must be an agent step")
     prev = ir["steps"][k - 1]
-    sess_path = trial_dir / ir["sources"]["session_jsonl"]
-    with open(sess_path, encoding="utf-8") as f:
-        raw_lines = [l for l in f.read().split("\n") if l.strip()]
     cut = adapter.cut_line(raw_lines, ir, k)
-    plan = trace_ir.replay_plan(ir, k)
-    # attach original observation text for fidelity comparison
-    obs: dict[str, Any] = {}
-    for s in ir["steps"][:k]:
-        for e in s["events"]:
-            if e["type"] == "observation":
-                obs[e["call_id"]] = e["text"]
-    for sc in ir["sidechains"]:
-        for c in sc["tool_calls"]:
-            obs.setdefault(c["call_id"], c.get("observation_text"))
-    for a in plan["actions"]:
-        a["orig_text"] = obs.get(a["call_id"])
+    plan = plan_with_observations(ir, k)
     first_cwd = next((json.loads(trace_ir._REDACT_RE.sub(r"\1null", l)).get("cwd")
                       for l in raw_lines if '"cwd"' in l), None)
     plan["initial_cwd"] = first_cwd
+    trailer = adapter.bg_output_trailer(ir, raw_lines)
+    if trailer and any(a.get("side_effect") == "exec_background" for a in plan["actions"]):
+        plan["bg_output_trailer"] = trailer
     run_id = re.sub(r"[^A-Za-z0-9_.-]", "-", run_id or default_run_id(trial, atif_step, mode))
     bdir = Path(out) / run_id
     if bdir.exists():
@@ -129,6 +155,10 @@ def build(*, adapter, trial_dir: Path, atif_step: int, out: Path, mode: str = "s
         raise SystemExit(f"no agent budget left at step {atif_step} (elapsed {st['elapsed_s']} s >= {timeout} s)")
     orig_date = (ir["start_ts"] or "")[:10]
     sentinel = sentinel_for(run_id)
+    n_compactions = sum(1 for s in ir["steps"][:k] for e in s["events"] if e["type"] == "compaction_boundary")
+    loc = parity.locate_request(ir, k, parity.original_requests(trial_dir))
+    orig_request = (parity.expected_from_record(loc["record"], index=loc["index"], method=loc["method"])
+                    if "record" in loc else None)
     agent_model = model or ((result.get("config") or {}).get("agent") or {}).get("model_name") or ir.get("model")
     meta = {
         "run_id": run_id, "agent": adapter.name, "trial": trial, "trial_dir": str(trial_dir), "task": task,
@@ -140,6 +170,8 @@ def build(*, adapter, trial_dir: Path, atif_step: int, out: Path, mode: str = "s
         "agent_timeout_task_s": timeout, "agent_budget_s": budget, "orig_date": orig_date, "mode": mode,
         "hint": hint, "model": agent_model, "sentinel": sentinel, "aux_counts": aux_counts,
         "resume_cost": rp, "n_replay_actions": len(plan["actions"]), "flags": ir["flags"],
+        "n_compactions_before_cut": n_compactions, "orig_request_at_k": orig_request,
+        "orig_request_locate_error": loc.get("error"),
         "fingerprint_roots": fingerprint_roots or None,
         "replay_reviewed_exceptions": {},
         "built_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
