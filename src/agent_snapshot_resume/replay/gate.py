@@ -255,6 +255,9 @@ def automatic_equivalence(action, result):
                             the command runs `ls -l`; only the date column of rows in ls -l format differs, for rows
                             whose original date is at/after the original run's first action (files the run created
                             and the replay re-created), plus the stderr placement freedom above; stdout order kept.
+      cprofile_time_sorted_rows_only
+                            as cprofile_timings_only, for profiles sorted by a time column: the same rows (function
+                            identity + call counts) and header, in an order that may differ where times are close.
       cprofile_timings_only a cProfile/pstats table (possibly truncated by head) with identical rows: call counts and
                             function identities in the same order; only the four timing columns and the header's
                             total seconds differ. All non-table lines identical.
@@ -323,6 +326,12 @@ def automatic_equivalence(action, result):
         key = lambda l: (row.fullmatch(l).groups() if row.fullmatch(l) else ("", hdr.sub(r"\1<t>\2", l)))
         if any(row.fullmatch(l) for l in old) and [key(l) for l in old] == [key(l) for l in new]:
             return "cprofile_timings_only"
+        # sorted by a time column (-s cumtime/tottime/time): rows with near-equal times may swap; the same rows
+        # (function identities and call counts, the deterministic part) in another order
+        if (re.search(r"-s\s+(?:cumtime|cumulative|tottime|time)\b|sort_stats\(\s*['\"](?:cumtime|cumulative|tottime|time)",
+                      command)
+                and any(row.fullmatch(l) for l in old) and sorted(map(key, old)) == sorted(map(key, new))):
+            return "cprofile_time_sorted_rows_only"
     if len(old) == len(new) and old != new and all(line_equivalent(x, y, command, result)
                                                      for x, y in zip(old, new)):
         return "evidence_bound_volatile"
@@ -344,7 +353,19 @@ def validate_replay(plan, report, rc, reviewed_exceptions=None):
     order_maps = {'same_lines_reordered': None, 'line_alignment_and_order_only': lambda l: l.strip()}
     import re as _re
     run_start = (plan.get('actions') or [{}])[0].get('timestamp')  # original run's first action (UTC)
-    planned_ids = {a['call_id'] for a in plan['actions']}
+    # content reads of each background output file in this plan: a Bash cat/head/tail/sed/grep/awk of that file
+    # whose original result showed text (compared with the replay like every exec action); a path mention or
+    # metadata probe (ls, stat, test -f) is not a read of the failure output
+    bg_files = {a.get('background_output_file') for a in plan['actions'] if a.get('background_output_file')}
+    content_reads = {}
+    for a in plan['actions']:
+        f_cmd = (a.get('args') or {}).get('command', '') if a.get('tool') == 'Bash' else ''
+        o_txt = (a.get('orig_text') or '').strip()
+        if a.get('side_effect') != 'exec' or not o_txt or o_txt == '(Bash completed with no output)':
+            continue
+        for bf in bg_files:
+            if _re.search(r"\b(?:cat|head|tail|sed|grep|egrep|awk)\b[^|;&]*" + _re.escape(bf), f_cmd):
+                content_reads.setdefault(bf, set()).add(a['call_id'])
     # background output files written by a command that uses the shell `time` keyword: a later read of such a file
     # shows that command's timing report (provenance from the plan, not from the reading command)
     time_files = []
@@ -374,7 +395,8 @@ def validate_replay(plan, report, rc, reviewed_exceptions=None):
             orig_code = action.get('bg_exit_code')
             failed_ok = (action.get('bg_status') == 'failed' and orig_code not in (None, 0)
                          and result.get('rc') == orig_code
-                         and (any(c in planned_ids for c in action.get('bg_output_read_later') or ())
+                         and (any(c in content_reads.get(action.get('background_output_file'), ())
+                  for c in action.get('bg_output_read_later') or ())
                               or reviewed_exceptions.get(action['call_id'], {}).get('kind') == 'background_failure'
                               and reviewed_exceptions[action['call_id']].get('command_sha256')
                               == hashlib.sha256((action.get('args') or {}).get('command', '').encode()).hexdigest()))

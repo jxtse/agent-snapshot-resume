@@ -135,8 +135,12 @@ def content_reference(session_lines: list[dict[str, Any]], templates: list[str] 
             n_blocks = len(_bfs(ctx[:ctx.index(d) + 1]))
         a = d.get("attachment") or {}
         if d.get("type") == "attachment" and a.get("type") != "prompt_snapshot":
-            attachments.append({"pos": n_blocks, "type": a.get("type"), "leaves": _leaves(a),
-                                "fields": _fields(a)})
+            leaves = _leaves(a)
+            item = {"pos": n_blocks, "type": a.get("type"), "leaves": leaves, "fields": _fields(a)}
+            body = ((a.get("content") or {}).get("file") or {}).get("content") if a.get("type") == "file" else None
+            if isinstance(body, str) and body in leaves:
+                item["content_leaf"] = leaves.index(body)  # the file text rendered under its Read header
+            attachments.append(item)
     ref: dict[str, Any] = {"message_block_sha256": [block_digest(b) for b in blocks_from_session(ctx)],
                            "n_attachments": sum(1 for d in ctx if d.get("type") == "attachment"),
                            "attachments": attachments, "rendered_templates": templates}

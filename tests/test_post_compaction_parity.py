@@ -214,7 +214,7 @@ class ContentParity(unittest.TestCase):
             self.assertTrue(proxy.rendered_text_problems(bad, att, tpl), bad)
 
     def test_two_files_cannot_swap_contents(self):
-        mk = lambda fn, body: {"type": "file", "leaves": [fn, body], "fields": {"file.filename": [fn]}}
+        mk = lambda fn, body: {"type": "file", "leaves": [fn, body], "fields": {"file.filename": [fn]}, "content_leaf": 1}
         atts = [mk("/app/a.cfg", "mode = fast\nretries = 1\n"), mk("/app/b.cfg", "mode = safe\nretries = 9\n")]
         tpl = {"fixed": ["Result of calling the Read tool:"],
                "slots": [['Called the Read tool with the following input: {"file_path":"\x00"}', ["file.filename"]]]}
@@ -224,6 +224,12 @@ class ContentParity(unittest.TestCase):
         self.assertEqual(proxy.rendered_text_problems(ok, atts, tpl), [])
         swapped = hdr("/app/a.cfg") + body("mode = safe\nretries = 9\n") + "\n" + hdr("/app/b.cfg") + body("mode = fast\nretries = 1\n")
         self.assertTrue(proxy.rendered_text_problems(swapped, atts, tpl))
+        # single-line contents (no trailing newline) are bound to their header too
+        one = [mk("/app/a.cfg", "mode = fast"), mk("/app/b.cfg", "mode = safe")]
+        ok1 = hdr("/app/a.cfg") + "1\tmode = fast\n\n" + hdr("/app/b.cfg") + "1\tmode = safe\n"
+        sw1 = hdr("/app/a.cfg") + "1\tmode = safe\n\n" + hdr("/app/b.cfg") + "1\tmode = fast\n"
+        self.assertEqual(proxy.rendered_text_problems(ok1, one, tpl), [])
+        self.assertTrue(proxy.rendered_text_problems(sw1, one, tpl))
         # a leaf is consumed across rendered blocks too
         used = set()
         self.assertEqual(proxy.rendered_text_problems(ok, atts, tpl, used), [])

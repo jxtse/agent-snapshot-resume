@@ -301,6 +301,19 @@ class BackgroundTasks(unittest.TestCase):
         self.assertFalse(self.ok("failed", 1, code=1, review={"c1": {"kind": "background_failure", "command_sha256": "0"}}))
 
 
+class CProfileSorted(unittest.TestCase):
+    def test_time_sorted_rows_may_swap(self):
+        hdr = "  9810144 function calls (9798384 primitive calls) in {} seconds"
+        rows = ["     93    0.006    0.000    0.900    0.010 __init__.py:1(<module>)",
+                "  37345    0.300    0.000    0.890    0.000 solver.py:504(add_point)"]
+        o = "\n".join([hdr.format("38.063")] + rows)
+        n = "\n".join([hdr.format("38.974")] + rows[::-1]) + "\n"
+        self.assertTrue(passes(*one("python3 -m cProfile -s cumtime s.py | head", o, n)))
+        self.assertFalse(passes(*one("python3 -m cProfile s.py | head", o, n)), "not time-sorted")
+        n2 = n.replace("37345", "37346")
+        self.assertFalse(passes(*one("python3 -m cProfile -s cumtime s.py | head", o, n2)), "call count changed")
+
+
 class FailedBackgroundEvidence(unittest.TestCase):
     def test_plan_records_exit_code_and_adds_output_read(self):
         from agent_snapshot_resume.trace.ir import replay_plan
@@ -336,6 +349,12 @@ class FailedBackgroundEvidence(unittest.TestCase):
         self.assertTrue(passes({"actions": [a, rd]}, {"results": [r, good]}))
         other = dict(good, fidelity="differs", stdout_full="Traceback: ModuleNotFoundError\n")
         self.assertFalse(passes({"actions": [a, rd]}, {"results": [r, other]}), "failed for another reason")
+        for probe in ("ls -la /tmp/t.output", "test -f /tmp/t.output && echo yes", "stat /tmp/t.output"):
+            ls = dict(rd, args={"command": probe}, orig_text="-rw-r--r-- 1 root root 9 /tmp/t.output")
+            res = dict(good, stdout_full="-rw-r--r-- 1 root root 9 /tmp/t.output\n")
+            self.assertFalse(passes({"actions": [a, ls]}, {"results": [r, res]}), probe)
+        other_file = dict(rd, args={"command": "cat /tmp/other.output"})
+        self.assertFalse(passes({"actions": [a, other_file]}, {"results": [r, good]}), "another task's output")
 
 
 class Pacing(unittest.TestCase):

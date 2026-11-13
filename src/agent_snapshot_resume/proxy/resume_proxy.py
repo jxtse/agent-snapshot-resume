@@ -332,9 +332,9 @@ def rendered_text_problems(text, attachments, templates, consumed=None):
     """Parse rendered attachment text in order. Each line must start a whole persisted leaf value of one of
     `attachments` (multi-line values as one contiguous block, exactly), or be a fixed rendering line / filled slot
     template (rendered_line_ok). Reordered, duplicated, altered or foreign lines fail; the longest leaf match wins.
-    A file header (slot template filled by exactly one attachment that has multi-line content) binds the
-    following leaf values to that attachment until its content block is matched (a file's header and its content
-    come from one attachment: no cross-file swaps). Each leaf is
+    A file header (slot template filled by exactly one `file` attachment) binds the following leaf values to that
+    attachment until its content leaf (`content_leaf`: index of the file's content in its leaves) is matched; a
+    file's header and its content come from one attachment, single-line contents included (no cross-file swaps). Each leaf is
     used at most once across all rendered blocks (`consumed`: shared set of (attachment id, leaf index)).
     attachments: [{"leaves": [...], "fields": {...}}]."""
     consumed = set() if consumed is None else consumed
@@ -358,8 +358,8 @@ def rendered_text_problems(text, attachments, templates, consumed=None):
         if best:
             consumed.add(best[1])
             i += best[0]
-            if bound is not None and best[0] > 1:
-                bound = None  # the bound file's content block is done; later lines belong to any attachment
+            if bound is not None and best[1] == (id(bound), bound.get("content_leaf")):
+                bound = None  # the bound file's content is done; later lines belong to any attachment
             continue
         owner = _template_owner(lines[i], attachments, templates)
         if owner is False:
@@ -376,7 +376,7 @@ def _template_owner(line, attachments, templates):
     if not rendered_line_ok(line, attachments, templates):
         return False
     owners = [a for a in attachments if rendered_line_ok(line, [a], {"slots": (templates or {}).get("slots", ())})]
-    return owners[0] if len(owners) == 1 and any(len(v.split("\n")) > 1 for v in owners[0].get("leaves", ())) else None
+    return owners[0] if len(owners) == 1 and owners[0].get("type") == "file" else None
 
 
 def tool_digest(t):
