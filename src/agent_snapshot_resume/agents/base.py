@@ -62,6 +62,11 @@ class AgentAdapter(ABC):
         """Copy auxiliary files the resumed agent needs into out_dir (bundle/aux). Returns counts per kind."""
         return {}
 
+    def rendered_attachment_templates(self, version: str | None) -> list[str] | None:
+        """Line templates (\x00 = an attachment value) of how this agent version renders persisted attachments into
+        a request; None = unknown (content parity then cannot bind rendered attachment text)."""
+        return None
+
     def bg_output_trailer(self, ir: dict[str, Any], raw_lines: list[str]) -> str | None:
         """Text the agent appends to a finished background task's output file ("{rc}" = exit code), or None."""
         return None
@@ -141,11 +146,24 @@ class SnapshotResumeAgentMixin:
         if spec.get("model"):
             raise ValueError("proxy-side model override is not supported; set the agent model in the job config")
         gate = getattr(self.options, "parity_gate", "auto") or "auto"
-        if (gate == "require" and not self.options.upstream_fake
-                and not getattr(self.options, "expected_first_request_sha256", None)):
-            # enforced here too, not only in `asr launch`: a hand-written job config must not bypass it
-            raise RuntimeError("parity_gate=require for a real run needs expected_first_request_sha256 "
-                               "(asr launch --freeze-first-request)")
+        from ..bundle import bundle_identity
+        (logs / "bundle_identity.json").write_text(json.dumps(bundle_identity(bundle), ensure_ascii=False, indent=1))
+        if gate == "require" and not self.options.upstream_fake:
+            # enforced here too, not only in `asr launch`: a hand-written job config must not bypass it. The digest
+            # is re-derived from the fake run's artifacts with the same provenance checks; a bare digest is refused.
+            from ..launch import frozen_first_request_digest
+            src = getattr(self.options, "freeze_first_request", None)
+            if not src:
+                raise RuntimeError("parity_gate=require for a real run needs freeze_first_request "
+                                   "(asr launch --freeze-first-request)")
+            try:
+                digest = frozen_first_request_digest(Path(src), bundle,
+                                                     getattr(self.options, "passthrough_args", None) or [])
+            except SystemExit as exc:
+                raise RuntimeError(str(exc)) from None
+            if getattr(self.options, "expected_first_request_sha256", None) not in (None, digest):
+                raise RuntimeError("expected_first_request_sha256 differs from the fake run's verified request")
+            self.options.expected_first_request_sha256 = digest
         if gate != "off":
             from ..proxy.resume_proxy import route_from_passthrough_args
             exp = meta.get("orig_request_at_k")

@@ -63,26 +63,29 @@ def check_shared_snapshot(source: dict[str, Any], bundle: Path) -> None:
     theirs = source.get("cut_identity")
     if theirs is None and source.get("bundle") and (Path(source["bundle"]) / "bundle.json").is_file():
         theirs = snapshot_cut_identity(Path(source["bundle"]))
+    if theirs is None:
+        raise SystemExit("snapshot state has no cut identity and its bundle is unavailable: cannot verify it matches")
     if theirs != mine:
-        raise SystemExit("snapshot state was prepared from a different bundle (cut identity differs)")
+        diff = sorted(k for k in mine if theirs.get(k) != mine.get(k))
+        raise SystemExit(f"snapshot state was prepared from a different cut (identity differs in {diff})")
     if source.get("agent_version") and mine.get("agent_version_orig") and \
             source["agent_version"] != mine["agent_version_orig"]:
         raise SystemExit(f"snapshot has agent {source['agent_version']}, bundle needs {mine['agent_version_orig']}")
-    print(f"note: sharing snapshot {source.get('snapshot_id')} prepared from bundle {source['run_id']} "
-          "(identical cut identity)", file=sys.stderr)
+    if source.get("run_id") != json.loads((bundle / "bundle.json").read_text()).get("run_id"):
+        print(f"note: sharing snapshot {source.get('snapshot_id')} prepared from bundle {source['run_id']} "
+              "(identical cut identity)", file=sys.stderr)
 
 
-FREEZE_IDENTITY_KEYS = ("run_id", "session_sha256", "cut_line", "sentinel", "mode", "hint", "agent_version_orig",
-                        "orig_request_at_k")
-
-
-def frozen_first_request_digest(path: Path, meta: dict[str, Any], passthrough_args: list[str] | None) -> str:
+def frozen_first_request_digest(path: Path, bundle: Path, passthrough_args: list[str] | None) -> str:
     """Digest of a fake run's rewritten first request (every field except `metadata`), to require the real run's
     first request to be identical. Verified provenance: the parity report next to it judged exactly this request
     (request_sha256), passed, came from a fake run, used the same passthrough route as this launch, and the fake
-    run's bundle has the same identity (session, cut, sentinel, mode, hint, original request) as this bundle."""
+    run's bundle identity (replay plan, reviews, fingerprint roots, cut, session seed + aux files, proxy spec,
+    original request; bundle.bundle_identity, recorded by the agent at startup) equals this bundle's."""
+    from .bundle import bundle_identity
     from .proxy.resume_proxy import request_digest, route_from_passthrough_args
 
+    path = Path(path)
     rec = json.loads(path.read_text())
     body = rec.get("body", rec)
     digest = request_digest(body)
@@ -97,11 +100,12 @@ def frozen_first_request_digest(path: Path, meta: dict[str, Any], passthrough_ar
         problems.append("not a --fake run")
     if (rep.get("route") or {}) != route_from_passthrough_args(passthrough_args or []):
         problems.append(f"fake run route {rep.get('route')} differs from this launch's passthrough args")
-    fake_bundle = path.parent.parent.parent / "resume" / "bundle.json"  # <trial>/agent/resume/bundle.json
-    fake_meta = json.loads(fake_bundle.read_text()) if fake_bundle.is_file() else {}
-    diff = [k for k in FREEZE_IDENTITY_KEYS if fake_meta.get(k) != meta.get(k)]
-    if diff:
-        problems.append(f"fake run's bundle differs from this bundle in {diff}")
+    ident_path = path.parent.parent.parent / "resume" / "bundle_identity.json"  # <trial>/agent/resume/
+    theirs = json.loads(ident_path.read_text()) if ident_path.is_file() else None
+    mine = bundle_identity(Path(bundle))
+    if theirs != mine:
+        diff = sorted(k for k in mine if (theirs or {}).get(k) != mine.get(k)) if theirs else ["<missing>"]
+        problems.append(f"fake run's bundle identity differs from this bundle in {diff}")
     if problems:
         raise SystemExit(f"--freeze-first-request {path}: " + "; ".join(problems))
     return digest
@@ -127,8 +131,7 @@ def build_job_config(*, adapter, bundle: Path, task_dir: Path, job_name: str, jo
             raise SystemExit("--snapshot-id differs from the snapshot state file")
         if not source.get("snapshot_id") or not source.get("replay_gate_passed"):
             raise SystemExit("snapshot source has not passed the replay gates")
-        if source.get("run_id") and source["run_id"] != meta["run_id"]:
-            check_shared_snapshot(source, bundle)
+        check_shared_snapshot(source, bundle)  # always: a rebuilt bundle with the same run id must match too
         hashes = verifier_hashes(task_dir)
         env_kwargs.update(snapshot_id=source["snapshot_id"], expected_fingerprint=source["fingerprint_source"],
                           fingerprint_command=source.get("fingerprint_command"),
@@ -150,7 +153,8 @@ def build_job_config(*, adapter, bundle: Path, task_dir: Path, job_name: str, jo
                          f"({meta.get('orig_request_locate_error')})")
     if freeze_first_request:
         kwargs["expected_first_request_sha256"] = frozen_first_request_digest(
-            Path(freeze_first_request), meta, passthrough_args)
+            Path(freeze_first_request), bundle, passthrough_args)
+        kwargs["freeze_first_request"] = str(Path(freeze_first_request).resolve())
     elif parity_gate == "require" and not fake:
         raise SystemExit("--parity-gate require for a real run needs --freeze-first-request <first_request_rewritten.json "
                          "of a --fake run of this bundle that passed the parity gate>")

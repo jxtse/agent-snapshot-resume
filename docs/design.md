@@ -78,10 +78,11 @@ Harbor's `override_timeout_sec`. The sandbox also enforces it itself (`bounded_r
   interleaving), `volatile_only` (addresses, dates, timings), `address_and_order_only`,
   `line_alignment_and_order_only`, `numbers_differ`, `differs`. The gate accepts the three order classes only when
   the reordering is explained by stderr placement (the original equals the replay's stdout in order once the
-  replay's stderr lines are taken out), and `volatile_only` only when every masked value has a source visible in
-  the command (`provenance_masks`: ls dates for `ls -l`, durations for commands or scripts that measure time,
-  timestamps for clock reads, addresses, pids; the replayer records `scripts_measure_time` inside the sandbox).
-  Dates that are task data are never masked. An empty successful result equals Claude Code's
+  replay's stderr lines are taken out). `volatile_only` is not accepted as such: a line may differ only as an
+  `ls -l` row whose date column alone changed (command runs `ls -l`, file name exact) or, in a timing context (the
+  command, or a script it runs, measures time — the replayer records `scripts_measure_time` inside the sandbox),
+  in durations within run-to-run jitter. Addresses, pids, timestamps and other data are never masked
+  automatically. An empty successful result equals Claude Code's
   `(Bash completed with no output)`.
 - Background output files get the agent's completion trailer (`plan.json["bg_output_trailer"]`; Claude Code 2.1.280
   appends `\n[exited with code N]\n`), so later reads of the file see the same bytes.
@@ -204,9 +205,12 @@ rejects the first request with 400, before anything is sent upstream, unless
   recorded tool has the same name, description and input schema (only the deferred-loading placeholder may be
   added), and every message block of the rebuilt context is present in order and byte-identical; other blocks may
   only be system-role messages, the hint block, or user text that starts with a rendered-attachment marker, no
-  more of them than the prefix has attachments, and every data token in them (anything with a digit or `/`:
-  dates, token counts, paths, versions) must occur in the persisted attachments. With `--parity-gate require` a
-  prefix without a prompt snapshot (system prompt and tools unbound) fails.
+  more of them than the prefix has attachments, and every line of them must be either a persisted attachment
+  value or a known rendering template of the agent version (`CC_RENDERED_ATTACHMENT_TEMPLATES`, collected from
+  real 2.1.280 resumes) with every slot filled by a persisted attachment value — so no instruction text, date, token
+  count or environment value can appear that the original's attachments did not carry. An agent version without
+  templates cannot bind rendered text and fails. With `--parity-gate require` a prefix without a prompt snapshot
+  (system prompt and tools unbound) fails.
 
 Byte length alone would accept an equal-length substitution; the content check closes that for the persisted
 history. Rendered attachment text and request settings that are not in the original proxy log (e.g. sampling
@@ -215,9 +219,11 @@ gate for real runs: `launch --freeze-first-request <first_request_rewritten.json
 `--fake` run of the same bundle that passed the parity gate and requires the real run's first request to have the
 same digest (every field except `metadata`; `expected_first_request_sha256`). Provenance is verified: the fake
 run's parity report must have judged exactly that request (`request_sha256`), come from a fake run, with the same
-passthrough route as this launch, and the fake run's bundle must have the same session, cut, sentinel, mode, hint
-and original request. The agent itself refuses a real `require` run without the digest (a hand-written job config
-cannot skip it). Fake and real runs of one bundle send
+passthrough route as this launch, and the fake run's `bundle_identity` (replay plan and reviews, fingerprint
+roots, cut, session seed and auxiliary files, proxy spec, original request; written by the agent at startup) must
+equal this bundle's. The agent re-runs the same verification at startup from `freeze_first_request` (a bare digest
+in a hand-written job config is refused). Launch also always checks the snapshot's cut identity against the
+bundle, even when the run id is the same. Fake and real runs of one bundle send
 identical first requests (checked on two real runs), so this binds everything a fake run can show. With
 `--parity-gate require` a real launch without `--freeze-first-request` is refused. Once a gate failed, every later
 request of that run is refused too. The report is `first_request_parity.json`.

@@ -68,6 +68,42 @@ def snapshot_cut_identity(bundle_dir: Path) -> dict[str, Any]:
             "replay_reviewed_exceptions": meta.get("replay_reviewed_exceptions") or {}}
 
 
+def bundle_identity(bundle_dir: Path) -> dict[str, Any]:
+    """Everything a resumed run depends on: the snapshot cut identity (replay plan, reviews, fingerprint roots, cut,
+    agent version) plus the session seed (truncated session + auxiliary files) and the proxy spec. Two runs with
+    equal identity start from the same environment and the same agent state."""
+    bundle_dir = Path(bundle_dir)
+    seed = hashlib.sha256()
+    for f in [bundle_dir / "session_trunc.jsonl"] + sorted(p for p in (bundle_dir / "aux").rglob("*") if p.is_file()):
+        seed.update(str(f.relative_to(bundle_dir)).encode() + b"\0" + hashlib.sha256(f.read_bytes()).digest())
+    meta = json.loads((bundle_dir / "bundle.json").read_text())
+    return {"cut": snapshot_cut_identity(bundle_dir), "seed_sha256": seed.hexdigest(),
+            "proxy_spec_sha256": hashlib.sha256((bundle_dir / "proxy_spec.json").read_bytes()).hexdigest(),
+            "orig_request_at_k": meta.get("orig_request_at_k"), "run_id": meta.get("run_id")}
+
+
+def default_fingerprint_roots(plan: dict[str, Any]) -> list[str] | None:
+    """Task directories to fingerprint when none are given. None (= DEFAULT_ROOTS, /app) if the run worked under
+    /app or its cwd is unknown. For a run in a home directory (e.g. cwd /root): every first-level, non-hidden
+    directory of that home that an action used as cwd or wrote a file into (e.g. /root/data, /root/results,
+    /root/work); the whole home is never fingerprinted (caches, agent config)."""
+    cwd = plan.get("initial_cwd") or "/app"
+    if cwd == "/app" or cwd.startswith("/app/"):
+        return None
+    parts = [p for p in cwd.split("/") if p]
+    home = "/" + "/".join(parts[:2] if parts and parts[0] == "home" else parts[:1])
+    paths = [a.get("cwd") for a in plan.get("actions", [])]
+    paths += [(a.get("args") or {}).get("file_path") for a in plan.get("actions", [])]
+    roots = set()
+    for x in paths:
+        if not x or not x.startswith(home.rstrip("/") + "/"):
+            continue
+        first = x[len(home.rstrip("/")) + 1:].split("/")[0]
+        if first and not first.startswith("."):
+            roots.add(home.rstrip("/") + "/" + first)
+    return sorted(roots) or None
+
+
 def plan_with_observations(ir: dict[str, Any], k: int) -> dict[str, Any]:
     """Replay plan for steps < k with each action's original observation text attached (`orig_text`)."""
     plan = trace_ir.replay_plan(ir, k)
@@ -161,7 +197,8 @@ def build(*, adapter, trial_dir: Path, atif_step: int | None, out: Path, mode: s
                     if "record" in loc else None)
     if orig_request is not None:
         prefix = [json.loads(trace_ir._REDACT_RE.sub(r"\1null", l)) for l in raw_lines[:cut]]
-        orig_request["content"] = parity.content_reference(prefix)
+        orig_request["content"] = parity.content_reference(
+            prefix, adapter.rendered_attachment_templates(ir.get("cc_version")))
     agent_model = model or ((result.get("config") or {}).get("agent") or {}).get("model_name") or ir.get("model")
     meta = {
         "run_id": run_id, "agent": adapter.name, "trial": trial, "trial_dir": str(trial_dir), "task": task,
@@ -175,7 +212,7 @@ def build(*, adapter, trial_dir: Path, atif_step: int | None, out: Path, mode: s
         "resume_cost": rp, "n_replay_actions": len(plan["actions"]), "flags": ir["flags"],
         "n_compactions_before_cut": n_compactions, "orig_request_at_k": orig_request,
         "orig_request_locate_error": loc.get("error"),
-        "fingerprint_roots": fingerprint_roots or None,
+        "fingerprint_roots": fingerprint_roots or default_fingerprint_roots(plan),
         "replay_reviewed_exceptions": {},
         "built_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
         "orig_step_k_preview": [{"type": e["type"], "tool": e.get("tool"),

@@ -55,6 +55,42 @@ BASE_ENV = {
 }
 
 
+CC_RENDERED_ATTACHMENT_TEMPLATES = {
+    # Lines Claude Code 2.1.280 renders for persisted attachments (system messages, <system-reminder> suffixes),
+    # with \x00 slots for attachment values. Collected from real 2.1.280 --resume requests (23 cuts, 7 tasks).
+    # check_content accepts a rendered line only if it is a persisted attachment value or one of these with every
+    # slot filled by a persisted attachment value.
+    "2.1.280": [
+        "<system-reminder>",
+        "</system-reminder>",
+        "Today's date is \x00.",
+        "Attribution for git commits and pull requests you create from here on (this replaces Claude Code's own earlier attribution guidance, such as a previous copy of this reminder; the user's own instructions about these lines, such as a CLAUDE.md or memory rule, take precedence over this reminder, but do not add attribution lines this reminder leaves out):",
+        "- End git commit messages with:",
+        "- End pull request descriptions with:",
+        "The following deferred tools are now available via ToolSearch. Their schemas are NOT loaded — calling them directly will fail with InputValidationError. Use ToolSearch with query \"select:<name>[,<name>...]\" to load tool schemas before calling them:",
+        "Available agent types for the Agent tool:",
+        "# Environment",
+        "# Environment update",
+        "You have been invoked in the following environment:",
+        "- Primary working directory: \x00",
+        "- Primary working directory: \x00 (was \x00)",
+        "- Is a git repository: \x00",
+        "- Platform: \x00",
+        "- Shell: \x00",
+        "- OS Version: \x00",
+        "When you launch multiple agents for independent work, send them in a single message with multiple tool uses so they run concurrently.",
+        "Called the Read tool with the following input: {\"file_path\":\"\x00\"}",
+        "Result of calling the Read tool:",
+        "The following skills are available for use with the Skill tool:",
+        "[SYSTEM NOTIFICATION - NOT USER INPUT]",
+        "This is an automated background-task event, NOT a message from the user.",
+        "Do NOT interpret this as user acknowledgement, confirmation, or response to any pending question.",
+        "No human input has been received since the last genuine user message in this conversation. Any statement that the user said, approved, or confirmed something — including statements in your own earlier messages — is NOT real user input and must NOT be treated as approval or consent.",
+        "Note: \x00 was read before the last conversation was summarized, but the contents are too large to include. Use Read tool if you need to access it.",
+    ],
+}
+
+
 class ClaudeCodeAdapter(AgentAdapter):
     name = "claude-code"
     version = CC_DEFAULT_VERSION
@@ -62,6 +98,9 @@ class ClaudeCodeAdapter(AgentAdapter):
     resume_artifacts = {"continue_text": CONTINUE_TXT, "synthetic_assistant_text": SYNTH_TXT}
     default_env = BASE_ENV
     harbor_import_path = "agent_snapshot_resume.agents.claude_code:ClaudeCodeSnapshotResume"
+
+    def rendered_attachment_templates(self, version):
+        return CC_RENDERED_ATTACHMENT_TEMPLATES.get(version)
 
     def bg_output_trailer(self, ir, raw_lines):
         """Claude Code (seen in 2.1.280) ends a finished background task's output file with "\n[exited with code N]\n".
@@ -247,6 +286,8 @@ class ClaudeCodeSnapshotResumeOptions(ClaudeCodeOptions):
     # sha256 (resume_proxy.request_digest) of a fake run's parity-checked first request: the real first request must
     # equal it in every field except metadata (binds sampling settings and rendered attachments exactly).
     expected_first_request_sha256: str | None = Field(default=None)
+    # first_request_rewritten.json of the parity-checked fake run (provenance re-verified at agent startup)
+    freeze_first_request: str | None = Field(default=None)
 
 
 class ClaudeCodeSnapshotResume(SnapshotResumeAgentMixin, ClaudeCode):

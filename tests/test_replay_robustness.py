@@ -132,15 +132,29 @@ class AutomaticEquivalence(unittest.TestCase):
         o, n = "event 2020-01-01T00:00:00 a", "event 2021-05-05T00:00:00 a\n"
         self.assertFalse(passes(*one("cat records", o, n)))
         self.assertFalse(passes(*one("time cat records", "real\t0m0.1s\n" + o, n, stderr="real\t0m0.2s\n")))
-        # a clock read in the command makes its own timestamps volatile
+        # clock-read timestamps are not masked automatically either (a reviewed exception is needed)
         cmd = "python3 -c 'import datetime; print(datetime.datetime.now())'"
-        self.assertTrue(passes(*one(cmd, "2026-11-02 20:17:01.5", "2026-11-13 04:47:09.1\n")))
+        self.assertFalse(passes(*one(cmd, "2026-11-02 20:17:01.5", "2026-11-13 04:47:09.1\n")))
 
     def test_ls_file_names_kept_exact(self):
         o = "total 8\n-rw-r--r-- 1 root root 5 Oct 1 00:00 a b"
         n = ("total 16\ndrwxr-xr-x 2 root root 4096 Oct 1 00:00 .\n"
              "-rw-r--r-- 1 root root 5 Oct 1 00:00 a  b")
         self.assertFalse(passes(*one("ls -la d", o, n)))
+
+    def test_hex_and_data_never_masked(self):
+        self.assertFalse(passes(*one("cat checksum.txt", "0x12345678", "0x87654321\n")))
+        self.assertFalse(passes(*one("time cat m.txt", "real\t0m0.1s\nexposure 10 seconds",
+                                     "exposure 90 seconds\n", stderr="real\t0m0.2s\n")))
+        o = "total 8\n-rw-r--r-- 1 root root 5 Oct 1 00:00 a0x12345678"
+        n = "total 8\ndrwxr-xr-x 2 root root 4096 Oct 1 00:00 .\n-rw-r--r-- 1 root root 5 Oct 1 00:00 a0x87654321"
+        self.assertFalse(passes(*one("ls -la d", o, n)))
+
+    def test_durations_in_timing_context_within_jitter(self):
+        cmd = "python3 - <<'EOF'\nimport time\nt=time.time()\nprint('OK %.1fs n=49' % (time.time()-t))\nEOF"
+        self.assertTrue(passes(*one(cmd, "OK 6.0s n=49", "OK 6.1s n=49\n")))
+        self.assertFalse(passes(*one(cmd, "OK 6.0s n=49", "OK 60.0s n=49\n")), "beyond jitter")
+        self.assertFalse(passes(*one(cmd, "OK 6.0s n=49", "OK 6.1s n=50\n")), "other number")
 
     def test_script_timing_recorded_by_replayer(self):
         p, r = one("python3 gencheck.py", "OK 6.0s n=49", "OK 6.1s n=49\n")

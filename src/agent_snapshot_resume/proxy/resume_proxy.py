@@ -291,22 +291,44 @@ def strip_reminder_suffix(blk):
 
 
 ATTACHMENT_TEXT_PREFIXES = ("<system-reminder>", "<task-notification>")
-_TAG_RE = re.compile(r"</?[A-Za-z_][\w-]*>")
 _LINENO_RE = re.compile(r"(?m)^\s*\d+\t")  # Read-tool rendering "N<TAB>line"
-_EVIDENCE_TOKEN_RE = re.compile(r"[\w./:@+%-]*[\d/][\w./:@+%-]*")
 
 
-def evidence_tokens(text, rendered=False):
-    """Tokens that carry data (contain a digit or '/'): numbers, dates, paths, versions, ids. In rendered text,
-    markup tags and Read-style line-number prefixes are removed first."""
-    if rendered:
-        text = _LINENO_RE.sub("", _TAG_RE.sub(" ", text))
-    out = set()
-    for t in _EVIDENCE_TOKEN_RE.findall(text):
-        t = t.strip(".:,;-")
-        if t and re.search(r"[\d/]", t):
-            out.add(t)
-    return out
+def rendered_line_ok(line, values, templates):
+    """A line of rendered attachment text is explained iff it is a persisted attachment value, or a template with
+    every \x00 slot filled by a persisted attachment value (exact strings, no other text)."""
+    line = line.strip()
+    if not line or line in values:
+        return True
+    for t in templates:
+        parts = t.split("\x00")
+        if len(parts) == 1:
+            if line == t:
+                return True
+            continue
+        if not (line.startswith(parts[0]) and line.endswith(parts[-1])):
+            continue
+        if _fill(line[len(parts[0]):len(line) - len(parts[-1]) if parts[-1] else len(line)], parts[1:-1], values):
+            return True
+    return False
+
+
+def _fill(rest, middles, values):
+    """rest = v1 m1 v2 m2 ... vn with every v a persisted value (backtracking over middle separators)."""
+    if not middles:
+        return rest in values
+    sep = middles[0]
+    i = rest.find(sep)
+    while i >= 0:
+        if rest[:i] in values and _fill(rest[i + len(sep):], middles[1:], values):
+            return True
+        i = rest.find(sep, i + 1)
+    return False
+
+
+def rendered_text_problems(text, values, templates):
+    bad = [l.strip() for l in _LINENO_RE.sub("", text).split("\n") if not rendered_line_ok(l, values, templates)]
+    return bad
 
 
 def tool_digest(t):
@@ -328,8 +350,9 @@ def check_content(body, ref, hints):
       messages       every reference block (session prefix after compaction rebuild) present in order, byte-identical
                      (a tool_result may carry an appended <system-reminder> suffix); every other block must be a
                      system-role message, an exact hint block, or user text that starts with a rendered-attachment
-                     marker; their number must not exceed the prefix's attachment count, and every data token
-                     (digit or '/') in them must occur in the persisted attachments (evidence_tokens)
+                     marker; their number must not exceed the prefix's attachment count, and every line of
+                     them must be a persisted attachment value or a rendering template of the agent version
+                     filled with persisted values (rendered_line_ok)
       completeness   require_complete: fail if the prefix had no prompt snapshot (system/tools unbound)
     """
     problems = []
@@ -377,14 +400,20 @@ def check_content(body, ref, hints):
             problems.append(f"reference block {j} of {len(want)} missing or different")
         if extras > int(ref.get("n_attachments", 0)):
             problems.append(f"{extras} rendered-attachment blocks for {ref.get('n_attachments', 0)} attachments")
-        # Rendered attachment text may only carry data (numbers, dates, paths, ids) that the persisted attachments
-        # carry: a resume-time date, token count, path or environment value that differs is caught here.
-        if "attachment_tokens" in ref:
-            known = set(ref["attachment_tokens"])
-            foreign = sorted({t for txt in rendered for t in evidence_tokens(txt, rendered=True)} - known)
-            if foreign:
-                problems.append(f"rendered attachment text carries data not in the persisted attachments: "
-                                f"{foreign[:8]}")
+        # Every line of rendered attachment text must be a persisted attachment value or a known rendering template
+        # of this agent version filled with persisted values (attachment_values / rendered_templates).
+        if "attachment_values" in ref:
+            values = set(ref["attachment_values"])
+            templates = ref.get("rendered_templates")
+            if templates is None:
+                if rendered:
+                    problems.append("rendered attachment text present but this agent version has no rendering "
+                                    "templates: cannot bind it")
+            else:
+                bad = [l for txt in rendered for l in rendered_text_problems(txt, values, templates)]
+                if bad:
+                    problems.append(f"rendered attachment text not explained by the persisted attachments: "
+                                    f"{[b[:120] for b in bad[:3]]}")
     return problems
 
 

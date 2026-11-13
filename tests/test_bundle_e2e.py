@@ -50,6 +50,15 @@ class BundleE2E(unittest.TestCase):
             build(adapter=get_adapter("claude-code"), trial_dir=TRIAL, atif_step=4, out=self.out / "e",
                   task_dir=TASK, cut_line=self.meta["cut_line"])
 
+    def test_default_fingerprint_roots(self):
+        from agent_snapshot_resume.bundle import default_fingerprint_roots
+        self.assertIsNone(default_fingerprint_roots({"initial_cwd": "/app", "actions": []}))
+        plan = {"initial_cwd": "/root", "actions": [{"cwd": "/root/work"}, {"cwd": "/root/data/dev"},
+                                                    {"args": {"file_path": "/root/results/a.py"}},
+                                                    {"cwd": "/root/.cache"}, {"cwd": "/tmp"}]}
+        self.assertEqual(default_fingerprint_roots(plan), ["/root/data", "/root/results", "/root/work"])
+        self.assertIsNone(default_fingerprint_roots({"initial_cwd": "/root", "actions": [{"cwd": "/root"}]}))
+
     def test_budget_and_metadata(self):
         self.assertEqual(self.meta["agent_timeout_task_s"], 600.0)
         self.assertAlmostEqual(self.meta["agent_budget_s"], 600.0 - self.meta["elapsed_at_k_s"], places=1)

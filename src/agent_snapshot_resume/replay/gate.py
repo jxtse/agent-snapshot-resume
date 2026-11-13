@@ -47,28 +47,35 @@ LS_ROW = re.compile(r"^([-dlcbps][-rwxsStT]{9}[.+@]?\s+\d+\s+\S+\s+\S+\s+[\d,]+)
 TIME_REPORT = re.compile(r"^(?:real|user|sys)\s+(?:\d+m\d+(?:\.\d+)?s|\d+(?:\.\d+)?)$")
 
 
-def provenance_masks(command, scripts_time=False):
-    """Maskers for values whose source is known from the command itself (never applied otherwise):
-    memory addresses and pids always; ls -l dates and totals only for commands running `ls -l`; durations only for
-    commands that measure time (in the command, or in a script it runs: the replayer records that inside the
-    sandbox as `scripts_measure_time`); wall-clock timestamps only for commands that read the clock."""
-    masks = [(re.compile(r"0x[0-9a-fA-F]{6,}"), "<ADDR>"), (re.compile(r"\bpid[= ]\d+"), "pid <N>")]
+DURATION = re.compile(r"(\d+(?:\.\d+)?)(\s?)(s|ms|sec|secs|seconds)\b")
+
+
+def _timing_context(command, result):
+    return bool(re.search(TIMING_CALL, command) or result.get("scripts_measure_time")
+                or re.search(r"(?:^|[;&|(]\s*)time\s|\bTIMEFORMAT=|/usr/bin/time\b", command, re.M))
+
+
+def _durations_close(a, b):
+    """Same line except durations (number + time unit) that differ by at most 50% (run-to-run jitter)."""
+    if DURATION.sub("<D>", a) != DURATION.sub("<D>", b):
+        return False
+    for x, y in zip(DURATION.finditer(a), DURATION.finditer(b)):
+        u, v = float(x.group(1)), float(y.group(1))
+        if x.group(3) != y.group(3) or abs(u - v) > max(0.5 * max(u, v), 0.05):
+            return False
+    return True
+
+
+def line_equivalent(a, b, command, result):
+    """One output line vs its replay, with only evidence-bound differences: an `ls -l` row whose date column alone
+    differs (command runs ls -l; name exact), or durations in a timing context within jitter."""
+    if a == b:
+        return True
     if re.search(r"\bls\s+-\w*l", command):
-        masks += [(LS_ROW, r"\1 <MTIME> \3"), (re.compile(r"^total \d+$"), "total <N>")]
-    if re.search(TIMING_CALL, command) or re.search(r"(?:^|[;&|(]\s*)time\s|\bTIMEFORMAT=|/usr/bin/time\b",
-                                                     command, re.M) or scripts_time:
-        masks += [(TIME_REPORT, "<TIME_REPORT>"),
-                  (re.compile(r"\d+(?:\.\d+)?\s?(?:s|ms|sec|secs|seconds)\b"), "<DUR>")]
-    if re.search(r"datetime\.(?:datetime\.)?now\(|date\.today\(|time\.time\(|(?:^|[;&|]\s*)date(?:\s|$)",
-                 command, re.M):
-        masks += [(re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?"), "<NOW>")]
-    return masks
-
-
-def masked(line, masks):
-    for rx, rep in masks:
-        line = rx.sub(rep, line)
-    return line
+        ma, mb = LS_ROW.match(a), LS_ROW.match(b)
+        if ma and mb and ma.group(1).split() == mb.group(1).split() and ma.group(3) == mb.group(3):
+            return True
+    return _timing_context(command, result) and _durations_close(a, b)
 
 
 TIMING_BEFORE = r"(?i)\b(?:time|timing|elapsed|took|duration|runtime|wall(?:time)?|wall[ -]clock)\s*[:=]?\s*$"
@@ -86,6 +93,9 @@ def _only_timing_numbers_differ(a, b):
         if x.group() == y.group():
             continue
         if not (re.search(TIMING_BEFORE, a[:x.start()]) or re.search(TIMING_AFTER, a[x.end():])):
+            return False
+        u, v = abs(float(x.group())), abs(float(y.group()))
+        if abs(u - v) > max(0.5 * max(u, v), 0.05):  # run-to-run jitter only
             return False
     return True
 TIMING_CALL = r"time\.time\(|perf_counter|time\.monotonic|process_time|timeit|datetime\.now\(|\btime\s+(?:python|bash|\./)"
@@ -159,18 +169,19 @@ def automatic_equivalence(action, result):
       ls_dot_entries_only   `ls -l*` listings whose only difference is the `.`/`..` rows and `total` block counts
                             (some sandbox filesystems omit them); every other row identical up to metadata-column
                             padding, file names exact.
-      volatile_with_provenance
-                            line by line, in order, every differing value is masked by provenance_masks (its source
-                            is visible in the command: ls dates, durations of timed commands, clock reads, addresses).
+      evidence_bound_volatile
+                            line by line, in order, every differing line is an `ls -l` row whose date column alone
+                            differs (command runs ls -l, file name exact) or, in a timing context (the command or a
+                            script it runs measures time, or uses `time`), the same line with durations (number +
+                            time unit) within 50% of each other. No other masking (no addresses, dates, pids).
       shell_diagnostic_prefix_only
                             bash's own error prefix differs (`/bin/bash: eval: line 18:` vs `bash: -c: line 9:`);
                             the original equals the replay's stdout in order once the replay's stderr lines are
                             taken out (stderr placement is the only other freedom).
       shell_time_report_only
                             the command uses the shell `time` keyword (TIMEFORMAT) or /usr/bin/time; after removing
-                            the timing report lines and blank lines the output is identical in order, up to values
-                            whose source the command shows (provenance_masks: ls dates for ls -l, durations for
-                            timed commands, wall-clock stamps for clock reads; addresses, pids).
+                            the timing report lines and blank lines the output is equal line by line in order
+                            (line_equivalent, as for evidence_bound_volatile).
       ls_mtime_and_stderr_placement_only
                             the command runs `ls -l`; only the date column of rows in ls -l format differs (files
                             the replay re-created), plus the stderr placement freedom above; stdout order kept.
@@ -179,8 +190,8 @@ def automatic_equivalence(action, result):
                             total seconds differ. All non-table lines identical.
       timing_lines_only     the command measures wall time (time.time()/perf_counter/...), the exit outcome is the
                             same, and every differing number sits directly after a duration label ("time", "took",
-                            "elapsed", ...) or before a time unit ("s", "ms", ...); everything else byte-identical
-                            after whitespace normalisation.
+                            "elapsed", ...) or before a time unit ("s", "ms", ...) and is within run-to-run jitter
+                            (50%); everything else byte-identical after whitespace normalisation.
     """
     import re
     from .replay_inside import norm
@@ -221,9 +232,9 @@ def automatic_equivalence(action, result):
             rep.append(re.compile("^" + pat + "$"))
         drop = lambda ls: [l for l in ls if l.strip() and not any(r.match(l.strip()) for r in rep)]
         n_rep = sum(1 for l in old + new if l.strip() and any(r.match(l.strip()) for r in rep))
-        pm = provenance_masks(command, bool(result.get("scripts_measure_time")))
-        if n_rep and (drop(old) == drop(new) or
-                      [masked(l, pm) for l in drop(old)] == [masked(l, pm) for l in drop(new)]):
+        d_old, d_new = drop(old), drop(new)
+        if n_rep and len(d_old) == len(d_new) and all(line_equivalent(x, y, command, result)
+                                                       for x, y in zip(d_old, d_new)):
             return "shell_time_report_only"
     # `ls -l` rows of files the command itself (re)created carry the replay's mtime: mask only the date column of
     # rows in ls -l format, in commands that run ls -l, combined with stderr placement
@@ -237,9 +248,9 @@ def automatic_equivalence(action, result):
         key = lambda l: (row.fullmatch(l).groups() if row.fullmatch(l) else ("", hdr.sub(r"\1<t>\2", l)))
         if any(row.fullmatch(l) for l in old) and [key(l) for l in old] == [key(l) for l in new]:
             return "cprofile_timings_only"
-    pm = provenance_masks(command, bool(result.get("scripts_measure_time")))
-    if len(old) == len(new) and old != new and [masked(l, pm) for l in old] == [masked(l, pm) for l in new]:
-        return "volatile_with_provenance"
+    if len(old) == len(new) and old != new and all(line_equivalent(x, y, command, result)
+                                                     for x, y in zip(old, new)):
+        return "evidence_bound_volatile"
     if re.search(TIMING_CALL, command) and len(old) == len(new):
         diff = [(a, b) for a, b in zip(old, new) if a != b]
         if diff and all(_only_timing_numbers_differ(a, b) for a, b in diff):
