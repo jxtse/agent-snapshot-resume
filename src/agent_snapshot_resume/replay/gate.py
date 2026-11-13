@@ -306,13 +306,59 @@ def validate_replay(plan, report, rc, reviewed_exceptions=None):
             # another order. Accept only when every line is identical after canonicalising Python set literals of
             # quoted strings (items sorted inside the braces) and at least one line did differ.
             def _canon_sets(lines):
-                def fix(m):
-                    inner = m.group(1)
-                    parts = [p.strip() for p in inner.split(',')]
-                    if inner and all(p[:1] in ("'", '"') and p[-1:] == p[:1] for p in parts):
-                        return '{' + ', '.join(sorted(parts)) + '}'
-                    return m.group(0)
-                return '\n'.join(re.sub(r'\{([^{}]*)\}', fix, l) for l in lines)
+                """Sort the members of every Python `set` literal of strings, leaving everything else alone.
+
+                Braces are located by a scanner that skips quoted strings (so a set printed *inside* a string is
+                never rewritten) and the group is only accepted when `ast.literal_eval` returns a set of strings.
+                """
+                import ast
+
+                def fix_line(line):
+                    out, i, n = [], 0, len(line)
+                    while i < n:
+                        ch = line[i]
+                        if ch in ("'", '"'):
+                            j = i + 1
+                            while j < n:
+                                if line[j] == "\\":
+                                    j += 2
+                                    continue
+                                if line[j] == ch:
+                                    break
+                                j += 1
+                            out.append(line[i:j + 1])
+                            i = j + 1
+                            continue
+                        if ch == '{':
+                            depth, j = 0, i
+                            while j < n:
+                                if line[j] == '{':
+                                    depth += 1
+                                elif line[j] == '}':
+                                    depth -= 1
+                                    if depth == 0:
+                                        break
+                                elif line[j] in ("'", '"'):
+                                    q = line[j]
+                                    j += 1
+                                    while j < n and line[j] != q:
+                                        j += 2 if line[j] == "\\" else 1
+                                j += 1
+                            group = line[i:j + 1]
+                            try:
+                                val = ast.literal_eval(group)
+                            except (ValueError, SyntaxError):
+                                val = None
+                            if isinstance(val, set) and val and all(isinstance(x, str) for x in val):
+                                out.append('{' + ', '.join(repr(x) for x in sorted(val)) + '}')
+                            else:
+                                out.append(group)
+                            i = j + 1
+                            continue
+                        out.append(ch)
+                        i += 1
+                    return ''.join(out)
+                return '\n'.join(fix_line(l) for l in lines)
             set_order = (review.get('kind') == 'python_set_repr_order' and bound and fidelity == 'differs' and
                 result.get('rc') == 0 and not result.get('stderr_full') and not action.get('is_error') and
                 len(old) == len(new) and old != new and _canon_sets(old) == _canon_sets(new))

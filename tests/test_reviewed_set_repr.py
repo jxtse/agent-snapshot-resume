@@ -49,6 +49,23 @@ def test_rejects_without_the_reviewed_command_binding():
         raise AssertionError("accepted without the command hash binding")
 
 
+def test_a_set_printed_inside_a_string_is_never_reordered():
+    # two different single-element sets of strings: the braces are *inside* a quoted string and must not be touched
+    old = '{\"{\'a\', \'b\'}\"}\n'
+    new = '{\"{\'b\', \'a\'}\"}\n'
+    plan = {"actions": [{"call_id": CALL, "tool": "Bash", "side_effect": "exec", "args": {"command": CMD},
+                         "orig_text": old, "obs_line": 1}]}
+    rep = {"results": [{"call_id": CALL, "tool": "Bash", "side_effect": "exec", "status": "ran", "rc": 0,
+                        "orig_text": old, "orig_full": old, "stdout_full": new, "stderr_full": "",
+                        "fidelity": "differs", "orig_is_error": False}]}
+    try:
+        validate_replay(plan, rep, "0", review())
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("a set written inside a string was treated as a set literal")
+
+
 def test_rejects_stderr_or_nonzero_rc():
     rep = report(NEW)
     rep["results"][0]["stderr_full"] = "warning\n"
