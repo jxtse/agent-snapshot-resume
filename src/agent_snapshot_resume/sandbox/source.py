@@ -152,7 +152,8 @@ def kill_source(sbx, attempts: int = 30, delay_s: float = 10.0) -> None:
 
 def prepare_source(*, adapter, task_dir: Path, bundle: Path, template: str, tag: str, state_dir: Path,
                    version: str | None = None, exec_cap: int = 1800, expected_fingerprint: str | None = None,
-                   retain_on_gate_failure: bool = False, sandbox_timeout_s: int = 4 * 3600) -> dict[str, Any]:
+                   retain_on_gate_failure: bool = False, sandbox_timeout_s: int = 4 * 3600,
+                   base_snapshot: str | None = None) -> dict[str, Any]:
     Sandbox = _sandbox_cls()
     state_dir.mkdir(parents=True, exist_ok=True)
     out = state_dir / f"snapshot-{tag}.json"
@@ -184,11 +185,52 @@ def prepare_source(*, adapter, task_dir: Path, bundle: Path, template: str, tag:
         return sbx.commands.run(cmd, user="root", timeout=timeout, envs=envs, cwd=cwd)
 
     t = time.time()
-    sbx = Sandbox.create(template=template, timeout=sandbox_timeout_s,
-                         metadata={"owner": owner, "role": "source", "asr_run": tag})
+    sbx = Sandbox.create(template=base_snapshot or template, timeout=sandbox_timeout_s,
+                         metadata={"owner": owner, "role": "source", "asr_run": tag,
+                                   **({"base_snapshot": base_snapshot} if base_snapshot else {})})
     rec["source_sandbox_id"] = sbx.sandbox_id
-    step("create_source", t, sandbox_id=sbx.sandbox_id)
+    rec["base_snapshot"] = base_snapshot
+    step("create_source", t, sandbox_id=sbx.sandbox_id, base_snapshot=base_snapshot)
     try:
+        if base_snapshot:
+            # Stop the previous run's processes by pid: a shell `pkill -f <pattern>` would also match the shell that
+            # runs it (its own command line contains the pattern) and could abort the cleanup half way.
+            t = time.time()
+            kill = """
+import json, os, subprocess
+me = os.getpid()
+out = subprocess.run(["ps", "-eo", "pid=,ppid=,args="], capture_output=True, text=True).stdout
+targets = []
+for line in out.splitlines():
+    parts = line.strip().split(None, 2)
+    if len(parts) < 3:
+        continue
+    pid, ppid, args = parts
+    if int(pid) in (me, os.getppid()) or "/bin/ps" in args or "ps -eo" in args:
+        continue
+    if "pkill" in args or "asr-base-cleanup" in args:
+        continue
+    if any(k in args for k in ("/claude", "claude-code", "claude --", "asr_proxy_runtime", "resume_proxy",
+                               "passthrough_proxy")):
+        targets.append(int(pid))
+for pid in targets:
+    try:
+        os.kill(pid, 9)
+    except OSError:
+        pass
+print(json.dumps({"killed": targets}))
+"""
+            r = run(sbx, "echo " + __import__("base64").b64encode(kill.encode()).decode() +
+                    " | base64 -d | python3 -", timeout=120)
+            killed = json.loads((r.stdout or "{}").strip().splitlines()[-1] or "{}").get("killed", [])
+            rec["base_snapshot_killed"] = killed
+            run(sbx, "sleep 2; rm -rf /logs/agent /logs/verifier /logs/artifacts /tmp/.asr-resume", timeout=120)
+            left = run(sbx, "ps -eo pid=,args=").stdout.splitlines()
+            left = [l for l in left if any(k in l for k in ("/claude", "asr_proxy_runtime", "resume_proxy",
+                                                            "passthrough_proxy")) and "/bin/ps" not in l]
+            if left:
+                raise RuntimeError("live clone processes survived the base-snapshot cleanup: " + "\n".join(left[-6:]))
+            step("base_snapshot_cleanup", t, base_snapshot=base_snapshot, killed=len(killed))
         t = time.time()
         run(sbx, (healthcheck + " && " if healthcheck else "") + "chmod 1777 /tmp")
         r = run(sbx, "uname -a; nproc; free -m | head -2; df -h / | tail -1; cat /etc/os-release | head -2")

@@ -36,7 +36,7 @@ DEFAULT_FINGERPRINT = build_fingerprint_command(list(DEFAULT_ROOTS))
 class SnapshotCloneEnvironment(SnapshotCommandRecovery, SandboxEnvironment):
     def __init__(self, *args, snapshot_id: str | None = None, expected_fingerprint=None,
                  expected_auxiliary_hashes=None, expected_verifier_hashes=None, fingerprint_command=None,
-                 owner: str | None = None, **kwargs):
+                 owner: str | None = None, job: str | None = None, **kwargs):
         super().__init__(*args, **kwargs)
         self._snapshot_id = snapshot_id
         self._expected_fingerprint = expected_fingerprint
@@ -44,6 +44,7 @@ class SnapshotCloneEnvironment(SnapshotCommandRecovery, SandboxEnvironment):
         self._expected_auxiliary_hashes = expected_auxiliary_hashes or {}
         self._expected_verifier_hashes = expected_verifier_hashes or {}
         self._owner = owner or owner_tag()
+        self._job = job
         # Harbor names the agent env "<trial>__env"; the separate verifier env gets "<trial>__verifier__<key>"
         # (possibly hash-truncated), so anything not ending in "__env" is built from its own template.
         self._is_verifier = not (self.session_id or "").endswith("__env")
@@ -86,8 +87,25 @@ class SnapshotCloneEnvironment(SnapshotCommandRecovery, SandboxEnvironment):
         net = self._sandbox_create_network_options()
         if self.network_policy.network_mode != NetworkMode.PUBLIC or net.get("allow_out"):
             kw["network"] = net
+        meta = {"environment_name": self.environment_name, "session_id": self.session_id,
+                "owner": self._owner, "role": "clone", "snapshot_id": self._snapshot_id}
+        if self._job:
+            meta["asr_job"] = self._job
         self._sandbox = await AsyncSandbox.create(
-            template=self._snapshot_id,
-            metadata={"environment_name": self.environment_name, "session_id": self.session_id,
-                      "owner": self._owner, "role": "clone", "snapshot_id": self._snapshot_id},
-            timeout=SANDBOX_TIMEOUT_SEC, allow_internet_access=True, **kw)
+            template=self._snapshot_id, metadata=meta, timeout=SANDBOX_TIMEOUT_SEC, allow_internet_access=True, **kw)
+        self._write_midrun_receipt()
+
+    def _write_midrun_receipt(self):
+        """Tell `asr launch`'s mid-run snapshotter which sandbox to watch (a clone whose id nobody else records).
+
+        The trial dir (not the sandbox) is what the launcher can see, so the receipt is the only handle on the
+        live clone; it is written before the agent starts so no early state can be missed.
+        """
+        import json as _json
+        import time as _time
+        target = self.trial_paths.trial_dir / 'infra-validation'
+        target.mkdir(parents=True, exist_ok=True)
+        rec = {"sandbox_id": self._sandbox.sandbox_id, "session_id": self.session_id,
+               "environment_name": self.environment_name, "snapshot_id": self._snapshot_id,
+               "job": self._job, "ts": _time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+        (target / 'midrun-sandbox.json').write_text(_json.dumps(rec, indent=1) + "\n")

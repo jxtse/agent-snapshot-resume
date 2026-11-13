@@ -132,25 +132,32 @@ def hint_stats(body, hint):
 
 
 def reinject_after_compaction(body, spec, acts):
-    """Post-compaction persistence: the sentinel turn is gone (summarised away) -> put the hint on the summary."""
+    """Post-compaction persistence: the sentinel turn is gone (summarised away) -> put every hint the run carries
+    on the summary, once each, in chain order. A chained round-N run must keep all earlier hints too."""
     msgs = body.get("messages") or []
     c = find_compact_summary(msgs)
     if c is None:
         acts.append("no_anchor")
         return body
-    hint = spec["hint"]
+    hints = spec_hints(spec) or ([spec["hint"]] if spec.get("hint") else [])
     bl = [dict(b) for b in _blocks(msgs[c])]
-    if any(hint in _text_of(b) for m in msgs for b in _blocks(m)):
-        acts.append("hint_already_present")  # e.g. the summary quotes it verbatim: never duplicate
+    present = "".join(_text_of(b) for m in msgs for b in _blocks(m))
+    added = []
+    for i, hint in enumerate(hints):
+        if hint in present:
+            continue  # e.g. the summary quotes it verbatim: never duplicate
+        blk = {"type": "text", "text": hint_block_text(hint)}
+        if bl and "cache_control" in bl[-1]:
+            cc = bl[-1].pop("cache_control")
+            blk["cache_control"] = cc
+        bl = bl + [blk]
+        added.append(i)
+    if not added:
+        acts.append("hint_already_present")
         return body
-    blk = {"type": "text", "text": hint_block_text(hint)}
-    # keep a cache breakpoint (if any) on the message's last block
-    if bl and "cache_control" in bl[-1]:
-        cc = bl[-1].pop("cache_control")
-        blk["cache_control"] = cc
     new = list(msgs)
-    new[c] = dict(msgs[c], content=bl + [blk])
-    acts.append(f"reinject_hint_after_compaction@{c}")
+    new[c] = dict(msgs[c], content=bl)
+    acts.append(f"reinject_hint_after_compaction@{c}" + (f":{len(added)}" if len(added) > 1 else ""))
     return dict(body, messages=new)
 
 
@@ -512,7 +519,7 @@ def rewrite(body, spec):
         if spec.get('require_sentinel'):
             raise ValueError('Required resume sentinel missing; refusing unverified continuation')
         acts.append("sentinel_not_found")
-        if spec.get("mode") == "hint" and spec.get("hint") and spec.get("persist_hint"):
+        if spec.get("persist_hint") and spec_hints(spec):
             body = reinject_after_compaction(body, spec, acts)
         return body, acts
     dropped = []
@@ -582,7 +589,9 @@ def request_fingerprint(body, spec):
     sys_txt = sysv if isinstance(sysv, str) else "".join(_text_of(b) for b in (sysv or []))
     tools = sorted(t.get("name", "") for t in body.get("tools") or [] if isinstance(t, dict))
     blocks, occ = hint_stats(body, spec.get("hint") if spec.get("mode") == "hint" else None)
-    return {"hint_blocks": blocks, "hint_occurrences": occ,
+    chains = [{"blocks": b, "occurrences": o} for b, o in
+              (hint_stats(body, h) for h in (spec_hints(spec) if spec.get("mode") == "hint" else []))]
+    return {"hint_blocks": blocks, "hint_occurrences": occ, "hint_chain": chains,
             "sys_sha": hashlib.sha256(sys_txt[:4000].encode()).hexdigest()[:12],
             "tools_sha": hashlib.sha256(json.dumps(tools).encode()).hexdigest()[:12], "n_tools": len(tools),
             "compact_summary": find_compact_summary(body.get("messages") or []) is not None}

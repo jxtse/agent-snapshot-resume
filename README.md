@@ -214,8 +214,63 @@ request has no sentinel but carries a compaction summary (a user message contain
 from a previous conversation"), the proxy appends the same hint block once to the latest such message (moving that
 message's cache breakpoint onto it). It never duplicates the hint (if the hint text is already present verbatim it does
 nothing) and leaves requests without a summary (e.g. sub-agent requests) untouched. Every `requests.jsonl` record
-carries `hint_blocks`, `hint_occurrences`, `compact_summary` and system/tools fingerprints, and the first request after
-each compaction is saved as `post_compaction_request_<i>.json`, so persistence can be audited per request.
+carries `hint_blocks`, `hint_occurrences`, `hint_chain` (one entry per hint the run carries), `compact_summary` and
+system/tools fingerprints, and the first request after each compaction is saved as
+`post_compaction_request_<i>.json`, so persistence can be audited per request. In a chained run (`--prior-hint-file`)
+*every* hint is re-applied, once each, in injection order.
+
+## Mid-run snapshots (`launch --midrun-snapshot-every`)
+
+A resumed run can be resumed again. `asr launch` snapshots its live clone every 20 minutes (and after each context
+compaction) and appends one record per snapshot to `<runs-dir>/<job>/midrun-snapshots.jsonl`:
+
+```json
+{"ts": "...", "trial": "task__X", "sandbox_id": "sbx-...", "snapshot_id": "...", "session_line": 240,
+ "session_line_before": 240, "session_line_after": 249, "session_line_reliable": true, "in_flight_tools": 0,
+ "prefix_sha256": "...", "n_compactions": 1, "trigger": "compaction", "pause_s": 0.84, "create_s": 6.6}
+```
+
+* `session_line` is the session line the *image* contains. `create_snapshot` suspends the guest only briefly
+  (~0.84 s measured on FC E2B, ~7 s of host time), so the freeze point is the one gap between two guest ticks that
+  the 50 ms cadence cannot explain (both clocks are written, so the guest's epoch is what session timestamps use);
+  every session line is timestamped and no line can be written while the guest is frozen.
+* `session_line_reliable` is false when that gap cannot be measured **or** a tool call was still in flight at the
+  freeze (its effect may be half applied, so replaying it would apply it twice). `prefix_sha256` binds the record to
+  the session prefix it froze, and `build-bundle --base-snapshot` refuses a record that is unreliable, belongs to
+  another trial or whose prefix does not byte-match the run's session.
+* `trigger` is `start` (the run began), `periodic`, or `compaction` (the agent compacted its context since the last
+  snapshot) — a fork after a compaction must have a snapshot after it.
+* The snapshotter only connects, reads and snapshots; it never touches the running agent. `asr snapshot-midrun
+  --job <job>` attaches to a job that was launched without it (`--once` for a single pass).
+* A snapshot of a live clone restarts that clone's processes when it is used as a base image, so
+  `prepare-snapshot` stops them (and fails if any survive) before replaying the tail.
+
+## Chained resumes (round N from round N-1's own session)
+
+`build-bundle` given a *resumed* trial dir produces the next round automatically: it reads the run's own
+`agent/resume/proxy_spec.json`, `bundle.json`, `run_start.json` and `first_request_rewritten.json`, and
+
+1. strips the previous resume scaffolding (continue turn, synthetic reply, sentinel prompt, resume attachments) and
+   reconnects the `parentUuid` chain across the hole;
+2. materialises every hint the run carried at the position the proxy injected it, bound to the tool result it
+   followed; after a compaction inside the run the hint goes on the summary message instead (where the proxy
+   re-injects it);
+3. writes the chain into `proxy_spec.json`: `prior_hints`, `required_hint_blocks`, `hint_anchors`,
+   `forbidden_sentinels` — the proxy refuses any request that lost, duplicated, reordered or moved a hint, or that
+   still contains a previous sentinel;
+4. charges the budget from the parent run (`agent_budget_s` − time since `run_start.json`), not from
+   `task timeout − session elapsed`, because a resumed session copies the original prefix's timestamps.
+
+```bash
+asr build-bundle --trial-dir jobs/round1/task__X --cut-line 812 --task-dir tasks/<task> \
+  --mode hint --hint-file round2/task/hint.2.txt --persist-hint \
+  --base-snapshot runs/<job>/midrun-snapshots.jsonl --run-id task-s812-h2
+```
+
+`--base-snapshot` (a record file; its last line is used) makes `prepare-snapshot` start from that mid-run snapshot
+and replay only the actions observed after its `session_line` instead of the whole prefix — those actions' effects
+are already in the image. `--full-replay` ignores it. `--prior-hint-file` (repeatable, oldest first) is optional: it
+is verified against the run's own spec and only needed to prove the chain from files on disk.
 
 ## What "equivalent" means
 
@@ -252,6 +307,13 @@ tool_result id/is_error/content. Anything else in the request is reported as an 
 - **Agent version is pinned.** Claude Code 2.1.207 and 2.1.280 (binary sha256 pinned per version; the bundle uses
   the original run's version). A different version changes the tool list or system prompt, so the context is no
   longer the same.
+- **Chained resumes inherit what the previous run left.** A mid-run snapshot contains that run's filesystem plus its
+  live processes; the tail is replayed after stopping them. Two chained limits are deliberate and fail closed:
+  a hint the proxy had to inject as a *new* message (never a block appended to a tool-result turn) cannot be seeded,
+  and a bundle may only chain from a trial that recorded its own `agent/resume/proxy_spec.json` +
+  `first_request_rewritten.json`. Large tool outputs the parent run persisted (`tool-results/`) are copied from the
+  chained run's own session directory only, so a fork that depends on an earlier round's persisted output fails the
+  parity gate instead of silently reading a truncated result.
 - **Snapshots need a provider that supports them.** Tested on Alibaba Cloud FC sandbox. `build-template` uses FC's
   `micro` build mode headers.
 - The live sandbox path (template build, source preparation, clone, real model) is not exercised by the offline
