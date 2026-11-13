@@ -12,10 +12,8 @@ CONTINUE_TXT = "Continue from where you left off."
 SYNTH_TXT = "No response requested."
 
 
-def _norm_tr_content(c):
-    if isinstance(c, str):
-        return c
-    return json.dumps(c, ensure_ascii=False, sort_keys=True)
+from .proxy.resume_proxy import blocks_from_request  # noqa: E402,F401  (one definition for proxy gate and equiv)
+from .proxy.resume_proxy import norm_tr_content as _norm_tr_content  # noqa: E402
 
 
 def blocks_from_session(lines):
@@ -69,33 +67,6 @@ def _emit(out, role, c):
             out.append((role, "tool_result", b["tool_use_id"], bool(b.get("is_error")), _norm_tr_content(b.get("content"))))
         else:
             out.append((role, bt, json.dumps(b, sort_keys=True)))
-    return out
-
-
-def blocks_from_request(msgs):
-    out = []
-    for i, m in enumerate(msgs):
-        role = m["role"]
-        c = m["content"]
-        if isinstance(c, str):
-            out.append(((role, "text", c), i))
-            continue
-        for b in c:
-            bt = b.get("type")
-            if bt == "text":
-                if role == "assistant" and not b.get("text"):
-                    continue
-                out.append(((role, "text", b["text"]), i))
-            elif bt == "thinking":
-                out.append(((role, "thinking", b.get("thinking", ""), b.get("signature")), i))
-            elif bt == "redacted_thinking":
-                out.append(((role, "redacted_thinking", b.get("data")), i))
-            elif bt == "tool_use":
-                out.append(((role, "tool_use", b["id"], b["name"], json.dumps(b.get("input"), sort_keys=True, ensure_ascii=False)), i))
-            elif bt == "tool_result":
-                out.append(((role, "tool_result", b["tool_use_id"], bool(b.get("is_error")), _norm_tr_content(b.get("content"))), i))
-            else:
-                out.append(((role, bt, json.dumps({k: v for k, v in b.items() if k != "cache_control"}, sort_keys=True)), i))
     return out
 
 

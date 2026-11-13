@@ -22,7 +22,9 @@ Policy (per side-effect class):
               approximately. Flagged in report.
   pacing      a replayed foreground command that leaves processes running (`nohup ... &`) keeps its process group
               alive; while it is, later Bash actions wait until the original time gap since that command has elapsed
-              (capped by --exec-cap), so polls and log reads see a comparable progress point ("paced_wait_s").
+              (capped by --exec-cap), so polls and log reads see a comparable progress point ("paced_wait_s"). If the
+              wait cannot be kept (beyond the cap, or the action's original time is unknown), the action is marked
+              "pacing_unmet" and the replay gate rejects the snapshot.
   subagent    Agent/Task spawn: not replayed as a model call; the sidechain's own side-effecting tool calls that
               finished before step k are included in the plan (merged by timestamp) and replayed like main calls.
   task_mgmt   TaskCreate/TaskUpdate: restored from the session by the agent adapter (Claude Code:
@@ -142,21 +144,24 @@ def iso_ts(s):
 def pace_wait(live, a, cap):
     """Shell background jobs started by earlier replayed commands are still running: keep the original pacing, i.e.
     do not start action a before (its original start - the job's original start) has elapsed since the job's replay
-    start. Returns seconds waited (bounded by cap)."""
+    start. Returns (seconds waited, met). met is False if the wait would exceed cap or a's original time is unknown
+    while a job is alive; the gate then rejects the replay (the read could see another progress point)."""
     t = iso_ts(a.get("timestamp"))
-    if t is None:
-        return 0.0
     waited = 0.0
     for job in list(live):
         if not group_alive(job["pgid"]):
             live.remove(job)
             continue
+        if t is None:
+            return round(waited, 1), False
         target = job["replay_t"] + max(0.0, t - job["orig_t"])
-        while time.time() < target and waited < cap and group_alive(job["pgid"]):
-            step = min(1.0, target - time.time())
-            time.sleep(max(0.0, step))
-            waited += max(0.0, step)
-    return round(waited, 1)
+        if target - time.time() > cap - waited:
+            return round(waited, 1), False
+        while time.time() < target and group_alive(job["pgid"]):
+            step = min(1.0, max(0.0, target - time.time()))
+            time.sleep(step)
+            waited += step
+    return round(waited, 1), True
 
 
 def cc_bash_text(r):
@@ -186,9 +191,11 @@ def main():
                "atif_step_id": a.get("atif_step_id"), "orig_is_error": a.get("is_error"),
                "orig_duration_s": a.get("duration_s")}
         if live and not dry and tool == "Bash":
-            w = pace_wait(live, a, cap)
+            w, met = pace_wait(live, a, cap)
             if w:
                 rec["paced_wait_s"] = w
+            if not met:
+                rec["pacing_unmet"] = True
         try:
             if dry:
                 rec["status"] = "dry"

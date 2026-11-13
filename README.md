@@ -149,10 +149,11 @@ With `--fake`, the resume proxy answers every request with `end_turn` and logs t
 No key is needed and no model is called.
 
 **Request parity.** When the bundle located the original request at the cut (`orig_request_at_k`), the resume proxy
-checks the first rewritten request against it and refuses it (HTTP 400, nothing sent upstream) unless, without the
-hint block and serialised as the original route logged it, it has exactly the original byte length and the same
-model, message count, `max_tokens`, `thinking` and tool count (`first_request_parity.json` in the resume-proxy log
-dir). `--parity-gate require` refuses to launch a bundle without the record; `off` disables the gate. Offline:
+checks the first rewritten request against it and refuses it and every later request (HTTP 400, nothing sent
+upstream) unless, without the hint block and serialised as the original route logged it, it has exactly the
+original byte length, the same model, message count, `max_tokens`, `thinking` and tools, the system prompt the agent
+persisted, and every message block of the session prefix in order (`first_request_parity.json` in the resume-proxy
+log dir). `--parity-gate require` refuses to launch a bundle without the record; `off` disables the gate. Offline:
 `asr parity bundles/<run_id> <first_request_rewritten.json> --passthrough-args '...'`.
 `--max-model-requests N` stops a continuation after N model requests (useful for cheap real-route probes).
 

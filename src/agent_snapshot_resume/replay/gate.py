@@ -99,6 +99,28 @@ def _heredoc_part(command):
     return _heredoc_split(command)[1]
 
 
+def _stderr_placement_equal(action, result, f):
+    """The original text equals the replay's stdout IN ORDER once the replay's stderr lines are taken out of it
+    (Claude Code interleaves stderr differently from `stdout + stderr`), with every line mapped through f."""
+    from .replay_inside import norm
+    f = f or (lambda l: l)
+    old = [f(l) for l in norm(action.get("orig_text") or "").splitlines()]
+    rc = result.get("rc")
+    out = norm(result.get("stdout_full", "")).splitlines()
+    err = [f(l) for l in norm(result.get("stderr_full", "")).splitlines() if l.strip()]
+    if rc not in (None, 0) and old and old[0] == f(f"Exit code {rc}"):
+        old = old[1:]
+    pending = list(err)
+    rest = []
+    for l in old:
+        if l in pending:
+            pending.remove(l)
+        else:
+            rest.append(l)
+    strip = lambda ls: [x for x in ls if x.strip()]
+    return not pending and strip(rest) == strip([f(l) for l in out])
+
+
 def automatic_equivalence(action, result):
     """Generic, review-free acceptance classes for replay outputs that differ only in ways that cannot reflect a
     different task state. Returns a reason string or None. Each class is narrow and checked on the full output:
@@ -106,22 +128,17 @@ def automatic_equivalence(action, result):
                             renders that case as success) and the full stdout is identical; no stderr.
       ls_dot_entries_only   `ls -l*` listings whose only difference is the `.`/`..` rows and `total` block counts
                             (some sandbox filesystems omit them); every other line identical up to column padding.
-      readonly_listing_order_only
-                            a read-only command (no file writes, redirections, installs) that lists a directory
-                            (glob/listdir/walk/iterdir/find); every output line has the same tokens, only their order
-                            within the line differs (ties broken by filesystem order).
       shell_diagnostic_prefix_only
-                            bash's own error prefix differs (`/bin/bash: eval: line 18:` vs `bash: -c: line 9:`),
-                            the rest identical (possibly reordered, as stderr is interleaved differently).
+                            bash's own error prefix differs (`/bin/bash: eval: line 18:` vs `bash: -c: line 9:`);
+                            the original equals the replay's stdout in order once the replay's stderr lines are
+                            taken out (stderr placement is the only other freedom).
       shell_time_report_only
                             the command uses the shell `time` keyword (TIMEFORMAT) or /usr/bin/time; after removing
                             the timing report lines and blank lines the output is identical in order (after the
                             replayer's volatile masking of dates/addresses/durations).
-      volatile_and_order_only
-                            the replayer's volatile masking (addresses, dates, durations) and line reordering
-                            (stderr interleaving) together make the outputs equal.
-      agent_state_read_only a command without writes that reads the agent's own session/log files (seeded at
-                            launch, absent during replay) and failed with "No such file" for such a path.
+      volatile_and_stderr_placement_only
+                            the replayer's volatile masking (volatile_only: addresses, dates, durations) plus the
+                            stderr placement freedom above; stdout order is preserved.
       cprofile_timings_only a cProfile/pstats table (possibly truncated by head) with identical rows: call counts and
                             function identities in the same order; only the four timing columns and the header's
                             total seconds differ. All non-table lines identical.
@@ -141,11 +158,6 @@ def automatic_equivalence(action, result):
             and not result.get("stderr_full")
             and norm(action.get("orig_text") or "") == norm(result.get("stdout_full", ""))):
         return "cc_grep_no_match"
-    # a command without writes that reads the agent's own session/logs: they are seeded at launch, not during replay
-    if (re.search(r"/logs/agent/|CLAUDE_CONFIG_DIR|\.claude/projects/", command) and not WRITES.search(_shell_part(command))
-            and not WRITES.search(_heredoc_part(command).replace(">", "")) and result.get("rc") not in (None, 0)
-            and re.search(r"No such file or directory:? '?(?:/logs/agent/|\S*\.claude/)", result.get("stderr_full", ""))):
-        return "agent_state_read_only"
     if bool(result.get("rc")) != bool(action.get("is_error")):
         return None
     old = norm(action.get("orig_text") or "").splitlines()
@@ -155,20 +167,12 @@ def automatic_equivalence(action, result):
         strip = lambda ls: [l.split() for l in ls if not ls_dot.fullmatch(l) and not re.fullmatch(r"total \d+", l)]
         if strip(old) == strip(new) and strip(old) and any(ls_dot.fullmatch(l) for l in old + new):
             return "ls_dot_entries_only"
-    listing = re.search(r"\b(?:glob\.i?glob|os\.listdir|os\.scandir|os\.walk)\(|\.(?:r?glob|iterdir)\(|\bfind\s",
-                        command)
-    if (listing and not WRITES.search(_shell_part(command)) and not WRITES.search(_heredoc_part(command).replace(">", ""))
-            and len(old) == len(new) and old != new
-            and all(sorted(a.split()) == sorted(b.split()) for a, b in zip(old, new))):
-        return "readonly_listing_order_only"
     # bash diagnostics carry the shell's own location prefix, which depends on how the command was invoked
-    # (Claude Code: `/bin/bash: eval: line 18:`, replay: `bash: -c: line 9:`); stderr may land elsewhere in the text
+    # (Claude Code: `/bin/bash: eval: line 18:`, replay: `bash: -c: line 9:`)
     diag = re.compile(r"^(?:/bin/|/usr/bin/)?bash:(?: eval:| -c:)? line \d+: ")
-    if any(diag.match(l) for l in old + new):
-        d_old = [diag.sub("bash: line <n>: ", l) for l in old]
-        d_new = [diag.sub("bash: line <n>: ", l) for l in new]
-        if d_old == d_new or sorted(d_old) == sorted(d_new):
-            return "shell_diagnostic_prefix_only"
+    if any(diag.match(l) for l in old + new) and _stderr_placement_equal(
+            action, result, lambda l: diag.sub("bash: line <n>: ", l)):
+        return "shell_diagnostic_prefix_only"
     # `time cmd` / TIMEFORMAT / /usr/bin/time reports go to stderr, which Claude Code interleaves differently
     if re.search(r"(?:^|[;&|(]\s*)time\s|\bTIMEFORMAT=|/usr/bin/time\b", command, re.M):
         tfmt = re.search(r"TIMEFORMAT=['\"]?([^'\";]*)", command)
@@ -183,12 +187,10 @@ def automatic_equivalence(action, result):
         if n_rep and (drop(old) == drop(new) or
                       volatile_free("\n".join(drop(old))) == volatile_free("\n".join(drop(new)))):
             return "shell_time_report_only"
-    # addresses/dates/timings masked AND stderr interleaved differently: each alone is accepted by the replayer
+    # addresses/dates/timings masked (the replayer's volatile_only) AND stderr placed elsewhere in the text
     from .replay_inside import volatile_free
-    vo = sorted(volatile_free("\n".join(old)).splitlines())
-    vn = sorted(volatile_free("\n".join(new)).splitlines())
-    if vo == vn and old != new:
-        return "volatile_and_order_only"
+    if _stderr_placement_equal(action, result, volatile_free) and not _stderr_placement_equal(action, result, None):
+        return "volatile_and_stderr_placement_only"
     if re.search(r"\bcProfile\b|\bprofile\.run\(|pstats", command) and len(old) == len(new):
         row = re.compile(r"\s*(\d+(?:/\d+)?)\s+(?:\d+\.\d+\s+){4}(.+)")
         hdr = re.compile(r"(\s*\d+ function calls(?: \(\d+ primitive calls\))? in )\d+(?:\.\d+)?( seconds)")
@@ -211,6 +213,9 @@ def validate_replay(plan, report, rc, reviewed_exceptions=None):
     for action, result in zip(plan['actions'],report['results']):
         if result.get('call_id') != action['call_id']:
             raise RuntimeError('Replay action identity mismatch')
+        if result.get('pacing_unmet'):
+            raise RuntimeError('Replay could not keep the original pacing of a running background job: '
+                               + action['call_id'])
         fidelity=result.get('fidelity')
         exit_reviewed = False
         if action['side_effect']=='exec_background':
@@ -227,7 +232,7 @@ def validate_replay(plan, report, rc, reviewed_exceptions=None):
             result['deferred_gate'] = 'session auxiliary files must be hash-verified after clone seeding, before CC starts'
         elif fidelity not in allowed and action['side_effect'] == 'exec' and automatic_equivalence(action, result):
             result['automatic_equivalence'] = automatic_equivalence(action, result)
-            exit_reviewed = result['automatic_equivalence'] in ('cc_grep_no_match', 'agent_state_read_only')
+            exit_reviewed = result['automatic_equivalence'] == 'cc_grep_no_match'
         elif fidelity not in allowed:
             import hashlib, re
             review = reviewed_exceptions.get(action['call_id'], {})
@@ -326,11 +331,20 @@ def validate_replay(plan, report, rc, reviewed_exceptions=None):
             listing_line = (review.get('kind') == 'listing_order_line' and bound and len(old) == len(new) and
                 all(sorted(re.findall(r"[\w.-]+", a_)) == sorted(re.findall(r"[\w.-]+", b_)) for a_, b_ in zip(old, new))
                 and bool(result.get('rc')) == bool(action.get('is_error')))
+            # The original read the agent's own session/log files (seeded only at launch, so absent during replay).
+            # Reviewed: the reviewer confirms the command writes nothing; the replay must fail with "No such file"
+            # on such a path and produce no stdout.
+            agent_state = (review.get('kind') == 'agent_state_read' and bound and result.get('rc') not in (None, 0)
+                and not result.get('stdout_full', '').strip()
+                and re.search(r"No such file or directory:? '?(?:/logs/agent/|\S*\.claude/)", result.get('stderr_full', ''))
+                is not None)
             if not (hardware_only or memory_only or terminal_grep_only or profile_only or timed_grep or timeout_same
-                    or ls_dot_only or unseeded or persisted_same or glob_order or timing_number or listing_line):
+                    or ls_dot_only or unseeded or persisted_same or glob_order or timing_number or listing_line
+                    or agent_state):
                 raise RuntimeError('Unaccepted replay fidelity '+str(fidelity)+': '+action['call_id'])
-            exit_reviewed = terminal_grep_only or timed_grep or timeout_same
-            result['reviewed_exception'] = ('single unlabelled wall-time number differs (command measures time)' if timing_number else
+            exit_reviewed = terminal_grep_only or timed_grep or timeout_same or agent_state
+            result['reviewed_exception'] = ('reads the agent\'s own session/logs (seeded at launch, absent in replay); reviewed as read-only' if agent_state else
+                'single unlabelled wall-time number differs (command measures time)' if timing_number else
                 'same items listed in a different filesystem order; writes reviewed as order-independent' if listing_line else
                 'replayed stdout identical to the persisted full original output (CC showed a preview)' if persisted_same else
                 'read-only probe; unsorted glob(...)[0] picked a different file in this filesystem order' if glob_order else

@@ -159,6 +159,9 @@ def build(*, adapter, trial_dir: Path, atif_step: int | None, out: Path, mode: s
     loc = parity.locate_request(ir, k, parity.original_requests(trial_dir))
     orig_request = (parity.expected_from_record(loc["record"], index=loc["index"], method=loc["method"])
                     if "record" in loc else None)
+    if orig_request is not None:
+        prefix = [json.loads(trace_ir._REDACT_RE.sub(r"\1null", l)) for l in raw_lines[:cut]]
+        orig_request["content"] = parity.content_reference(prefix)
     agent_model = model or ((result.get("config") or {}).get("agent") or {}).get("model_name") or ir.get("model")
     meta = {
         "run_id": run_id, "agent": adapter.name, "trial": trial, "trial_dir": str(trial_dir), "task": task,

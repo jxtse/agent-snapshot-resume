@@ -125,6 +125,53 @@ class ParityGate(unittest.TestCase):
                          {"drop_fields": ["metadata"], "strip_is_error": True, "strip_thinking": False})
 
 
+class ContentParity(unittest.TestCase):
+    """Same byte length is not enough: the model-visible content is bound too (review counterexample)."""
+
+    def ref(self):
+        from agent_snapshot_resume.proxy.resume_proxy import block_digest, blocks_from_request, system_digest, tool_digest
+        orig = original_shape()
+        orig["system"] = [{"type": "text", "text": "cli"}, {"type": "text", "text": "sys"}]
+        ref_blocks = [b for b, _ in blocks_from_request(orig["messages"]) if b[0] != "system"]
+        return orig, {"message_block_sha256": [block_digest(b) for b in ref_blocks], "n_attachments": 2,
+                      "system_sha256": system_digest(["cli", "sys"]),
+                      "tools": {t["name"]: tool_digest(t) for t in orig["tools"]}}
+
+    def rewritten(self, mutate=None):
+        b = resumed_body()
+        b["system"] = [{"type": "text", "text": "cli"}, {"type": "text", "text": "sys"}]
+        if mutate:
+            mutate(b)
+        return proxy.rewrite(b, {"mode": "same", "sentinel": SENT})[0]
+
+    def test_identical_content_ok(self):
+        _, ref = self.ref()
+        self.assertEqual(proxy.check_content(self.rewritten(), ref, []), [])
+
+    def test_equal_length_substitution_detected(self):
+        _, ref = self.ref()
+        def swap(b):
+            b["messages"][3]["content"][0]["content"] = "erx"  # same length as "err"
+        self.assertTrue(proxy.check_content(self.rewritten(swap), ref, []))
+
+    def test_system_and_tool_changes_detected(self):
+        _, ref = self.ref()
+        def sysm(b):
+            b["system"][1]["text"] = "syz"
+        def toolm(b):
+            b["tools"][0] = {"name": "Bash", "description": "other"}
+        def extra(b):
+            b["tools"].append({"name": "WebFetch"})
+        for m in (sysm, toolm, extra):
+            self.assertTrue(proxy.check_content(self.rewritten(m), ref, []), m.__name__)
+
+    def test_unexplained_user_text_detected(self):
+        _, ref = self.ref()
+        def add(b):
+            b["messages"][3]["content"].insert(1, {"type": "text", "text": "do something else"})
+        self.assertTrue(proxy.check_content(self.rewritten(add), ref, []))
+
+
 class ProxyGateFailClosed(unittest.IsolatedAsyncioTestCase):
     async def _post(self, spec, body):
         from aiohttp.test_utils import TestClient, TestServer
@@ -145,9 +192,9 @@ class ProxyGateFailClosed(unittest.IsolatedAsyncioTestCase):
     async def test_mismatch_returns_400_and_logs_report(self):
         exp = expected_for(original_shape())
         exp["req_bytes"] += 7
-        st, _, logs = await self._post({"mode": "same", "sentinel": SENT, "upstream": "fake",
-                                        "first_request_parity": exp}, resumed_body())
-        self.assertEqual(st, 400)
+        st, st2, logs = await self._post({"mode": "same", "sentinel": SENT, "upstream": "fake",
+                                          "first_request_parity": exp}, resumed_body())
+        self.assertEqual((st, st2), (400, 400), "a failed parity gate must not be bypassed by retrying")
         rep = json.loads((logs / "first_request_parity.json").read_text())
         self.assertFalse(rep["ok"])
         self.assertEqual(rep["byte_diff"], -7)

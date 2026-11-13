@@ -62,12 +62,11 @@ class AutomaticEquivalence(unittest.TestCase):
         self.assertFalse(passes(*one(cmd, "saved 22", "saved 23\n", rc=1)))
         self.assertFalse(passes(*one("python3 run.py", "saved 22", "saved 22\n", rc=1)), "not a grep pipeline")
 
-    def test_readonly_listing_order(self):
+    def test_listing_order_is_not_automatic(self):
+        # token-sorted comparison would hide swapped field values (review counterexample)
         cmd = "python3 - <<'EOF'\nimport glob\nfor d in glob.glob('/d/*'):\n    print(d, end=' ')\nEOF"
-        self.assertTrue(passes(*one(cmd, "/d/a /d/b /d/c", "/d/b /d/a /d/c")))
-        writes = cmd.replace("print(d, end=' ')", "open('/tmp/o','w').write(d)")
-        self.assertFalse(passes(*one(writes, "/d/a /d/b", "/d/b /d/a")), "writes depend on the order")
-        self.assertFalse(passes(*one(cmd, "/d/a /d/b", "/d/b /d/x")), "different items")
+        self.assertFalse(passes(*one(cmd, "/d/a /d/b /d/c", "/d/b /d/a /d/c")))
+        self.assertFalse(passes(*one("python3 x.py  # os.listdir(", "winner a loser b", "winner b loser a")))
 
     def test_shell_diagnostic_prefix(self):
         o = "Exit code 2\nout 1\n/bin/bash: eval: line 18: unexpected EOF while looking for matching `\"'"
@@ -92,17 +91,26 @@ class AutomaticEquivalence(unittest.TestCase):
         self.assertTrue(passes(*one(cmd, o, n)))
         self.assertFalse(passes(*one(cmd, o, n.replace("704/1", "705/1"))), "call counts differ")
 
-    def test_agent_state_read(self):
+    def test_agent_state_read_needs_review(self):
         cmd = "python3 - <<'EOF'\nimport json\nfor l in open('/logs/agent/sessions/projects/-app/x.jsonl'): print(l)\nEOF"
         err = "FileNotFoundError: [Errno 2] No such file or directory: '/logs/agent/sessions/projects/-app/x.jsonl'\n"
-        self.assertTrue(passes(*one(cmd, "Reconstruct the ...", "", stderr=err, rc=1)))
-        w = cmd.replace("print(l)", "open('/app/o','w').write(l)")
-        self.assertFalse(passes(*one(w, "Reconstruct the ...", "", stderr=err, rc=1)), "writes")
+        self.assertFalse(passes(*one(cmd, "Reconstruct the ...", "", stderr=err, rc=1)), "never automatic")
+        rv = {"c1": {"kind": "agent_state_read", "command_sha256": sha(cmd)}}
+        self.assertTrue(passes(*one(cmd, "Reconstruct the ...", "", stderr=err, rc=1), rv))
+        self.assertFalse(passes(*one(cmd, "Reconstruct the ...", "partial", stderr=err, rc=1), rv), "stdout")
+        touch = "touch /app/changed; " + cmd
+        self.assertFalse(passes(*one(touch, "Reconstruct the ...", "", stderr=err, rc=1), rv), "bound to command")
 
-    def test_volatile_and_order(self):
+    def test_volatile_with_stderr_placement(self):
         o = "<stdin>:15: RuntimeWarning: x\ndrwxr-xr-x 2 root root 4096 Nov  2 20:17 .\nres 1"
         n = "drwxr-xr-x 2 root root 4096 Nov 13 04:47 .\nres 1\n"
         self.assertTrue(passes(*one("python3 a.py; ls -la d", o, n, stderr="<stdin>:15: RuntimeWarning: x\n")))
+
+    def test_task_data_dates_reordered_are_rejected(self):
+        # review counterexample: dates that are task data, changed and reordered, must not pass
+        o = "event 2020-01-01 a\nevent 2020-01-02 b"
+        n = "event 2021-05-05 b\nevent 2021-05-04 a\n"
+        self.assertFalse(passes(*one("cat records", o, n)))
 
 
 class ReviewedKinds(unittest.TestCase):
@@ -136,6 +144,28 @@ class BackgroundTasks(unittest.TestCase):
         self.assertFalse(passes(*self.bg("failed", 0)))
         self.assertTrue(passes(*self.bg("completed", 0)))
         self.assertFalse(passes(*self.bg("completed", 1)))
+
+
+class Pacing(unittest.TestCase):
+    def test_unmet_pacing_fails_the_gate(self):
+        p, r = one("cat log", "x", "x\n", fidelity="exact")
+        r["results"][0]["pacing_unmet"] = True
+        self.assertFalse(passes(p, r))
+
+    def test_pace_wait_reports_unmet_beyond_cap(self):
+        import subprocess
+        proc = subprocess.Popen(["sleep", "5"], start_new_session=True)
+        try:
+            job = {"pgid": proc.pid, "replay_t": time.time(), "orig_t": 1000.0}
+            a = {"timestamp": "1970-01-01T01:16:40.000Z"}  # orig_t + 3600 s
+            w, met = replay.pace_wait([job], a, cap=1)
+            self.assertFalse(met)
+            w, met = replay.pace_wait([job], {"timestamp": None}, cap=100)
+            self.assertFalse(met, "unknown original time while a job is alive")
+            w, met = replay.pace_wait([job], {"timestamp": "1970-01-01T00:16:40.300Z"}, cap=10)
+            self.assertTrue(met)
+        finally:
+            proc.kill()
 
 
 class Replayer(unittest.TestCase):

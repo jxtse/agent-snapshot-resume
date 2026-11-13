@@ -101,9 +101,12 @@ call ids, and that every result has an accepted fidelity:
   output line has the same tokens), `shell_diagnostic_prefix_only` (`/bin/bash: eval: line N:` vs
   `bash: -c: line M:`), `shell_time_report_only` (`time`/`TIMEFORMAT`/`/usr/bin/time` report lines removed, rest
   identical after volatile masking), `cprofile_timings_only` (same profile rows and call counts; timing columns
-  differ), `volatile_and_order_only`, `agent_state_read_only` (read-only command fails with "No such file" on the
-  agent's own `/logs/agent`/session files, which are seeded at launch), `timing_lines_only` (command measures time;
-  every differing number directly follows a duration label or precedes a time unit);
+  differ), `volatile_and_stderr_placement_only` (the replayer's volatile masking plus stderr placed elsewhere;
+  stdout order kept), `timing_lines_only` (command measures time; every differing number directly follows a
+  duration label or precedes a time unit). Stderr placement means: the original equals the replay's stdout in
+  order once the replay's stderr lines are taken out of it; nothing else is reordered;
+- pacing: an action marked `pacing_unmet` (a background job was alive and the original gap could not be kept)
+  fails the gate;
 - `numbers_differ` / `differs` are accepted only with a **reviewed exception** in
   `bundle.json["replay_reviewed_exceptions"][call_id]`, bound to `sha256(command)`. Supported kinds:
   `hardware_probe`, `hardware_probe_and_python_build_stamp`, `shell_memory_probe`, `terminal_grep_no_match`,
@@ -112,8 +115,9 @@ call ids, and that every result has an accepted fidelity:
   the source filesystem lists them and the original did not; all other rows equal field by field),
   `unseeded_rng_numbers` (read-only probe using an unseeded RNG; same text with numbers masked),
   `unlabelled_timing_number` (command measures time; exactly one number differs), `listing_order_line` (same
-  items listed in another order by a command that also writes files; the reviewer checks the writes are
-  order-independent). Each kind checks that only that specific benign difference exists. Record a `note` next to
+  items listed in another order; the reviewer checks nothing depends on that order), `agent_state_read` (the
+  original read the agent's own session/log files, which exist only from launch on; the replay must fail with
+  "No such file" on such a path and print nothing; the reviewer checks the command writes nothing). Each kind checks that only that specific benign difference exists. Record a `note` next to
   each exception.
 
 ### Screening cuts offline (`asr screen`)
@@ -185,9 +189,19 @@ user message (a plain string), the persisted date reminder as a system message, 
 messages is wrong when failed attempts or compactions were logged. It records `orig_request_at_k` (index,
 `req_bytes`, model, n_messages, max_tokens, thinking, n_tools) in `bundle.json`. At launch the agent puts it into the
 resume proxy spec (`first_request_parity`, with the request transformations of `--passthrough-args`). The proxy
-rejects the first request with 400, before anything is sent upstream, unless the rewritten body minus the injected
-hint block(s), serialised as the original route logged it, has exactly the original `req_bytes`, and model,
-n_messages, max_tokens, thinking and tool count are equal. The report is `first_request_parity.json`.
+rejects the first request with 400, before anything is sent upstream, unless
+
+- the rewritten body minus the injected hint block(s), serialised as the original route logged it, has exactly the
+  original `req_bytes`, and model, n_messages, max_tokens, thinking and tool count are equal; and
+- its model-visible content matches the session prefix (`content`, built by `parity.content_reference`): the
+  system prompt equals the agent's last persisted `prompt_snapshot` (2.1.280 writes it into the session), every
+  recorded tool has the same name, description and input schema (only the deferred-loading placeholder may be
+  added), and every message block of the rebuilt context is present in order and byte-identical; other blocks may
+  only be system-role messages, the hint block, or user text that starts with a rendered-attachment marker, no
+  more of them than the prefix has attachments.
+
+Byte length alone would accept an equal-length substitution; the content check closes that. Once the gate failed,
+every later request of that run is refused too. The report is `first_request_parity.json`.
 `--parity-gate auto` (default) gates whenever the bundle has the record, `require` refuses to launch without it,
 `off` disables it. `asr parity <bundle> <first_request_rewritten.json>` runs the same check offline.
 

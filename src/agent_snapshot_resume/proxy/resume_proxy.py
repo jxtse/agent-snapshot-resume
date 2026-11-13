@@ -14,9 +14,11 @@ Per-run spec: <spec_dir>/<run_id>.json
    "require_sentinel", "require_text_only", "expected_first_request_sha256", "required_hint_blocks",
    "hint_anchors", "forbidden_sentinels": optional gates (see rewrite() / check_chained_history()),
    "max_model_requests": N,            # refuse model request N+1 and later (bounded continuation)
-   "first_request_parity": {"req_bytes", "model", "n_messages", "max_tokens", "thinking", "n_tools", "route"}
-                                         # fail-closed gate: the first rewritten request minus hint blocks, as the
-                                         # original route logged it, must equal the original request at the cut}
+   "first_request_parity": {"req_bytes", "model", "n_messages", "max_tokens", "thinking", "n_tools", "route",
+                            "content": {system_sha256, tools, extra_tools_allowed, message_block_sha256,
+                                        n_attachments}}
+                                         # fail-closed gate on the first request (see check_content); once it
+                                         # failed, every later request of the run is refused too}
 Rewrites EVERY /v1/messages body (the agent re-sends its persisted resume artifacts on each turn):
   1. find the user message containing a text block with the sentinel -> drop it
   2. drop the preceding synthetic assistant message (e.g. 'No response requested.')
@@ -231,6 +233,130 @@ def compare_parity(body, expected, route=None,
             "hint_blocks_removed": n_hint, "byte_diff": got["req_bytes"] - (expected.get("req_bytes") or 0)}
 
 
+# ------------------------------------------------------------------ content parity (model-visible content)
+# The request's model-visible content as comparable blocks: (role, type, ...) tuples, one per content block.
+# Single source of truth for the proxy gate and for `asr equiv` (agent_snapshot_resume.equiv imports these).
+REMINDER_SUFFIX_RE = re.compile(r"(?:\n\n<system-reminder>\n.*?\n</system-reminder>)+", re.S)
+
+
+def norm_tr_content(c):
+    if isinstance(c, str):
+        return c
+    return json.dumps(c, ensure_ascii=False, sort_keys=True)
+
+
+def blocks_from_request(msgs):
+    out = []
+    for i, m in enumerate(msgs):
+        role = m["role"]
+        c = m["content"]
+        if isinstance(c, str):
+            out.append(((role, "text", c), i))
+            continue
+        for b in c:
+            bt = b.get("type")
+            if bt == "text":
+                if role == "assistant" and not b.get("text"):
+                    continue
+                out.append(((role, "text", b["text"]), i))
+            elif bt == "thinking":
+                out.append(((role, "thinking", b.get("thinking", ""), b.get("signature")), i))
+            elif bt == "redacted_thinking":
+                out.append(((role, "redacted_thinking", b.get("data")), i))
+            elif bt == "tool_use":
+                out.append(((role, "tool_use", b["id"], b["name"],
+                             json.dumps(b.get("input"), sort_keys=True, ensure_ascii=False)), i))
+            elif bt == "tool_result":
+                out.append(((role, "tool_result", b["tool_use_id"], bool(b.get("is_error")),
+                             norm_tr_content(b.get("content"))), i))
+            else:
+                out.append(((role, bt, json.dumps({k: v for k, v in b.items() if k != "cache_control"},
+                                                  sort_keys=True)), i))
+    return out
+
+
+def block_digest(blk):
+    return hashlib.sha256(json.dumps(list(blk), ensure_ascii=False).encode()).hexdigest()
+
+
+def strip_reminder_suffix(blk):
+    """A tool_result whose string content ends with <system-reminder> blocks (Claude Code renders some attachments
+    that way) -> the same block without them; None if there is no such suffix."""
+    if blk[1] != "tool_result" or not isinstance(blk[4], str):
+        return None
+    m = re.search(r"(?:\n\n<system-reminder>\n.*?\n</system-reminder>)+$", blk[4], re.S)
+    if not m or not m.group(0):
+        return None
+    return blk[:4] + (blk[4][:m.start()],)
+
+
+ATTACHMENT_TEXT_PREFIXES = ("<system-reminder>", "<task-notification>")
+
+
+def tool_digest(t):
+    return hashlib.sha256(json.dumps([t.get("name"), t.get("description"), t.get("input_schema")],
+                                     sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def system_digest(texts):
+    return hashlib.sha256(json.dumps(list(texts), ensure_ascii=False).encode()).hexdigest()
+
+
+def check_content(body, ref, hints):
+    """Model-visible content of a rewritten request vs the reference built from the session prefix
+    (agent_snapshot_resume.parity.content_reference). Returns a list of problems (empty = ok).
+
+      system         sha256 of the system block texts == the prompt snapshot the agent persisted (if recorded)
+      tools          every recorded tool present with the same name/description/input_schema; any other tool must
+                     be listed in extra_tools_allowed
+      messages       every reference block (session prefix after compaction rebuild) present in order, byte-identical
+                     (a tool_result may carry an appended <system-reminder> suffix); every other block must be a
+                     system-role message, an exact hint block, or user text that starts with a rendered-attachment
+                     marker; their number must not exceed the prefix's attachment count
+    """
+    problems = []
+    if ref.get("system_sha256"):
+        sysv = body.get("system")
+        texts = [b.get("text") for b in sysv] if isinstance(sysv, list) else [sysv]
+        if system_digest(texts) != ref["system_sha256"]:
+            problems.append("system prompt differs from the agent's persisted prompt snapshot")
+    if ref.get("tools"):
+        got = {t.get("name"): tool_digest(t) for t in body.get("tools") or []}
+        for name, dg in ref["tools"].items():
+            if got.get(name) != dg:
+                problems.append(f"tool {name} missing or different")
+        allowed = set(ref.get("extra_tools_allowed") or [])
+        extra = [n for n in got if n not in ref["tools"] and n not in allowed]
+        if extra:
+            problems.append(f"unexpected tools {extra}")
+    want = ref.get("message_block_sha256")
+    if want is not None:
+        hint_blocks = {hint_block_text(h) for h in hints or []}
+        j, extras = 0, 0
+        for blk, _ in blocks_from_request(body.get("messages") or []):
+            if j < len(want) and block_digest(blk) == want[j]:
+                j += 1
+                continue
+            stripped = strip_reminder_suffix(blk)
+            if j < len(want) and stripped is not None and block_digest(stripped) == want[j]:
+                j += 1
+                extras += 1
+                continue
+            if blk[1] == "text" and blk[2] in hint_blocks:
+                continue
+            if blk[0] == "system" or (blk[0] == "user" and blk[1] == "text"
+                                      and blk[2].lstrip().startswith(ATTACHMENT_TEXT_PREFIXES)):
+                extras += 1
+                continue
+            problems.append(f"unexplained {blk[0]} {blk[1]} block before reference block {j}")
+            break
+        if j < len(want):
+            problems.append(f"reference block {j} of {len(want)} missing or different")
+        if extras > int(ref.get("n_attachments", 0)):
+            problems.append(f"{extras} rendered-attachment blocks for {ref.get('n_attachments', 0)} attachments")
+    return problems
+
+
 def spec_hints(spec):
     """All hints a request may carry: the chain's earlier hints (spec "prior_hints", oldest first) + this run's."""
     hs = list(spec.get("prior_hints") or [])
@@ -420,16 +546,26 @@ async def handle(request):
             wlog(app, run_id, "first_request_raw.json", {"headers": hdr, "body": d}, mode="w")
         try:
             nd, acts = rewrite(d, spec)
-            if n == 0 and spec.get("first_request_parity"):
-                # Fail closed unless the first resumed request equals the original run's request at the cut
-                # (bytes as logged by the original route, model/max_tokens/thinking/tool count/message count).
-                exp = spec["first_request_parity"]
-                rep = compare_parity(nd, exp, exp.get("route") or {}, spec_hints(spec))
-                wlog(app, run_id, "first_request_parity.json", rep, mode="w")
-                if not rep["ok"]:
-                    raise ValueError("First resumed request differs from the original request at the cut: "
-                                     + json.dumps(rep["diffs"], ensure_ascii=False)[:600])
-                acts.append("first_request_parity_passed")
+            if spec.get("first_request_parity"):
+                state = spec.get("_parity_state")  # lives on the cached spec: reset only by a new spec
+                if state is False:
+                    raise ValueError("first-request parity failed earlier in this run; every request is refused")
+                if state is None:
+                    # Fail closed unless the first resumed request equals the original run's request at the cut:
+                    # bytes as logged by the original route, model/max_tokens/thinking/tool and message counts,
+                    # and the model-visible content (system prompt, tools, every message block of the prefix).
+                    exp = spec["first_request_parity"]
+                    rep = compare_parity(nd, exp, exp.get("route") or {}, spec_hints(spec))
+                    if exp.get("content"):
+                        rep["content_problems"] = check_content(nd, exp["content"], spec_hints(spec))
+                        rep["ok"] = rep["ok"] and not rep["content_problems"]
+                    wlog(app, run_id, "first_request_parity.json", rep, mode="w")
+                    spec["_parity_state"] = bool(rep["ok"])
+                    if not rep["ok"]:
+                        raise ValueError("First resumed request differs from the original request at the cut: "
+                                         + json.dumps({"diffs": rep["diffs"], "content": rep.get("content_problems")},
+                                                      ensure_ascii=False)[:600])
+                    acts.append("first_request_parity_passed")
             if spec.get('expected_first_request_sha256') and not spec.get('_first_request_validated'):
                 if request_digest(nd) != spec['expected_first_request_sha256']:
                     raise ValueError('First model request differs from the frozen fake-resume request')

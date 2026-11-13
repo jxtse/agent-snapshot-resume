@@ -20,7 +20,8 @@ import os
 from pathlib import Path
 from typing import Any
 
-from .proxy.resume_proxy import compare_parity, route_from_passthrough_args
+from .proxy.resume_proxy import (block_digest, compare_parity, route_from_passthrough_args, system_digest,
+                                 tool_digest)
 
 FIELDS = ("model", "n_messages", "max_tokens", "thinking", "n_tools")
 
@@ -69,6 +70,33 @@ def locate_request(ir: dict[str, Any], k_index: int, requests: list[dict[str, An
     return {"error": "original request for step k not identifiable (no unique usage match, failed attempts logged)"}
 
 
+def content_reference(session_lines: list[dict[str, Any]]) -> dict[str, Any]:
+    """Model-visible content the first resumed request must carry, from the truncated session prefix:
+    the system prompt and tools of the agent's last persisted `prompt_snapshot` attachments (Claude Code 2.1.280
+    writes them; absent -> not checked), and the digest of every message block of the context rebuilt after the last
+    compaction (equiv.context_lines), in order."""
+    from .equiv import blocks_from_session, context_lines
+    cli = sysp = tools = None
+    for d in session_lines:
+        a = d.get("attachment") or {}
+        if a.get("type") == "prompt_snapshot":
+            cli = a.get("cliPrefix", cli)
+            sysp = a.get("systemPrompt", sysp)
+            tools = a.get("tools", tools)
+    ctx = context_lines(session_lines)
+    ref: dict[str, Any] = {"message_block_sha256": [block_digest(b) for b in blocks_from_session(ctx)],
+                           "n_attachments": sum(1 for d in ctx if d.get("type") == "attachment")}
+    if cli is not None and sysp is not None:
+        ref["system_sha256"] = system_digest([cli, "\n\n".join(sysp)])
+    if tools:
+        ref["tools"] = {t["name"]: tool_digest({"name": t["name"], "description": t.get("description"),
+                                                 "input_schema": (t.get("schema") or {}).get("input_schema")})
+                        for t in tools}
+        # Claude Code adds this deferred-loading placeholder to the request but not to the snapshot
+        ref["extra_tools_allowed"] = ["DeferredToolPlaceholder"]
+    return ref
+
+
 def expected_from_record(rec: dict[str, Any], *, index: int, method: str) -> dict[str, Any]:
     return {"index": index, "method": method, "req_bytes": rec["req_bytes"],
             **{f: rec.get(f) for f in FIELDS}}
@@ -87,5 +115,9 @@ def check_files(bundle_dir: str | os.PathLike, request_path: str | os.PathLike,
     body = rq.get("body", rq)
     hints = list(spec.get("hints") or ([spec["hint"]] if spec.get("hint") else []))
     rep = compare_parity(body, exp, route_from_passthrough_args(passthrough_args), hints)
+    if exp.get("content"):
+        from .proxy.resume_proxy import check_content
+        rep["content_problems"] = check_content(body, exp["content"], hints)
+        rep["ok"] = rep["ok"] and not rep["content_problems"]
     rep.update(bundle=meta["run_id"], orig_index=exp.get("index"), locate_method=exp.get("method"))
     return rep
