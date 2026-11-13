@@ -193,16 +193,44 @@ def prepare_source(*, adapter, task_dir: Path, bundle: Path, template: str, tag:
     step("create_source", t, sandbox_id=sbx.sandbox_id, base_snapshot=base_snapshot)
     try:
         if base_snapshot:
-            # A mid-run snapshot of a live clone restarts that clone's processes (agent, proxies, background tasks).
-            # Stop them and drop the old logs before replaying the tail, otherwise the previous run keeps writing.
+            # Stop the previous run's processes by pid: a shell `pkill -f <pattern>` would also match the shell that
+            # runs it (its own command line contains the pattern) and could abort the cleanup half way.
             t = time.time()
-            run(sbx, "pkill -9 -f '[/]claude' ; pkill -9 -f 'asr_proxy_runtime|resume_proxy|passthrough_proxy' ; "
-                     "pkill -9 -f '[/]asr/' ; sleep 2; rm -rf /logs/agent /logs/verifier /logs/artifacts /tmp/.asr-resume; "
-                     "ps -eo pid,args --sort=pid | grep -v -E 'ps -eo|grep' | tail -30 || true", timeout=300)
-            left = run(sbx, "ps -eo pid,args | grep -E '[/]claude|claude-code|asr_proxy_runtime' || true").stdout.strip()
+            kill = """
+import json, os, subprocess
+me = os.getpid()
+out = subprocess.run(["ps", "-eo", "pid=,ppid=,args="], capture_output=True, text=True).stdout
+targets = []
+for line in out.splitlines():
+    parts = line.strip().split(None, 2)
+    if len(parts) < 3:
+        continue
+    pid, ppid, args = parts
+    if int(pid) in (me, os.getppid()) or "/bin/ps" in args or "ps -eo" in args:
+        continue
+    if "pkill" in args or "asr-base-cleanup" in args:
+        continue
+    if any(k in args for k in ("/claude", "claude-code", "claude --", "asr_proxy_runtime", "resume_proxy",
+                               "passthrough_proxy")):
+        targets.append(int(pid))
+for pid in targets:
+    try:
+        os.kill(pid, 9)
+    except OSError:
+        pass
+print(json.dumps({"killed": targets}))
+"""
+            r = run(sbx, "echo " + __import__("base64").b64encode(kill.encode()).decode() +
+                    " | base64 -d | python3 -", timeout=120)
+            killed = json.loads((r.stdout or "{}").strip().splitlines()[-1] or "{}").get("killed", [])
+            rec["base_snapshot_killed"] = killed
+            run(sbx, "sleep 2; rm -rf /logs/agent /logs/verifier /logs/artifacts /tmp/.asr-resume", timeout=120)
+            left = run(sbx, "ps -eo pid=,args=").stdout.splitlines()
+            left = [l for l in left if any(k in l for k in ("/claude", "asr_proxy_runtime", "resume_proxy",
+                                                            "passthrough_proxy")) and "/bin/ps" not in l]
             if left:
-                raise RuntimeError("live clone processes survived the base-snapshot cleanup: " + left[-400:])
-            step("base_snapshot_cleanup", t, base_snapshot=base_snapshot)
+                raise RuntimeError("live clone processes survived the base-snapshot cleanup: " + "\n".join(left[-6:]))
+            step("base_snapshot_cleanup", t, base_snapshot=base_snapshot, killed=len(killed))
         t = time.time()
         run(sbx, (healthcheck + " && " if healthcheck else "") + "chmod 1777 /tmp")
         r = run(sbx, "uname -a; nproc; free -m | head -2; df -h / | tail -1; cat /etc/os-release | head -2")

@@ -167,14 +167,17 @@ def screen_plan(plan: dict[str, Any], rp: dict[str, Any] | None = None, *, n_com
 
 
 def screen_trial(adapter, trial_dir: Path, *, cut_lines: list[int] | None = None, steps: list[int] | None = None,
-                 agent_timeout_s: float | None = None, task_dir: Path | None = None) -> list[dict[str, Any]]:
+                 agent_timeout_s: float | None = None, task_dir: Path | None = None,
+                 ir: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     from . import parity
     from .bundle import plan_with_observations, resolve_agent_timeout, step_for_cut_line
     trial_dir = Path(trial_dir)
-    ir = adapter.load_trace(trial_dir, agent_timeout_s=resolve_agent_timeout(trial_dir, agent_timeout_s, task_dir),
-                            task=trial_dir.name.split("__")[0])
-    if ir.get("error"):
-        raise SystemExit(f"{trial_dir.name}: {ir['error']}")
+    if ir is None:
+        ir = adapter.load_trace(trial_dir,
+                                agent_timeout_s=resolve_agent_timeout(trial_dir, agent_timeout_s, task_dir),
+                                task=trial_dir.name.split("__")[0])
+    if ir is None or ir.get("error"):
+        raise SystemExit(f"{trial_dir.name}: {(ir or {}).get('error')}")
     raw = [l for l in (trial_dir / ir["sources"]["session_jsonl"]).read_text(encoding="utf-8").split("\n")
            if l.strip()]
     reqs = parity.original_requests(trial_dir)

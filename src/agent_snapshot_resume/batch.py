@@ -142,33 +142,51 @@ class Batch:
     # ------------------------------------------------------------------ stage: screen
     def stage_screen(self, row: dict[str, Any]) -> dict[str, Any]:
         from . import screen
-        from .trace import ir as trace_ir
+        from .bundle import resolve_agent_timeout
 
         task = row["task"]
         ud = self.unit_dir(task)
         out = ud / "screen.json"
         if out.is_file():
             rep = json.loads(out.read_text())
-            if rep.get("cut_line") == row["cut_line"]:
+            if rep.get("manifest_cut") == row["cut_line"]:
                 return rep
         src = self.source(row)
         trial_dir = Path(src["trial_dir"])
         if not trial_dir.is_dir():
             raise RuntimeError(f"source trial dir missing: {trial_dir}")
+        if not (self.task_dir(row) / "task.toml").is_file():
+            # no template, no healthcheck, no agent timeout: this task cannot be resumed here at all
+            raise RuntimeError(f"no local task dir ({self.task_dir(row)}): not resumable")
         fork_line = None
         fork = self.manifest_path.parent / task / "fork.json"
         if fork.is_file():
             fj = json.loads(fork.read_text())
             lines = [f["session_line"] for f in fj.get("forks") or [] if f.get("session_line")]
             fork_line = max(lines) if lines else None
-        cands = [row["cut_line"]]
-        for d in range(2, self.cut_window + 1, 2):
-            for c in (row["cut_line"] - d, row["cut_line"] + d):
-                if c > 0 and (fork_line is None or c < fork_line) and c not in cands:
-                    cands.append(c)
-        reps = screen.screen_trial(self.adapter, trial_dir, cut_lines=cands, agent_timeout_s=None,
-                                   task_dir=self.task_dir(row))
-        by_cut = {r["cut_line"]: r for r in reps}
+        # a cut must start an agent step: snap the manifest cut to the nearest one, then take the neighbourhood
+        ir = self.adapter.load_trace(trial_dir, agent_timeout_s=resolve_agent_timeout(trial_dir, None,
+                                                                                     self.task_dir(row)),
+                                    task=task)
+        if ir.get("error"):
+            raise RuntimeError(f"{trial_dir.name}: {ir['error']}")
+        starts = sorted({st["line_range"][0] for st in ir["steps"] if st["source"] == "agent"})
+        if not starts:
+            raise RuntimeError("no agent steps in the session")
+        near = min(starts, key=lambda s: (abs(s - row["cut_line"]), -s))
+        pool = [s for s in starts if abs(s - near) <= self.cut_window and (fork_line is None or s < fork_line)]
+        # nearest first, then earlier before later (a cut moved forward risks crossing the wrong decision)
+        cands = [near] + sorted((s for s in pool if s != near), key=lambda s: (abs(s - near), s))
+        by_cut: dict[int, dict[str, Any]] = {}
+        skipped: list[dict[str, Any]] = []
+        for c in cands[:8]:
+            try:
+                rep = screen.screen_trial(self.adapter, trial_dir, cut_lines=[c], task_dir=self.task_dir(row), ir=ir)
+            except (SystemExit, ValueError) as exc:  # e.g. a step at index 0 has no prefix to replay
+                skipped.append({"cut_line": c, "error": str(exc)[:200]})
+                continue
+            if rep:
+                by_cut[c] = rep[0]
         chosen = None
         for c in cands:
             r = by_cut.get(c)
@@ -181,14 +199,14 @@ class Batch:
                 if r and r.get("verdict") == "review":
                     chosen = c
                     break
-        rep = {"task": task, "manifest_cut": row["cut_line"], "fork_session_line": fork_line,
-               "candidates": [screen.summarize(by_cut[c]) for c in cands if c in by_cut],
+        rep = {"task": task, "manifest_cut": row["cut_line"], "snapped_cut": near, "fork_session_line": fork_line,
+               "candidates": [screen.summarize(by_cut[c]) for c in cands if c in by_cut], "skipped": skipped,
                "cut_line": chosen, "moved": chosen != row["cut_line"],
                "verdict": (by_cut.get(chosen) or {}).get("verdict") if chosen else "block",
                "reports": {str(c): by_cut[c] for c in cands if c in by_cut}, "ts": _now()}
         out.write_text(json.dumps(rep, indent=1, ensure_ascii=False))
         if chosen is None:
-            raise RuntimeError(f"every cut in the fork window blocks ({len(cands)} candidates)")
+            raise RuntimeError(f"every cut in the fork window blocks ({len(by_cut)} screened, {len(skipped)} skipped)")
         return rep
 
     # ------------------------------------------------------------------ stage: bundles
@@ -236,11 +254,14 @@ class Batch:
         return rec
 
     # ------------------------------------------------------------------ stage: snapshot
-    def stage_snapshot(self, row: dict[str, Any], cut: int, bundled: dict[str, Any]) -> dict[str, Any]:
+    def stage_snapshot(self, row: dict[str, Any], cut: int, bundled: dict[str, Any],
+                       tmpl_id: str | None = None) -> dict[str, Any]:
         from .sandbox import source
 
         task = row["task"]
         tag = f"{task}-s{cut}"
+        if not tmpl_id:
+            raise RuntimeError("no ready template id for this task")
         out = self.state_dir / f"snapshot-{tag}.json"
         if out.is_file():
             rec = json.loads(out.read_text())
@@ -249,8 +270,7 @@ class Batch:
             raise RuntimeError(f"snapshot state {out} exists without a passed replay gate; inspect and use a new tag")
         rec = source.prepare_source(adapter=self.adapter, task_dir=self.task_dir(row),
                                     bundle=Path(bundled["bundles"]["hinted"]["dir"]),
-                                    template=str(self.state_dir / f"template-{task}.json"), tag=tag,
-                                    state_dir=self.state_dir)
+                                    template=str(tmpl_id), tag=tag, state_dir=self.state_dir)
         if not rec.get("snapshot_id"):
             raise RuntimeError("prepare-snapshot produced no snapshot id")
         return rec
@@ -350,7 +370,7 @@ class Batch:
             self.state.update(task, stage="template")
             tmpl = self.stage_template(row)
             self.state.update(task, stage="snapshot", template_id=tmpl.get("template_id"))
-            snap = self.stage_snapshot(row, cut, bundled)
+            snap = self.stage_snapshot(row, cut, bundled, tmpl.get("template_id"))
             snap_path = self.state_dir / f"snapshot-{task}-s{cut}.json"
             self.state.update(task, stage="fake", snapshot_id=snap["snapshot_id"])
             fake = self.stage_fake(row, cut, bundled, snap_path)

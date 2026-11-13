@@ -30,6 +30,8 @@ def manifest(tmp: Path, rows=None) -> Path:
     (tmp / "hint.txt").write_text(HINT)
     (tmp / TASK).mkdir(exist_ok=True)
     (tmp / TASK / "source.json").write_text(json.dumps({"trial_dir": str(tmp / "l0" / f"{TASK}__abc")}))
+    (tmp / "tasks" / TASK).mkdir(parents=True, exist_ok=True)
+    (tmp / "tasks" / TASK / "task.toml").write_text("[agent]\ntimeout_sec = 600\n")
     (tmp / "l0" / f"{TASK}__abc").mkdir(parents=True)
     (tmp / TASK / "fork.json").write_text(json.dumps({"forks": [{"session_line": 140}]}))
     return p
@@ -40,7 +42,21 @@ def make_batch(tmp: Path, **kw) -> batch.Batch:
                 jobs_dir=tmp / "jobs", runs_dir=tmp / "runs", state_dir=tmp / "state",
                 prep_concurrency=1, launch_concurrency=1)
     args.update(kw)
-    return batch.Batch(**args)
+    b = batch.Batch(**args)
+    b._adapter = FakeAdapter()
+    return b
+
+
+class FakeAdapter:
+    """Only what the screen stage needs from an adapter: the IR (for agent-step starts), nothing else."""
+    name = "claude-code"
+
+    def __init__(self, starts=(96, 100, 104, 108)):
+        self.starts = starts
+
+    def load_trace(self, trial_dir, **kw):
+        return {"error": None, "steps": [{"source": "agent", "line_range": [s, s + 1], "atif_step_id": i}
+                                         for i, s in enumerate(self.starts)]}
 
 
 class Screen:
@@ -94,7 +110,7 @@ class Prep(unittest.TestCase):
 
     def run_prep(self, b, screen, launches=None):
         launches = launches if launches is not None else []
-        with mock.patch.object(batch, "load_manifest", batch.load_manifest), \
+        with mock.patch("agent_snapshot_resume.bundle.resolve_agent_timeout", lambda *a, **k: 600.0), \
                 mock.patch("agent_snapshot_resume.screen.screen_trial", screen), \
                 mock.patch("agent_snapshot_resume.bundle.build", fake_build), \
                 mock.patch("agent_snapshot_resume.sandbox.templates.build_template",
@@ -144,8 +160,11 @@ class Prep(unittest.TestCase):
         self.assertEqual(st["cut_line"], 96)
         self.assertTrue(st["cut_moved"])
         self.assertEqual(st["screen_verdict"], "ok")
-        self.assertIn(96, scr.calls[0])
-        self.assertTrue(all(c < 140 for c in scr.calls[0]))  # never at or past the fork
+        screened = [c for call in scr.calls for c in call]
+        self.assertIn(96, screened)
+        self.assertTrue(all(c < 140 for c in screened))  # never at or past the fork
+        # nearest first, earlier before later
+        self.assertEqual(screened[:3], [100, 96, 104])
 
     def test_review_only_cut_is_taken_with_its_verdict(self):
         b = make_batch(self.root)
@@ -170,7 +189,8 @@ class Prep(unittest.TestCase):
                 Path(kw["out"]) / kw["run_id"], {"cut_line": kw["cut_line"], "orig_request_at_k": None,
                                                  "orig_request_locate_error": "no model-proxy log"})
 
-        with mock.patch("agent_snapshot_resume.screen.screen_trial", Screen({})), \
+        with mock.patch("agent_snapshot_resume.bundle.resolve_agent_timeout", lambda *a, **k: 600.0), \
+                mock.patch("agent_snapshot_resume.screen.screen_trial", Screen({})), \
                 mock.patch("agent_snapshot_resume.bundle.build", no_parity):
             out = b.prep({"task": TASK, "cut_line": 100, "hint_path": str(self.root / "hint.txt"), "group": "g"})
         self.assertIn("error", out)

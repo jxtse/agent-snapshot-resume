@@ -42,7 +42,7 @@ def lines_of(p):
     n = 0
     comp = 0
     ts = []
-    pending = []
+    pending = set()
     with open(p, "rb") as f:
         for line in f:
             if not line.strip():
@@ -52,13 +52,20 @@ def lines_of(p):
                 comp += 1
             i = line.find(b'"timestamp":"')
             if i >= 0:
-                ts.append(line[i + 13:i + 36].decode("ascii", "replace"))
-            if b'"tool_use_id":"' in line and b'"type":"tool_result"' in line:
-                j = line.find(b'"tool_use_id":"') + 15
-                pending = [x for x in pending if x != line[j:j + 40]]
-            if b'"type":"tool_use"' in line:
-                j = line.find(b'"id":"') + 6
-                pending.append(line[j:j + 40])
+                ts.append(line[i + 13:i + 37].decode("ascii", "replace"))  # ISO8601 with the trailing Z
+            if b'"tool_use"' in line or b'"tool_result"' in line:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                content = (rec.get("message") or {}).get("content")
+                for b in (content if isinstance(content, list) else []):
+                    if not isinstance(b, dict):
+                        continue
+                    if b.get("type") == "tool_use" and b.get("id"):
+                        pending.add(b["id"])
+                    elif b.get("type") == "tool_result" and b.get("tool_use_id"):
+                        pending.discard(b["tool_use_id"])
     return n, comp, ts, len(pending)
 out = {"sessions": []}
 for pat in ("/logs/agent/resume/sessions/projects/*/*.jsonl", "/logs/agent/sessions/projects/*/*.jsonl"):
@@ -100,14 +107,23 @@ def parse_ts(ts: str) -> float | None:
 
 
 def pause_window(before: list[Any], after: list[Any]) -> tuple[float, float] | None:
-    """(start, end) of the suspension in guest *epoch* seconds, from the ticker values around the snapshot call."""
+    """(start, end) of the suspension in guest *epoch* seconds, from the ticker values around the snapshot call.
+
+    `before`/`after` are (monotonic, epoch) pairs. The freeze is the *one* gap between two consecutive ticks that
+    the 50 ms tick cadence cannot explain: the start is the last tick before that gap and the end the first tick
+    after it. If the ticks show no such gap (the snapshot was too fast to see, or the ticker died) the freeze cannot
+    be bounded and the record is unusable for a tail replay.
+    """
     if not before or not after:
         return None
-    last_before, newest_after = before[-1][1], max(t[1] for t in after)
-    gap = newest_after - last_before
-    if gap <= 0.2:  # no suspension longer than two tick periods: cannot bound the freeze this way
+    seq = sorted([p[1] for p in before] + [p[1] for p in after])
+    gaps = [(b - a, a, b) for a, b in zip(seq, seq[1:])]
+    if not gaps:
         return None
-    return last_before, newest_after
+    gap, start, end = max(gaps)
+    if gap <= 0.2 or gap > 600:
+        return None
+    return start, end
 
 
 def session_line_at(probe: dict[str, Any], pause: tuple[float, float] | None) -> tuple[int, str, bool]:

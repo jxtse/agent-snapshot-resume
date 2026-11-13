@@ -229,14 +229,13 @@ class ChainedBuild(unittest.TestCase):
         good = {"snapshot_id": "s", "session_line": 5, "session_line_reliable": True,
                 "prefix_sha256": hashlib.sha256(("\n".join(raw[:5]) + "\n").encode()).hexdigest(),
                 "trial": self.fx["trial"].name}
-        chain.check_base_snapshot(good, trial=self.fx["trial"].name, session_id=None, raw_lines=raw)
+        chain.check_base_snapshot(good, trial=self.fx["trial"].name, raw_lines=raw)
         for bad in ({"trial": "other__trial"},
                     {"session_line_reliable": False},
                     {"prefix_sha256": "0" * 64},
                     {"prefix_sha256": None}):
             with self.assertRaises(ValueError):
-                chain.check_base_snapshot({**good, **bad}, trial=self.fx["trial"].name, session_id=None,
-                                          raw_lines=raw)
+                chain.check_base_snapshot({**good, **bad}, trial=self.fx["trial"].name, raw_lines=raw)
 
     def test_tail_split_boundary_and_no_line(self):
         acts = [{"call_id": "a", "obs_line": 7}, {"call_id": "b", "obs_line": 8}, {"call_id": "c", "obs_line": None}]

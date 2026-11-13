@@ -313,14 +313,14 @@ def tail_actions(actions: list[dict[str, Any]], session_line: int) -> list[dict[
     return out
 
 
-def check_base_snapshot(record: dict[str, Any], *, trial: str, session_id: str | None,
-                        raw_lines: list[str]) -> None:
+def check_base_snapshot(record: dict[str, Any], *, trial: str, raw_lines: list[str]) -> None:
     """Bind a mid-run snapshot record to the run it claims to come from, before it is used as an environment.
 
-    The record must prove (a) it was taken from a clone of *this* trial's session, (b) its freeze point was
-    measurable (a suspension the guest's ticker saw, no tool call in flight) and (c) the session prefix in the image
-    is byte-identical to the first `session_line` lines of this run's session. Without (c) a record from another run
-    (or another cut) would silently transplant a foreign filesystem into this resume.
+    The record must prove (a) it was taken from a clone of *this* trial, (b) its freeze point was measurable (a
+    suspension the guest's ticker saw, no tool call in flight) and (c) the session prefix in the image is
+    byte-identical to the first `session_line` lines of this run's session. (c) is what actually binds the history:
+    a record from another run, session or cut cannot satisfy it. The receipt's `session_id` is the Harbor sandbox
+    session (`<trial>__env`), not the agent's session id, so it is not used here.
     """
     import hashlib
 
@@ -330,8 +330,6 @@ def check_base_snapshot(record: dict[str, Any], *, trial: str, session_id: str |
         raise ValueError(f"base snapshot record lacks {missing} (taken by an older snapshotter?): re-snapshot it")
     if record.get("trial") and record["trial"] != trial:
         raise ValueError(f"base snapshot belongs to trial {record['trial']}, not {trial}")
-    if record.get("session_id") and session_id and record["session_id"] != session_id:
-        raise ValueError("base snapshot was taken from a different session than this run's")
     if record.get("session_line_reliable") is False:
         raise ValueError("base snapshot's freeze point was not measurable (no tick gap or a tool call in flight); "
                          "it cannot be used for a tail replay")

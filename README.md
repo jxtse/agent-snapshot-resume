@@ -226,13 +226,18 @@ compaction) and appends one record per snapshot to `<runs-dir>/<job>/midrun-snap
 
 ```json
 {"ts": "...", "trial": "task__X", "sandbox_id": "sbx-...", "snapshot_id": "...", "session_line": 240,
- "session_line_before": 240, "session_line_after": 249, "n_compactions": 1,
- "trigger": "compaction", "pause_s": 0.84, "create_s": 6.6}
+ "session_line_before": 240, "session_line_after": 249, "session_line_reliable": true, "in_flight_tools": 0,
+ "prefix_sha256": "...", "n_compactions": 1, "trigger": "compaction", "pause_s": 0.84, "create_s": 6.6}
 ```
 
 * `session_line` is the session line the *image* contains. `create_snapshot` suspends the guest only briefly
-  (~0.84 s measured on FC E2B, ~7 s of host time), so the freeze point is derived from the guest's own ticker: every
-  session line is timestamped, and lines written after the pause cannot be in the image.
+  (~0.84 s measured on FC E2B, ~7 s of host time), so the freeze point is the one gap between two guest ticks that
+  the 50 ms cadence cannot explain (both clocks are written, so the guest's epoch is what session timestamps use);
+  every session line is timestamped and no line can be written while the guest is frozen.
+* `session_line_reliable` is false when that gap cannot be measured **or** a tool call was still in flight at the
+  freeze (its effect may be half applied, so replaying it would apply it twice). `prefix_sha256` binds the record to
+  the session prefix it froze, and `build-bundle --base-snapshot` refuses a record that is unreliable, belongs to
+  another trial or whose prefix does not byte-match the run's session.
 * `trigger` is `start` (the run began), `periodic`, or `compaction` (the agent compacted its context since the last
   snapshot) — a fork after a compaction must have a snapshot after it.
 * The snapshotter only connects, reads and snapshots; it never touches the running agent. `asr snapshot-midrun

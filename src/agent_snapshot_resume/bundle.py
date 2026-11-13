@@ -194,8 +194,7 @@ def build(*, adapter, trial_dir: Path, atif_step: int | None, out: Path, mode: s
         art = evidence["spec"].get("resume_artifacts") or {}
         try:
             if base_snapshot:
-                chain.check_base_snapshot(base_snapshot, trial=trial, session_id=ir.get("session_id"),
-                                          raw_lines=raw_lines)
+                chain.check_base_snapshot(base_snapshot, trial=trial, raw_lines=raw_lines)
             stripped, strip_audit = chain.strip_scaffolding(recs, evidence["spec"]["sentinel"],
                                                             art.get("continue_text", chain.CONTINUE_TXT),
                                                             art.get("synthetic_assistant_text", chain.SYNTH_TXT))

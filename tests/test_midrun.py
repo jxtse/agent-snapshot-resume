@@ -58,9 +58,14 @@ class PauseWindow(unittest.TestCase):
     def test_gap_between_last_tick_before_and_first_after(self):
         # the guest clock is what matters: the pause is measured on the epoch part
         self.assertEqual(midrun.pause_window(ticks(T0 + 1.0, T0 + 1.05, T0 + 1.1), ticks(T0 + 1.95, T0 + 2.0)),
-                         (T0 + 1.1, T0 + 2.0))
+                         (T0 + 1.1, T0 + 1.95))
         self.assertIsNone(midrun.pause_window(ticks(T0 + 1.0), ticks(T0 + 1.05)))  # not a suspension
         self.assertIsNone(midrun.pause_window([], ticks(T0 + 1.0)))
+        # a continuously ticking guest is never mistaken for a paused one
+        self.assertIsNone(midrun.pause_window(ticks(*[T0 + i / 20 for i in range(10)]),
+                                              ticks(*[T0 + 10 / 20 + i / 20 for i in range(20)])))
+        # nor is a suspiciously long "pause" (the guest clock jumped, or the ticker stopped)
+        self.assertIsNone(midrun.pause_window(ticks(T0 + 1.0), ticks(T0 + 900.0)))
 
     def test_session_line_is_the_state_at_the_pause(self):
         ts = ["2026-01-01T00:00:00.000Z"] * 5 + ["2026-01-01T00:10:00.000Z"] * 3
@@ -76,6 +81,13 @@ class PauseWindow(unittest.TestCase):
         self.assertFalse(reliable)
         line, _path, reliable = midrun.session_line_at(probe(8, ts=ts, ticks=ticks(1.0)), None)
         self.assertFalse(reliable)
+
+
+class Timestamps(unittest.TestCase):
+    def test_utc_z_is_honoured(self):
+        # the guest may run in any TZ; the session timestamp carries its own zone
+        self.assertEqual(midrun.parse_ts("2026-01-01T00:00:00.000Z"), T0)
+        self.assertIsNone(midrun.parse_ts(""))
 
 
 class TickLoop(unittest.TestCase):
