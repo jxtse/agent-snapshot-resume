@@ -92,8 +92,25 @@ uv run asr build-bundle \
 # optional: --mode hint --hint-file hint.txt ; --fingerprint-root /app --fingerprint-root /data/out
 ```
 
+Instead of `--step` you can give `--cut-line L` (0-based session line where the regenerated step starts). Cuts after
+one or more context compactions are supported.
+
 Check `bundles/<run_id>/bundle.json`: `cut_line`, `agent_budget_s` (task agent timeout − time elapsed before *k*),
-`n_replay_actions`, `resume_cost.bg_inflight` / `subagents_inflight` (pick a *k* where both are 0), and `flags`.
+`n_replay_actions`, `resume_cost.bg_inflight` / `subagents_inflight` (pick a *k* where both are 0), `flags`,
+`n_compactions_before_cut`, and `orig_request_at_k` (the original run's request at the cut, located in the original
+proxy log by token usage; used by the parity gate).
+
+Before paying for a sandbox, screen candidate cuts offline:
+
+```bash
+uv run asr screen --trial-dir /path/to/jobs/<job>/<trial> --task-dir /path/to/tasks/<task> \
+    --cut-line 372 --cut-line 2251          # one JSON line per cut; --full lists every risk
+# {"trial": ..., "cut_line": 372, "verdict": "review", "rules": {"warn:network": 4, "warn:glob_order": 3, ...}}
+```
+
+`block` means the replay gate is expected to fail or the restored state is known to differ (a background job or
+sub-agent still running at the cut, a read of a running job's output); `review` lists pace-, order- or
+network-dependent commands the gate will look at (see [docs/design.md](docs/design.md#screening-cuts-offline-asr-screen)).
 
 ### 2. Register a snapshot-capable template for the task image
 
@@ -109,9 +126,12 @@ uv run asr prepare-snapshot --task-dir /path/to/tasks/<task> --bundle bundles/<r
 # -> state/snapshot-<task>-s27.json with snapshot_id, fingerprint_source, replay_gate_passed=true
 ```
 
-If the replay gate fails, nothing is snapshotted. Check `state/<tag>-replay_report.json`. If a difference is
-benign (for example a hardware probe prints another memory size), add a reviewed exception bound to that command's
-sha256 in `bundle.json` → `replay_reviewed_exceptions` (see [docs/design.md](docs/design.md#replay-gate)). Then
+If the replay gate fails, nothing is snapshotted. Check `state/<tag>-replay_report.json`. Common benign differences
+(ls `.`/`..` rows, `time` reports, cProfile timings, timing lines, bash's own error prefix, directory-listing order of
+read-only commands, ...) are accepted automatically and named in the report (`automatic_equivalence`). If another
+difference is benign (for example a hardware probe prints another memory size), add a reviewed exception bound to
+that command's sha256 in `bundle.json` → `replay_reviewed_exceptions` (see
+[docs/design.md](docs/design.md#replay-gate)). Then
 retry with a new `--tag`, or use `--retain-on-gate-failure` and finish with
 `asr prepare-snapshot --continue state/snapshot-<tag>.json`.
 
@@ -128,11 +148,28 @@ uv run asr equiv <trial>/agent/sessions/projects/<slug>/<sid>.jsonl <cut_line> \
 With `--fake`, the resume proxy answers every request with `end_turn` and logs the raw and rewritten first request.
 No key is needed and no model is called.
 
+**Request parity.** When the bundle located the original request at the cut (`orig_request_at_k`), the resume proxy
+checks the first rewritten request against it and refuses it and every later request (HTTP 400, nothing sent
+upstream) unless, without the hint block and serialised as the original route logged it, it has exactly the
+original byte length, the same model, message count, `max_tokens`, `thinking` and tools, the system prompt the agent
+persisted, and every message block of the session prefix in order (`first_request_parity.json` in the resume-proxy
+log dir). `--parity-gate require` refuses to launch a bundle without the record and, for a real run, also needs
+`--freeze-first-request jobs/<fake job>/<trial>/agent/resume-proxy/<run_id>/first_request_rewritten.json`: the real
+first request must then be identical (every field but `metadata`) to the fake run's parity-checked one. `off`
+disables the gate. Offline:
+`asr parity bundles/<run_id> <first_request_rewritten.json> --passthrough-args '...'`.
+`--max-model-requests N` stops a continuation after N model requests (useful for cheap real-route probes).
+
 Use `--original-trial-dir <trial>` so the resumed agent gets the same non-secret env and kwargs as the original run.
 If the original config used `${VAR}` templates (for example `CLAUDE_CODE_MAX_OUTPUT_TOKENS`), `launch` fills them from
 your shell or drops them with a warning. Pass the original value with `--agent-env VAR=value`, otherwise request
 parameters such as `max_tokens` differ from the original run. Compare the whole first request, not only `equiv`
 (which checks the message prefix).
+
+If the original route started its in-sandbox proxy with extra flags (for example `--drop-fields metadata
+--strip-is-error` for a backend that rejects those fields), pass them with
+`--passthrough-args '--drop-fields metadata --strip-is-error'` (whitelisted flags only). A `same` and a `hint` bundle
+cut at the same step can share one snapshot (see [docs/design.md](docs/design.md#sharing-one-snapshot-between-bundles)).
 
 ### 5. Real resume
 
@@ -168,6 +205,18 @@ Stable Harbor import paths:
 - `agent_snapshot_resume.agents.claude_code:ClaudeCodeSnapshotResume`
 - `agent_snapshot_resume.sandbox.fc_env:SandboxEnvironment` / `:VpcSandboxEnvironment` (plain FC runs, no resume)
 
+## Hints that survive context compaction (`--persist-hint`)
+
+A `--mode hint` bundle injects the hint as a `<system-reminder>` block on the fork turn. The resume proxy finds that
+turn by the sentinel prompt; once the agent auto-compacts its context, the sentinel turn is summarised away and the
+hint would silently disappear from every later request. Build the bundle with `--persist-hint` to keep it: when a
+request has no sentinel but carries a compaction summary (a user message containing "This session is being continued
+from a previous conversation"), the proxy appends the same hint block once to the latest such message (moving that
+message's cache breakpoint onto it). It never duplicates the hint (if the hint text is already present verbatim it does
+nothing) and leaves requests without a summary (e.g. sub-agent requests) untouched. Every `requests.jsonl` record
+carries `hint_blocks`, `hint_occurrences`, `compact_summary` and system/tools fingerprints, and the first request after
+each compaction is saved as `post_compaction_request_<i>.json`, so persistence can be audited per request.
+
 ## What "equivalent" means
 
 `asr equiv` compares the rewritten first request with the original session prefix (`lines[:cut]`). The rule:
@@ -200,8 +249,9 @@ tool_result id/is_error/content. Anything else in the request is reported as an 
   until the difference is reviewed.
 - **Redacted sessions.** If a pipeline replaced values with `[REDACTED]` in the session, the prefix is no longer
   byte-faithful (flag `redaction_*`). Do not resume such trials.
-- **Agent version is pinned.** Claude Code 2.1.207 only (binary sha256 pinned). A different version changes the
-  tool list or system prompt, so the context is no longer the same.
+- **Agent version is pinned.** Claude Code 2.1.207 and 2.1.280 (binary sha256 pinned per version; the bundle uses
+  the original run's version). A different version changes the tool list or system prompt, so the context is no
+  longer the same.
 - **Snapshots need a provider that supports them.** Tested on Alibaba Cloud FC sandbox. `build-template` uses FC's
   `micro` build mode headers.
 - The live sandbox path (template build, source preparation, clone, real model) is not exercised by the offline

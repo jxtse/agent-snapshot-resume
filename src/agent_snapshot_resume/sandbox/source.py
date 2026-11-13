@@ -163,9 +163,13 @@ def prepare_source(*, adapter, task_dir: Path, bundle: Path, template: str, tag:
     fingerprint_cmd = fingerprint_command_for(meta)
     healthcheck = task_healthcheck(task_dir)
     owner = owner_tag()
-    rec: dict[str, Any] = {"task_dir": str(task_dir), "tag": tag, "template": template, "bundle": str(bundle),
+    from ..bundle import snapshot_cut_identity
+    # Default to the original run's agent version (recorded in the bundle), not the adapter's default.
+    version = version or meta.get("agent_version_orig") or adapter.version
+    rec: dict[str, Any] = {"task_dir": str(task_dir), "tag": tag, "template": template, "bundle": str(bundle.resolve()),
                            "run_id": meta["run_id"], "resume_atif_step": meta["resume_atif_step"],
-                           "agent": adapter.name, "agent_version": version or adapter.version, "owner": owner,
+                           "cut_identity": snapshot_cut_identity(bundle),
+                           "agent": adapter.name, "agent_version": version, "owner": owner,
                            "steps": []}
 
     def save():
@@ -322,6 +326,9 @@ def finish_prepared_source(state_path: Path, *, observe_timeout_s: int = 10800) 
         save()
         raise
     rec.pop("replay_gate_error", None)
+    # Reviewed exceptions may have been added to the bundle after prepare; the snapshot is gated with these.
+    from ..bundle import snapshot_cut_identity
+    rec["cut_identity"] = snapshot_cut_identity(bundle)
     _collect_gate_evidence(sb, rec, report, save)
     _snapshot_and_kill(sb, rec, step, run, fingerprint_cmd)
     t = time.time()

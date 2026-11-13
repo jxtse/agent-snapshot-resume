@@ -14,6 +14,7 @@ The key is never written to disk, never on a command line and never in the proxy
 from __future__ import annotations
 
 import hashlib
+import re
 import shlex
 from pathlib import Path
 
@@ -143,6 +144,31 @@ for i in $(seq 1 60); do
 done
 cat {logdir}/resume-proxy.stderr >&2; echo "resume proxy did not start" >&2; exit 1
 """
+
+
+# Extra passthrough-proxy flags an agent may request (e.g. the original route's `--drop-fields metadata
+# --strip-is-error`). Whitelisted so a job config cannot inject shell or override host/port/key/upstream/log-dir.
+PASSTHROUGH_FLAGS = {"--drop-fields": 1, "--strip-is-error": 0, "--strip-thinking": 0, "--retry-403-marker": 1,
+                     "--no-thinking-text": 0}
+_ARG_VALUE_RE = re.compile(r"[A-Za-z0-9_.,:-]+")
+
+
+def validate_passthrough_args(args) -> list[str]:
+    if isinstance(args, str):
+        args = shlex.split(args)
+    args, out, i = list(args), [], 0
+    while i < len(args):
+        flag = args[i]
+        if flag not in PASSTHROUGH_FLAGS:
+            raise ValueError(f"passthrough arg {flag!r} not allowed (allowed: {sorted(PASSTHROUGH_FLAGS)})")
+        out.append(flag)
+        if PASSTHROUGH_FLAGS[flag]:
+            if i + 1 >= len(args) or not _ARG_VALUE_RE.fullmatch(args[i + 1]):
+                raise ValueError(f"passthrough arg {flag} needs a plain value")
+            out.append(args[i + 1])
+            i += 1
+        i += 1
+    return out
 
 
 def passthrough_start_command(upstream: str, port: int = PASSTHROUGH_PORT, logdir: str = PASSTHROUGH_LOGDIR,

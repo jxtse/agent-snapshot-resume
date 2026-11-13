@@ -21,6 +21,7 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
+from . import parity
 from .trace import ir as trace_ir
 
 SENTINEL_PREFIX = "ZZZ_RESUME_SENTINEL_"
@@ -53,34 +54,59 @@ def sentinel_for(run_id: str) -> str:
     return SENTINEL_PREFIX + hashlib.sha1(run_id.encode()).hexdigest()[:10]
 
 
-def build(*, adapter, trial_dir: Path, atif_step: int, out: Path, mode: str = "same", hint: str | None = None,
-          agent_timeout: float | None = None, task_dir: Path | None = None, run_id: str | None = None,
-          model: str | None = None, pin_date: bool = True, fingerprint_roots: list[str] | None = None,
-          force: bool = False) -> tuple[Path, dict[str, Any]]:
-    if mode not in ("same", "hint"):
-        raise SystemExit("--mode must be same or hint")
-    if mode == "hint" and not hint:
-        raise SystemExit("--mode hint needs --hint-file")
-    trial_dir = Path(trial_dir).resolve()
-    trial = trial_dir.name
-    result = _trial_result(trial_dir)
-    task = (result.get("task_name") or "").split("/")[-1] or (task_dir.name if task_dir else trial.split("__")[0])
-    reward = ((result.get("verifier_result") or {}).get("rewards") or {}).get("reward")
-    timeout = resolve_agent_timeout(trial_dir, agent_timeout, task_dir)
-    ir = adapter.load_trace(trial_dir, agent_timeout_s=timeout, task=task, reward=reward)
-    if ir.get("error"):
-        raise SystemExit(f"{trial}: {ir['error']}")
-    k = trace_ir.step_index(ir, atif_step)
-    st = ir["steps"][k]
-    if st["source"] != "agent":
-        raise SystemExit("resume step must be an agent step")
-    prev = ir["steps"][k - 1]
-    sess_path = trial_dir / ir["sources"]["session_jsonl"]
-    with open(sess_path, encoding="utf-8") as f:
-        raw_lines = [l for l in f.read().split("\n") if l.strip()]
-    cut = adapter.cut_line(raw_lines, ir, k)
+def snapshot_cut_identity(bundle_dir: Path) -> dict[str, Any]:
+    """What a step-k environment snapshot depends on. Bundles with equal identity (e.g. the mode=same and mode=hint
+    bundles of one trial at one k) can share one snapshot: the replay plan, cut, fingerprint roots and agent version
+    are identical; only the session seed / proxy spec (uploaded at launch, not part of the snapshot) differ."""
+    bundle_dir = Path(bundle_dir)
+    meta = json.loads((bundle_dir / "bundle.json").read_text())
+    return {"trial": meta["trial"], "session_sha256": meta["session_sha256"], "cut_line": meta["cut_line"],
+            "resume_atif_step": meta["resume_atif_step"], "agent": meta.get("agent"),
+            "agent_version_orig": meta.get("agent_version_orig"), "fingerprint_roots": meta.get("fingerprint_roots"),
+            "fingerprint_optional_roots": meta.get("fingerprint_optional_roots"),
+            "plan_sha256": hashlib.sha256((bundle_dir / "plan.json").read_bytes()).hexdigest(),
+            "replay_reviewed_exceptions": meta.get("replay_reviewed_exceptions") or {}}
+
+
+def bundle_identity(bundle_dir: Path) -> dict[str, Any]:
+    """Everything a resumed run depends on: the snapshot cut identity (replay plan, reviews, fingerprint roots, cut,
+    agent version) plus the session seed (truncated session + auxiliary files) and the proxy spec. Two runs with
+    equal identity start from the same environment and the same agent state."""
+    bundle_dir = Path(bundle_dir)
+    seed = hashlib.sha256()
+    for f in [bundle_dir / "session_trunc.jsonl"] + sorted(p for p in (bundle_dir / "aux").rglob("*") if p.is_file()):
+        seed.update(str(f.relative_to(bundle_dir)).encode() + b"\0" + hashlib.sha256(f.read_bytes()).digest())
+    meta = json.loads((bundle_dir / "bundle.json").read_text())
+    return {"cut": snapshot_cut_identity(bundle_dir), "seed_sha256": seed.hexdigest(),
+            "proxy_spec_sha256": hashlib.sha256((bundle_dir / "proxy_spec.json").read_bytes()).hexdigest(),
+            "orig_request_at_k": meta.get("orig_request_at_k"), "run_id": meta.get("run_id")}
+
+
+def default_fingerprint_roots(plan: dict[str, Any]) -> list[str] | None:
+    """Task directories to fingerprint when none are given. None (= DEFAULT_ROOTS, /app) if the run worked under
+    /app or its cwd is unknown. For a run in a home directory (e.g. cwd /root): every first-level, non-hidden
+    directory of that home that an action used as cwd or wrote a file into (e.g. /root/data, /root/results,
+    /root/work); the whole home is never fingerprinted (caches, agent config)."""
+    cwd = plan.get("initial_cwd") or "/app"
+    if cwd == "/app" or cwd.startswith("/app/"):
+        return None
+    parts = [p for p in cwd.split("/") if p]
+    home = "/" + "/".join(parts[:2] if parts and parts[0] == "home" else parts[:1])
+    paths = [a.get("cwd") for a in plan.get("actions", [])]
+    paths += [(a.get("args") or {}).get("file_path") for a in plan.get("actions", [])]
+    roots = set()
+    for x in paths:
+        if not x or not x.startswith(home.rstrip("/") + "/"):
+            continue
+        first = x[len(home.rstrip("/")) + 1:].split("/")[0]
+        if first and not first.startswith("."):
+            roots.add(home.rstrip("/") + "/" + first)
+    return sorted(roots) or None
+
+
+def plan_with_observations(ir: dict[str, Any], k: int) -> dict[str, Any]:
+    """Replay plan for steps < k with each action's original observation text attached (`orig_text`)."""
     plan = trace_ir.replay_plan(ir, k)
-    # attach original observation text for fidelity comparison
     obs: dict[str, Any] = {}
     for s in ir["steps"][:k]:
         for e in s["events"]:
@@ -91,9 +117,61 @@ def build(*, adapter, trial_dir: Path, atif_step: int, out: Path, mode: str = "s
             obs.setdefault(c["call_id"], c.get("observation_text"))
     for a in plan["actions"]:
         a["orig_text"] = obs.get(a["call_id"])
+    return plan
+
+
+def step_for_cut_line(ir: dict[str, Any], cut_line: int, trimmed=None) -> int:
+    """ATIF step id of the agent step that starts at session line cut_line (0-based; = number of prefix lines kept).
+    Accepts the step's first line or its trimmed cut (adapter.cut_line, e.g. without trailing bookkeeping lines)."""
+    for st in ir["steps"]:
+        if st["source"] == "agent" and (st["line_range"][0] == cut_line or
+                                        (trimmed is not None and trimmed(st["index"]) == cut_line)):
+            return st["atif_step_id"]
+    near = sorted((abs(st["line_range"][0] - cut_line), st["line_range"][0], st["atif_step_id"])
+                  for st in ir["steps"] if st["source"] == "agent")[:4]
+    raise SystemExit(f"no agent step starts at session line {cut_line}; nearest (line, step): "
+                     f"{[(ln, sid) for _, ln, sid in near]}")
+
+
+def build(*, adapter, trial_dir: Path, atif_step: int | None, out: Path, mode: str = "same", hint: str | None = None,
+          agent_timeout: float | None = None, task_dir: Path | None = None, run_id: str | None = None,
+          model: str | None = None, pin_date: bool = True, fingerprint_roots: list[str] | None = None,
+          force: bool = False, persist_hint: bool = False, cut_line: int | None = None) -> tuple[Path, dict[str, Any]]:
+    if mode not in ("same", "hint"):
+        raise SystemExit("--mode must be same or hint")
+    if mode == "hint" and not hint:
+        raise SystemExit("--mode hint needs --hint-file")
+    if persist_hint and mode != "hint":
+        raise SystemExit("--persist-hint needs --mode hint")
+    trial_dir = Path(trial_dir).resolve()
+    trial = trial_dir.name
+    result = _trial_result(trial_dir)
+    task = (result.get("task_name") or "").split("/")[-1] or (task_dir.name if task_dir else trial.split("__")[0])
+    reward = ((result.get("verifier_result") or {}).get("rewards") or {}).get("reward")
+    timeout = resolve_agent_timeout(trial_dir, agent_timeout, task_dir)
+    ir = adapter.load_trace(trial_dir, agent_timeout_s=timeout, task=task, reward=reward)
+    if ir.get("error"):
+        raise SystemExit(f"{trial}: {ir['error']}")
+    if (atif_step is None) == (cut_line is None):
+        raise SystemExit("give exactly one of --step / --cut-line")
+    sess_path = trial_dir / ir["sources"]["session_jsonl"]
+    with open(sess_path, encoding="utf-8") as f:
+        raw_lines = [l for l in f.read().split("\n") if l.strip()]
+    if atif_step is None:
+        atif_step = step_for_cut_line(ir, int(cut_line), lambda i: adapter.cut_line(raw_lines, ir, i))
+    k = trace_ir.step_index(ir, atif_step)
+    st = ir["steps"][k]
+    if st["source"] != "agent":
+        raise SystemExit("resume step must be an agent step")
+    prev = ir["steps"][k - 1]
+    cut = adapter.cut_line(raw_lines, ir, k)
+    plan = plan_with_observations(ir, k)
     first_cwd = next((json.loads(trace_ir._REDACT_RE.sub(r"\1null", l)).get("cwd")
                       for l in raw_lines if '"cwd"' in l), None)
     plan["initial_cwd"] = first_cwd
+    trailer = adapter.bg_output_trailer(ir, raw_lines)
+    if trailer and any(a.get("side_effect") == "exec_background" for a in plan["actions"]):
+        plan["bg_output_trailer"] = trailer
     run_id = re.sub(r"[^A-Za-z0-9_.-]", "-", run_id or default_run_id(trial, atif_step, mode))
     bdir = Path(out) / run_id
     if bdir.exists():
@@ -113,6 +191,14 @@ def build(*, adapter, trial_dir: Path, atif_step: int, out: Path, mode: str = "s
         raise SystemExit(f"no agent budget left at step {atif_step} (elapsed {st['elapsed_s']} s >= {timeout} s)")
     orig_date = (ir["start_ts"] or "")[:10]
     sentinel = sentinel_for(run_id)
+    n_compactions = sum(1 for s in ir["steps"][:k] for e in s["events"] if e["type"] == "compaction_boundary")
+    loc = parity.locate_request(ir, k, parity.original_requests(trial_dir))
+    orig_request = (parity.expected_from_record(loc["record"], index=loc["index"], method=loc["method"])
+                    if "record" in loc else None)
+    if orig_request is not None:
+        prefix = [json.loads(trace_ir._REDACT_RE.sub(r"\1null", l)) for l in raw_lines[:cut]]
+        orig_request["content"] = parity.content_reference(
+            prefix, adapter.rendered_attachment_templates(ir.get("cc_version")))
     agent_model = model or ((result.get("config") or {}).get("agent") or {}).get("model_name") or ir.get("model")
     meta = {
         "run_id": run_id, "agent": adapter.name, "trial": trial, "trial_dir": str(trial_dir), "task": task,
@@ -124,7 +210,9 @@ def build(*, adapter, trial_dir: Path, atif_step: int, out: Path, mode: str = "s
         "agent_timeout_task_s": timeout, "agent_budget_s": budget, "orig_date": orig_date, "mode": mode,
         "hint": hint, "model": agent_model, "sentinel": sentinel, "aux_counts": aux_counts,
         "resume_cost": rp, "n_replay_actions": len(plan["actions"]), "flags": ir["flags"],
-        "fingerprint_roots": fingerprint_roots or None,
+        "n_compactions_before_cut": n_compactions, "orig_request_at_k": orig_request,
+        "orig_request_locate_error": loc.get("error"),
+        "fingerprint_roots": fingerprint_roots or default_fingerprint_roots(plan),
         "replay_reviewed_exceptions": {},
         "built_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
         "orig_step_k_preview": [{"type": e["type"], "tool": e.get("tool"),
@@ -137,6 +225,8 @@ def build(*, adapter, trial_dir: Path, atif_step: int, out: Path, mode: str = "s
     spec = {"mode": mode, "sentinel": sentinel, "hint": hint if mode == "hint" else None,
             "upstream": "http://127.0.0.1:4013", "model": None, "pin_date": orig_date if pin_date else None,
             "resume_artifacts": dict(adapter.resume_artifacts)}
+    if persist_hint:
+        spec["persist_hint"] = True  # re-inject the hint on the compaction summary once the sentinel is gone
     with open(bdir / "proxy_spec.json", "w") as f:
         json.dump(spec, f, indent=1)
     return bdir, meta

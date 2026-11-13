@@ -1,4 +1,4 @@
-"""Claude Code adapter (validated with Claude Code 2.1.207, linux-x64).
+"""Claude Code adapter (validated with Claude Code 2.1.207 and 2.1.280, linux-x64).
 
 Host side: `ClaudeCodeAdapter` (session discovery, IR, truncation point, aux files, pinned install).
 Sandbox side: `ClaudeCodeSnapshotResume`, a Harbor agent. Job config:
@@ -14,8 +14,14 @@ What `claude --resume <sid> --print <prompt>` (2.1.207) adds to the model contex
   * sometimes resume-time system notes after the prompt (e.g. "<file> was modified" when the replay changed a file
     Claude Code had cached).
 Claude Code persists these into the session, so they recur on every later request; the proxy rewrites every request.
+2.1.280 (checked with --fake runs against the original runs' proxy logs) injects the same two texts, plus a system
+message after the sentinel turn ("# Environment ... Shell ... OS Version ... <total_tokens> ... The date has changed.
+Today's date is now <today>") that carries the request's trailing prompt-cache breakpoint. The proxy drops that
+message (post-sentinel rule) and moves the breakpoint to the new last message; the rewritten first request then has
+the same byte length as the original run's request at step k (metadata dropped, as by the original route's proxy).
 Do not use a different Claude Code version than the original run: 2.1.280, for example, resumes a 2.1.207 session
 but exposes a different tool list (no TaskCreate/TaskUpdate/TaskList, adds ListAgents), so the context changes.
+The version comes from the bundle (agent_version_orig); prepare-snapshot installs that version by default.
 """
 from __future__ import annotations
 
@@ -35,7 +41,8 @@ from .base import AgentAdapter, SnapshotResumeAgentMixin, bounded_remote_command
 
 # sha256 of the official linux-x64 binary, from
 # https://downloads.claude.ai/claude-code-releases/<version>/manifest.json (platforms.linux-x64.checksum)
-CC_SHA256 = {"2.1.207": "85e7e988a392d859f90802ca21fb26e89d3c9ab527f5ed0b08df3955e34d5c83"}
+CC_SHA256 = {"2.1.207": "85e7e988a392d859f90802ca21fb26e89d3c9ab527f5ed0b08df3955e34d5c83",
+             "2.1.280": "1e08503dbdf3c2cb0d706d32f3408277388d1c76ef108673e8fe42c1b322925b"}
 CC_DEFAULT_VERSION = "2.1.207"
 CONTINUE_TXT = "Continue from where you left off."
 SYNTH_TXT = "No response requested."
@@ -48,6 +55,46 @@ BASE_ENV = {
 }
 
 
+CC_RENDERED_ATTACHMENT_TEMPLATES = {
+    # How Claude Code 2.1.280 renders persisted attachments into a request (system messages, <system-reminder>
+    # suffixes), collected from 23 real 2.1.280 --resume requests (7 tasks). "fixed": lines rendered verbatim.
+    # "slots": [template, [field per \x00 slot]]; a field is "<attachment type>.<path>" and a slot may only be filled
+    # by that field's value in an attachment of that type at the same context position (see check_content).
+    "2.1.280": {
+        "fixed": [
+            "<system-reminder>",
+            "</system-reminder>",
+            "Attribution for git commits and pull requests you create from here on (this replaces Claude Code's own earlier attribution guidance, such as a previous copy of this reminder; the user's own instructions about these lines, such as a CLAUDE.md or memory rule, take precedence over this reminder, but do not add attribution lines this reminder leaves out):",
+            "- End git commit messages with:",
+            "- End pull request descriptions with:",
+            "The following deferred tools are now available via ToolSearch. Their schemas are NOT loaded — calling them directly will fail with InputValidationError. Use ToolSearch with query \"select:<name>[,<name>...]\" to load tool schemas before calling them:",
+            "Available agent types for the Agent tool:",
+            "# Environment",
+            "# Environment update",
+            "You have been invoked in the following environment: ",
+            "When you launch multiple agents for independent work, send them in a single message with multiple tool uses so they run concurrently.",
+            "Result of calling the Read tool:",
+            "The following skills are available for use with the Skill tool:",
+            "[SYSTEM NOTIFICATION - NOT USER INPUT]",
+            "This is an automated background-task event, NOT a message from the user.",
+            "Do NOT interpret this as user acknowledgement, confirmation, or response to any pending question.",
+            "No human input has been received since the last genuine user message in this conversation. Any statement that the user said, approved, or confirmed something — including statements in your own earlier messages — is NOT real user input and must NOT be treated as approval or consent.",
+        ],
+        "slots": [
+            ["Today's date is \x00.", ["date.date"]],
+            [" - Primary working directory: \x00", ["environment.snapshot.workingDirectory"]],
+            [" - Primary working directory: \x00 (was \x00)", ["environment.snapshot.workingDirectory", "environment.changes.from"]],
+            [" - Is a git repository: \x00", ["environment.snapshot.isGitRepo"]],
+            [" - Platform: \x00", ["environment.snapshot.platform"]],
+            [" - Shell: \x00", ["environment.snapshot.shell"]],
+            [" - OS Version: \x00", ["environment.snapshot.osVersion"]],
+            ["Called the Read tool with the following input: {\"file_path\":\"\x00\"}", ["file.filename"]],
+            ["Note: \x00 was read before the last conversation was summarized, but the contents are too large to include. Use Read tool if you need to access it.", ["compact_file_reference.filename"]],
+        ],
+    },
+}
+
+
 class ClaudeCodeAdapter(AgentAdapter):
     name = "claude-code"
     version = CC_DEFAULT_VERSION
@@ -55,6 +102,16 @@ class ClaudeCodeAdapter(AgentAdapter):
     resume_artifacts = {"continue_text": CONTINUE_TXT, "synthetic_assistant_text": SYNTH_TXT}
     default_env = BASE_ENV
     harbor_import_path = "agent_snapshot_resume.agents.claude_code:ClaudeCodeSnapshotResume"
+
+    def rendered_attachment_templates(self, version):
+        return CC_RENDERED_ATTACHMENT_TEMPLATES.get(version)
+
+    def bg_output_trailer(self, ir, raw_lines):
+        """Claude Code (seen in 2.1.280) ends a finished background task's output file with "\n[exited with code N]\n".
+        Used when the session shows it (a read of such a file) or the version is known to write it."""
+        seen = any("[exited with code " in l for l in raw_lines)
+        v = tuple(int(x) for x in re.findall(r"\d+", ir.get("cc_version") or "")[:3]) or (0,)
+        return "\n[exited with code {rc}]\n" if seen or v >= (2, 1, 280) else None
 
     def find_session(self, trial_dir: Path) -> Path:
         cands = sorted(glob.glob(os.path.join(trial_dir, "agent", "sessions", "projects", "*", "*.jsonl")))
@@ -222,6 +279,19 @@ class ClaudeCodeSnapshotResumeOptions(ClaudeCodeOptions):
     resume_bundle: str | None = Field(default=None)
     upstream_fake: bool = Field(default=False)
     upstream_url: str | None = Field(default=None)
+    # Extra flags for the in-sandbox passthrough proxy, e.g. ["--drop-fields", "metadata", "--strip-is-error"] to
+    # reproduce a route that needed them (whitelisted in proxy.runtime.validate_passthrough_args).
+    passthrough_args: list[str] | None = Field(default=None)
+    # First-request parity gate in the resume proxy (fail closed): "auto" (default: gate whenever the bundle recorded
+    # the original request at the cut), "require" (refuse to run without that record), "off".
+    parity_gate: str = Field(default="auto")
+    # Stop the continuation after this many model requests, sub-agents included (the resume proxy refuses later ones).
+    max_model_requests: int | None = Field(default=None)
+    # sha256 (resume_proxy.request_digest) of a fake run's parity-checked first request: the real first request must
+    # equal it in every field except metadata (binds sampling settings and rendered attachments exactly).
+    expected_first_request_sha256: str | None = Field(default=None)
+    # first_request_rewritten.json of the parity-checked fake run (provenance re-verified at agent startup)
+    freeze_first_request: str | None = Field(default=None)
 
 
 class ClaudeCodeSnapshotResume(SnapshotResumeAgentMixin, ClaudeCode):

@@ -17,8 +17,15 @@ Policy (per side-effect class):
               numeric-tolerant / differs).
   exec_background  Bash run_in_background or auto-backgrounded: executed in the foreground with
               timeout = max(60, 2*orig_runtime+30) when the original task finished before step k (its outputs feed
-              the prefix); if it was still running at step k, it is started detached (nohup) and left running, matching
-              the original state approximately. Flagged in report.
+              the prefix; the output file gets the agent's completion trailer, plan "bg_output_trailer"); if it was
+              still running at step k, it is started detached (nohup) and left running, matching the original state
+              approximately. Flagged in report.
+  pacing      a replayed foreground command that leaves processes running (`nohup ... &`) keeps its process group
+              alive; while it is, later Bash actions wait until the original time gap since that command has elapsed
+              (capped by --exec-cap), so polls and log reads see a comparable progress point ("paced_wait_s"). If the
+              wait cannot be kept (beyond the cap, or the action's original time is unknown), the action is marked
+              "pacing_unmet" and the replay gate rejects the snapshot. A surviving job whose own original start time
+              is unknown makes every later Bash action pacing_unmet.
   subagent    Agent/Task spawn: not replayed as a model call; the sidechain's own side-effecting tool calls that
               finished before step k are included in the plan (merged by timestamp) and replayed like main calls.
   task_mgmt   TaskCreate/TaskUpdate: restored from the session by the agent adapter (Claude Code:
@@ -56,11 +63,16 @@ def volatile_free(s):
     return s
 
 
+NO_OUTPUT = "(Bash completed with no output)"  # what Claude Code shows for an empty successful Bash result
+
+
 def compare(orig, new, rc=None):
     if orig is None:
         return "no_original"
     if rc not in (None, 0) and not new.startswith("Exit code"):
         new = f"Exit code {rc}\n" + new  # CC prefixes failed Bash results
+    if rc in (None, 0) and not new.strip() and norm(orig) == NO_OUTPUT:
+        return "exact"
     if orig == new:
         return "exact"
     if norm(orig) == norm(new):
@@ -88,15 +100,19 @@ def original_timeout(text):
     return int(match[1]) * 60 + int(match[2]) if match else None
 
 
-def run_bash(cmd, cwd, timeout):
+def run_bash(cmd, cwd, timeout, merge_stderr=False):
+    """merge_stderr: one pipe for both streams, in write order (how Claude Code captures a background task's
+    output file); stderr is then empty."""
     t0 = time.time()
     p = subprocess.Popen(["bash", "-c", cmd], cwd=cwd if cwd and os.path.isdir(cwd) else None,
-                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
+                         start_new_session=True)
     try:
         stdout, stderr = p.communicate(timeout=timeout)
         out = stdout.decode(errors="replace")
-        err = stderr.decode(errors="replace")
-        return {"rc": p.returncode, "stdout": out, "stderr": err, "dur": round(time.time() - t0, 2), "timeout": False}
+        err = (stderr or b"").decode(errors="replace")
+        return {"rc": p.returncode, "stdout": out, "stderr": err, "dur": round(time.time() - t0, 2), "timeout": False,
+                "pgid": p.pid}
     except subprocess.TimeoutExpired:
         try:
             os.killpg(p.pid, signal.SIGTERM)
@@ -110,6 +126,62 @@ def run_bash(cmd, cwd, timeout):
         out = (stdout or b"").decode(errors="replace")
         err = (stderr or b"").decode(errors="replace")
         return {"rc": None, "stdout": out, "stderr": err, "dur": round(time.time() - t0, 2), "timeout": True}
+
+
+TIMING_SRC = re.compile(r"time\.time\(|perf_counter|time\.monotonic|process_time|timeit")
+
+
+def scripts_measure_time(cmd, cwd):
+    """Python scripts the command runs (python x.py) whose source measures wall time, read from this sandbox."""
+    for path in re.findall(r"\bpython3?\s+(?:-\w+\s+)*([\w./-]+\.py)\b", cmd or ""):
+        p = path if path.startswith("/") else os.path.join(cwd or "", path)
+        try:
+            with open(p, encoding="utf-8", errors="replace") as f:
+                if TIMING_SRC.search(f.read(500_000)):
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+def group_alive(pgid):
+    """True while any process of the replayed command's process group (e.g. a `nohup ... &` child) is alive."""
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
+def iso_ts(s):
+    import datetime as dt
+    try:
+        return dt.datetime.fromisoformat((s or "").replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def pace_wait(live, a, cap):
+    """Shell background jobs started by earlier replayed commands are still running: keep the original pacing, i.e.
+    do not start action a before (its original start - the job's original start) has elapsed since the job's replay
+    start. Returns (seconds waited, met). met is False if the wait would exceed cap or a's original time is unknown
+    while a job is alive; the gate then rejects the replay (the read could see another progress point)."""
+    t = iso_ts(a.get("timestamp"))
+    waited = 0.0
+    for job in list(live):
+        if not group_alive(job["pgid"]):
+            live.remove(job)
+            continue
+        if t is None or job.get("orig_t") is None:
+            return round(waited, 1), False
+        target = job["replay_t"] + max(0.0, t - job["orig_t"])
+        if target - time.time() > cap - waited:
+            return round(waited, 1), False
+        while time.time() < target and group_alive(job["pgid"]):
+            step = min(1.0, max(0.0, target - time.time()))
+            time.sleep(step)
+            waited += step
+    return round(waited, 1), True
 
 
 def cc_bash_text(r):
@@ -131,11 +203,20 @@ def main():
     results = []
     t_start = time.time()
     shell_cwd = plan.get("initial_cwd") or "/app"
+    live = []  # shell background jobs (nohup ... &) of replayed commands still running: keep original pacing
+    trailer = plan.get("bg_output_trailer")
     for n, a in enumerate(plan["actions"]):
         tool, se, args = a["tool"], a["side_effect"], a["args"]
         rec = {"n": n, "call_id": a["call_id"], "tool": tool, "side_effect": se, "origin": a.get("origin"),
                "atif_step_id": a.get("atif_step_id"), "orig_is_error": a.get("is_error"),
                "orig_duration_s": a.get("duration_s")}
+        rec["started_at"] = round(time.time(), 3)  # replay clock, for the gate's clock-provenance check
+        if live and not dry and tool == "Bash":
+            w, met = pace_wait(live, a, cap)
+            if w:
+                rec["paced_wait_s"] = w
+            if not met:
+                rec["pacing_unmet"] = True
         try:
             if dry:
                 rec["status"] = "dry"
@@ -189,9 +270,16 @@ def main():
                         rec["orig_timed_out"] = True
                     else:
                         to = int(min(cap, max(60, 2 * (od or 0) + 30)))
-                    r = run_bash(cmd, cwd, to)
+                    if scripts_measure_time(cmd, cwd):
+                        rec["scripts_measure_time"] = True
+                    r = run_bash(cmd, cwd, to, merge_stderr=(se == "exec_background"))
                     rec.update({"status": "timeout" if r["timeout"] else "ran", "rc": r["rc"], "dur_s": r["dur"],
                                 "timeout_s": to})
+                    if not r["timeout"] and r.get("pgid") and group_alive(r["pgid"]):
+                        # orig_t None (no original start time): any later action while it lives is pacing_unmet
+                        live.append({"pgid": r["pgid"], "replay_t": time.time() - r["dur"],
+                                     "orig_t": iso_ts(a.get("timestamp")), "call_id": a["call_id"]})
+                        rec["left_background_job"] = True
                     rec["stdout_full"] = r["stdout"]
                     rec["stderr_full"] = r["stderr"]
                     rec["orig_full"] = a.get("orig_text")
@@ -206,7 +294,10 @@ def main():
                         output = a.get("background_output_file")
                         if output:
                             os.makedirs(os.path.dirname(output), exist_ok=True)
-                            payload = (r["stdout"] + r["stderr"]).encode()
+                            payload = r["stdout"] + r["stderr"]
+                            if trailer and r["rc"] is not None:
+                                payload += trailer.format(rc=r["rc"])  # e.g. CC 2.1.280: "\n[exited with code 0]\n"
+                            payload = payload.encode()
                             with open(output, "wb") as f:
                                 f.write(payload)
                             rec["background_output_file"] = output

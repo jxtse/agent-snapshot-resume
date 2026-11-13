@@ -54,11 +54,70 @@ def original_agent_settings(trial_dir: str | None) -> tuple[dict[str, str], dict
     return env, kwargs
 
 
+def check_shared_snapshot(source: dict[str, Any], bundle: Path) -> None:
+    """Allow a snapshot prepared from another bundle only if both bundles cut the same trial at the same point with
+    the same replay plan (snapshot_cut_identity); otherwise refuse."""
+    from .bundle import snapshot_cut_identity
+
+    mine = snapshot_cut_identity(bundle)
+    theirs = source.get("cut_identity")
+    if theirs is None:
+        # never reconstructed from the (mutable) bundle directory: only the identity recorded at preparation counts
+        raise SystemExit("snapshot state has no recorded cut identity (prepared by an older version): re-prepare it")
+    if theirs != mine:
+        diff = sorted(k for k in mine if theirs.get(k) != mine.get(k))
+        raise SystemExit(f"snapshot state was prepared from a different cut (identity differs in {diff})")
+    if source.get("agent_version") and mine.get("agent_version_orig") and \
+            source["agent_version"] != mine["agent_version_orig"]:
+        raise SystemExit(f"snapshot has agent {source['agent_version']}, bundle needs {mine['agent_version_orig']}")
+    if source.get("run_id") != json.loads((bundle / "bundle.json").read_text()).get("run_id"):
+        print(f"note: sharing snapshot {source.get('snapshot_id')} prepared from bundle {source['run_id']} "
+              "(identical cut identity)", file=sys.stderr)
+
+
+def frozen_first_request_digest(path: Path, bundle: Path, passthrough_args: list[str] | None) -> str:
+    """Digest of a fake run's rewritten first request (every field except `metadata`), to require the real run's
+    first request to be identical. Verified provenance: the parity report next to it judged exactly this request
+    (request_sha256), passed, came from a fake run, used the same passthrough route as this launch, and the fake
+    run's bundle identity (replay plan, reviews, fingerprint roots, cut, session seed + aux files, proxy spec,
+    original request; bundle.bundle_identity, recorded by the agent at startup) equals this bundle's."""
+    from .bundle import bundle_identity
+    from .proxy.resume_proxy import request_digest, route_from_passthrough_args
+
+    path = Path(path)
+    rec = json.loads(path.read_text())
+    body = rec.get("body", rec)
+    digest = request_digest(body)
+    rep_path = path.with_name("first_request_parity.json")
+    rep = json.loads(rep_path.read_text()) if rep_path.is_file() else {}
+    problems = []
+    if not rep.get("ok"):
+        problems.append("parity report missing or not ok")
+    if rep.get("request_sha256") != digest:
+        problems.append("parity report did not judge this request")
+    if rep.get("upstream_fake") is not True:
+        problems.append("not a --fake run")
+    if (rep.get("route") or {}) != route_from_passthrough_args(passthrough_args or []):
+        problems.append(f"fake run route {rep.get('route')} differs from this launch's passthrough args")
+    ident_path = path.parent.parent.parent / "resume" / "bundle_identity.json"  # <trial>/agent/resume/
+    theirs = json.loads(ident_path.read_text()) if ident_path.is_file() else None
+    mine = bundle_identity(Path(bundle))
+    if theirs != mine:
+        diff = sorted(k for k in mine if (theirs or {}).get(k) != mine.get(k)) if theirs else ["<missing>"]
+        problems.append(f"fake run's bundle identity differs from this bundle in {diff}")
+    if problems:
+        raise SystemExit(f"--freeze-first-request {path}: " + "; ".join(problems))
+    return digest
+
+
 def build_job_config(*, adapter, bundle: Path, task_dir: Path, job_name: str, jobs_dir: Path,
                      snapshot_state: Path | None = None, snapshot_id: str | None = None, fake: bool = False,
                      verifier: bool = True, model: str | None = None, upstream_url: str | None = None,
                      extra_env: dict[str, str] | None = None, extra_kwargs: dict[str, Any] | None = None,
-                     original_trial_dir: str | None = None, setup_timeout_s: float = 1200.0) -> dict[str, Any]:
+                     original_trial_dir: str | None = None, setup_timeout_s: float = 1200.0,
+                     passthrough_args: list[str] | None = None, parity_gate: str = "auto",
+                     max_model_requests: int | None = None,
+                     freeze_first_request: str | None = None) -> dict[str, Any]:
     bundle, meta = load_bundle(bundle)
     bundle = bundle.resolve()
     task_dir = task_dir.resolve()
@@ -71,8 +130,7 @@ def build_job_config(*, adapter, bundle: Path, task_dir: Path, job_name: str, jo
             raise SystemExit("--snapshot-id differs from the snapshot state file")
         if not source.get("snapshot_id") or not source.get("replay_gate_passed"):
             raise SystemExit("snapshot source has not passed the replay gates")
-        if source.get("run_id") and source["run_id"] != meta["run_id"]:
-            raise SystemExit("snapshot state was prepared from a different bundle")
+        check_shared_snapshot(source, bundle)  # always: a rebuilt bundle with the same run id must match too
         hashes = verifier_hashes(task_dir)
         env_kwargs.update(snapshot_id=source["snapshot_id"], expected_fingerprint=source["fingerprint_source"],
                           fingerprint_command=source.get("fingerprint_command"),
@@ -88,7 +146,24 @@ def build_job_config(*, adapter, bundle: Path, task_dir: Path, job_name: str, jo
     agent_env = {**getattr(adapter, "default_env", {}), **orig_env, **(extra_env or {})}
     upstream_url = upstream_url or config.upstream_url()
     kwargs = {**orig_kwargs, **(extra_kwargs or {}), "version": meta.get("agent_version_orig") or adapter.version,
-              "resume_bundle": str(bundle), "upstream_fake": bool(fake)}
+              "resume_bundle": str(bundle), "upstream_fake": bool(fake), "parity_gate": parity_gate}
+    if parity_gate == "require" and not meta.get("orig_request_at_k"):
+        raise SystemExit("--parity-gate require: bundle has no orig_request_at_k "
+                         f"({meta.get('orig_request_locate_error')})")
+    if freeze_first_request:
+        kwargs["expected_first_request_sha256"] = frozen_first_request_digest(
+            Path(freeze_first_request), bundle, passthrough_args)
+        kwargs["freeze_first_request"] = str(Path(freeze_first_request).resolve())
+    elif parity_gate == "require" and not fake:
+        raise SystemExit("--parity-gate require for a real run needs --freeze-first-request <first_request_rewritten.json "
+                         "of a --fake run of this bundle that passed the parity gate>")
+    if max_model_requests is not None:
+        if max_model_requests < 1:
+            raise SystemExit("--max-model-requests must be >= 1")
+        kwargs["max_model_requests"] = int(max_model_requests)
+    if passthrough_args:
+        from .proxy.runtime import validate_passthrough_args
+        kwargs["passthrough_args"] = validate_passthrough_args(passthrough_args)
     agent: dict[str, Any] = {"import_path": adapter.harbor_import_path,
                              "model_name": model or config.model_override() or meta.get("model"),
                              "override_timeout_sec": float(meta["agent_budget_s"]),

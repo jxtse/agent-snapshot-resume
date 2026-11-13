@@ -62,6 +62,15 @@ class AgentAdapter(ABC):
         """Copy auxiliary files the resumed agent needs into out_dir (bundle/aux). Returns counts per kind."""
         return {}
 
+    def rendered_attachment_templates(self, version: str | None) -> list[str] | None:
+        """Line templates (\x00 = an attachment value) of how this agent version renders persisted attachments into
+        a request; None = unknown (content parity then cannot bind rendered attachment text)."""
+        return None
+
+    def bg_output_trailer(self, ir: dict[str, Any], raw_lines: list[str]) -> str | None:
+        """Text the agent appends to a finished background task's output file ("{rc}" = exit code), or None."""
+        return None
+
     @abstractmethod
     def install_commands(self, version: str | None = None) -> list[tuple[str, str, int]]:
         """[(step_name, shell_command, timeout_s)] run as root in the source sandbox. Must verify sha256."""
@@ -136,6 +145,43 @@ class SnapshotResumeAgentMixin:
         spec.pop("key_file", None)
         if spec.get("model"):
             raise ValueError("proxy-side model override is not supported; set the agent model in the job config")
+        gate = getattr(self.options, "parity_gate", "auto") or "auto"
+        from ..bundle import bundle_identity
+        (logs / "bundle_identity.json").write_text(json.dumps(bundle_identity(bundle), ensure_ascii=False, indent=1))
+        if gate == "require" and not self.options.upstream_fake:
+            # enforced here too, not only in `asr launch`: a hand-written job config must not bypass it. The digest
+            # is re-derived from the fake run's artifacts with the same provenance checks; a bare digest is refused.
+            from ..launch import frozen_first_request_digest
+            src = getattr(self.options, "freeze_first_request", None)
+            if not src:
+                raise RuntimeError("parity_gate=require for a real run needs freeze_first_request "
+                                   "(asr launch --freeze-first-request)")
+            try:
+                digest = frozen_first_request_digest(Path(src), bundle,
+                                                     getattr(self.options, "passthrough_args", None) or [])
+            except SystemExit as exc:
+                raise RuntimeError(str(exc)) from None
+            if getattr(self.options, "expected_first_request_sha256", None) not in (None, digest):
+                raise RuntimeError("expected_first_request_sha256 differs from the fake run's verified request")
+            self.options.expected_first_request_sha256 = digest
+        if gate != "off":
+            from ..proxy.resume_proxy import route_from_passthrough_args
+            exp = meta.get("orig_request_at_k")
+            if exp:
+                spec["first_request_parity"] = dict(exp, route=route_from_passthrough_args(
+                    getattr(self.options, "passthrough_args", None) or []))
+                if gate == "require":
+                    if not exp.get("content"):
+                        raise RuntimeError("parity_gate=require but the bundle has no content reference; rebuild it")
+                    spec["first_request_parity"]["content"] = dict(exp["content"], require_complete=True)
+            elif gate == "require":
+                raise RuntimeError("parity_gate=require but the bundle has no orig_request_at_k (original proxy log "
+                                   f"missing or ambiguous: {meta.get('orig_request_locate_error')}); "
+                                   "use parity_gate=auto/off to run without the first-request parity gate")
+        if getattr(self.options, "max_model_requests", None):
+            spec["max_model_requests"] = int(self.options.max_model_requests)
+        if getattr(self.options, "expected_first_request_sha256", None):
+            spec["expected_first_request_sha256"] = self.options.expected_first_request_sha256
         (logs / "proxy_spec.json").write_text(json.dumps(spec, ensure_ascii=False, indent=1))
         t0 = time.time()
         if not self.options.upstream_fake:
@@ -147,8 +193,10 @@ class SnapshotResumeAgentMixin:
                 raise RuntimeError(f"{config.UPSTREAM_KEY_ENV} is not set in the Harbor process environment")
             # The key travels only as the env of this single exec (redacted by Harbor's logger: name contains KEY)
             # and from there into the proxy over a pipe. See proxy/runtime.py.
-            await self.exec_as_root(environment, command=runtime.passthrough_start_command(url, self.PASSTHROUGH_PORT),
-                                    env={runtime.KEY_ENV_IN_SANDBOX: key})
+            extra = runtime.validate_passthrough_args(getattr(self.options, "passthrough_args", None) or [])
+            await self.exec_as_root(environment, command=runtime.passthrough_start_command(
+                url, self.PASSTHROUGH_PORT, extra=" ".join(shlex.quote(x) for x in extra)),
+                env={runtime.KEY_ENV_IN_SANDBOX: key})
         resume_proxy = Path(runtime.HERE / "resume_proxy.py")
         await self.exec_as_root(environment, command=f"mkdir -p {runtime.PROXY_DIR}/resume/specs")
         await environment.upload_file(resume_proxy, f"{runtime.PROXY_DIR}/resume/resume_proxy.py")
@@ -156,6 +204,7 @@ class SnapshotResumeAgentMixin:
         await self.exec_as_root(environment, command=runtime.resume_start_command(self.RESUME_PORT))
         (logs / "setup.json").write_text(json.dumps({
             "proxies_s": round(time.time() - t0, 1),
+            "passthrough_args": getattr(self.options, "passthrough_args", None) or [],
             "resume_proxy_sha256": hashlib.sha256(resume_proxy.read_bytes()).hexdigest(),
             "upstream_fake": bool(self.options.upstream_fake)}, indent=1))
 

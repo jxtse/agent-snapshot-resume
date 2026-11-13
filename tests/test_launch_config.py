@@ -23,15 +23,63 @@ class LaunchConfig(unittest.TestCase):
         self.adapter = get_adapter("claude-code")
         self.bdir, self.meta = build(adapter=self.adapter, trial_dir=TRIAL, atif_step=4, out=self.root, task_dir=TASK)
         self.state = self.root / "snapshot-x.json"
+        from agent_snapshot_resume.bundle import snapshot_cut_identity
         self.state.write_text(json.dumps({"snapshot_id": "snap-123", "replay_gate_passed": True,
                                           "fingerprint_source": "files=2\nabc", "fingerprint_command": "python3 -c x",
-                                          "auxiliary_hashes": {}, "run_id": self.meta["run_id"]}))
+                                          "auxiliary_hashes": {}, "run_id": self.meta["run_id"],
+                                          "cut_identity": snapshot_cut_identity(self.bdir)}))
 
     def cfg(self, **kw):
         args = dict(adapter=self.adapter, bundle=self.bdir, task_dir=TASK, job_name="j", jobs_dir=self.root / "jobs",
                     snapshot_state=self.state, fake=True, original_trial_dir=str(TRIAL))
         args.update(kw)
         return build_job_config(**args)
+
+    def test_freeze_first_request_required_for_strict_real_runs(self):
+        from agent_snapshot_resume.bundle import bundle_identity
+        from agent_snapshot_resume.proxy.resume_proxy import request_digest
+        meta = dict(json.loads((self.bdir / "bundle.json").read_text()),
+                    orig_request_at_k={"req_bytes": 1, "content": {"message_block_sha256": []}})
+        (self.bdir / "bundle.json").write_text(json.dumps(meta))
+        route = ["--drop-fields", "metadata", "--strip-is-error"]
+        trial = self.root / "fakejob" / "t__x" / "agent"
+        logs = trial / "resume-proxy" / self.meta["run_id"]
+        logs.mkdir(parents=True)
+        (trial / "resume").mkdir()
+        ident = bundle_identity(self.bdir)
+        (trial / "resume" / "bundle_identity.json").write_text(json.dumps(ident))
+        body = {"model": "m", "messages": [], "temperature": 1}
+        freeze = str(logs / "first_request_rewritten.json")
+        (logs / "first_request_rewritten.json").write_text(json.dumps({"body": body}))
+        good = {"ok": True, "request_sha256": request_digest(body), "upstream_fake": True,
+                "route": {"drop_fields": ["metadata"], "strip_is_error": True, "strip_thinking": False}}
+        kw = dict(fake=False, parity_gate="require", passthrough_args=route)
+        with patch.dict(os.environ, {"ASR_UPSTREAM_URL": "https://example.invalid"}):
+            with self.assertRaises(SystemExit):
+                self.cfg(**kw)
+            for bad in ({"ok": False}, {"request_sha256": "x"}, {"upstream_fake": False},
+                        {"route": {"drop_fields": ["temperature"], "strip_is_error": True, "strip_thinking": False}}):
+                (logs / "first_request_parity.json").write_text(json.dumps(dict(good, **bad)))
+                with self.assertRaises(SystemExit, msg=str(bad)):
+                    self.cfg(freeze_first_request=freeze, **kw)
+            (logs / "first_request_parity.json").write_text(json.dumps(good))
+            for key, val in (("seed_sha256", "0" * 64), ("proxy_spec_sha256", "1" * 64),
+                             ("cut", dict(ident["cut"], plan_sha256="2" * 64))):
+                (trial / "resume" / "bundle_identity.json").write_text(json.dumps(dict(ident, **{key: val})))
+                with self.assertRaises(SystemExit, msg=key):
+                    self.cfg(freeze_first_request=freeze, **kw)
+            (trial / "resume" / "bundle_identity.json").write_text(json.dumps(ident))
+            cfg = self.cfg(freeze_first_request=freeze, **kw)
+            self.assertEqual(cfg["agents"][0]["kwargs"]["expected_first_request_sha256"], request_digest(body))
+            self.assertEqual(cfg["agents"][0]["kwargs"]["freeze_first_request"], str(Path(freeze).resolve()))
+
+    def test_snapshot_cut_identity_checked_even_for_same_run_id(self):
+        from agent_snapshot_resume.bundle import snapshot_cut_identity
+        state = json.loads(self.state.read_text())
+        state["cut_identity"] = dict(snapshot_cut_identity(self.bdir), plan_sha256="0" * 64)
+        self.state.write_text(json.dumps(state))
+        with self.assertRaises(SystemExit):
+            self.cfg()
 
     def test_fake_config_valid_and_secret_free(self):
         secret = "test-secret-should-never-appear"
@@ -73,6 +121,8 @@ class LaunchConfig(unittest.TestCase):
     def test_snapshot_from_other_bundle_refused(self):
         d = json.loads(self.state.read_text())
         d["run_id"] = "other"
+        d.pop("cut_identity")
+        d["bundle"] = str(self.bdir)  # never reconstructed from the (mutable) bundle directory
         self.state.write_text(json.dumps(d))
         with self.assertRaises(SystemExit):
             self.cfg()

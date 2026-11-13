@@ -37,6 +37,28 @@ class BundleE2E(unittest.TestCase):
         # the trailing last-prompt line before step 4 is trimmed
         self.assertEqual(json.loads(trunc.splitlines()[-1])["message"]["content"][0]["tool_use_id"], "toolu_b1")
 
+    def test_cut_line_selects_the_same_step(self):
+        b2, m2 = build(adapter=get_adapter("claude-code"), trial_dir=TRIAL, atif_step=None, out=self.out / "c",
+                       task_dir=TASK, cut_line=self.meta["cut_line"])
+        self.assertEqual(m2["resume_atif_step"], 4)
+        self.assertEqual((b2 / "session_trunc.jsonl").read_bytes(), (self.bdir / "session_trunc.jsonl").read_bytes())
+        self.assertEqual(m2["n_compactions_before_cut"], 0)
+        with self.assertRaises(SystemExit):
+            build(adapter=get_adapter("claude-code"), trial_dir=TRIAL, atif_step=None, out=self.out / "d",
+                  task_dir=TASK, cut_line=1)  # not the start of an agent step
+        with self.assertRaises(SystemExit):
+            build(adapter=get_adapter("claude-code"), trial_dir=TRIAL, atif_step=4, out=self.out / "e",
+                  task_dir=TASK, cut_line=self.meta["cut_line"])
+
+    def test_default_fingerprint_roots(self):
+        from agent_snapshot_resume.bundle import default_fingerprint_roots
+        self.assertIsNone(default_fingerprint_roots({"initial_cwd": "/app", "actions": []}))
+        plan = {"initial_cwd": "/root", "actions": [{"cwd": "/root/work"}, {"cwd": "/root/data/dev"},
+                                                    {"args": {"file_path": "/root/results/a.py"}},
+                                                    {"cwd": "/root/.cache"}, {"cwd": "/tmp"}]}
+        self.assertEqual(default_fingerprint_roots(plan), ["/root/data", "/root/results", "/root/work"])
+        self.assertIsNone(default_fingerprint_roots({"initial_cwd": "/root", "actions": [{"cwd": "/root"}]}))
+
     def test_budget_and_metadata(self):
         self.assertEqual(self.meta["agent_timeout_task_s"], 600.0)
         self.assertAlmostEqual(self.meta["agent_budget_s"], 600.0 - self.meta["elapsed_at_k_s"], places=1)

@@ -5,6 +5,8 @@
   prepare-snapshot  source sandbox: install agent, replay steps < k, gate, fingerprint, snapshot
   launch            write the Harbor job config (and run Harbor unless --dry-run)
   equiv             check a rewritten first request against the original session prefix (offline)
+  parity            check a rewritten first request against the original run's request at the cut (offline)
+  screen            replayability risks of candidate cuts (offline, no sandbox)
   selfcheck         simulate the resumed first request from a bundle, rewrite it, run equiv (offline)
   sandboxes         list sandboxes tagged with ASR_OWNER_TAG; --kill-id to kill one
   delete-snapshot   delete a snapshot
@@ -14,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shlex
 import sys
 from pathlib import Path
 
@@ -30,12 +33,18 @@ def cmd_build_bundle(a):
 
     hint = Path(a.hint_file).read_text().strip() if a.hint_file else None
     bdir, meta = build(adapter=_adapter(a.agent), trial_dir=Path(a.trial_dir), atif_step=a.step, out=Path(a.out),
+                       cut_line=a.cut_line,
                        mode=a.mode, hint=hint, agent_timeout=a.agent_timeout,
                        task_dir=Path(a.task_dir) if a.task_dir else None, run_id=a.run_id, model=a.model,
-                       pin_date=not a.no_pin_date, fingerprint_roots=a.fingerprint_root or None, force=a.force)
+                       pin_date=not a.no_pin_date, fingerprint_roots=a.fingerprint_root or None, force=a.force,
+                       persist_hint=a.persist_hint)
     print(bdir)
-    print(json.dumps({k: meta[k] for k in ("run_id", "task", "cut_line", "agent_budget_s", "n_replay_actions",
-                                           "aux_counts")}, ensure_ascii=False))
+    print(json.dumps({k: meta[k] for k in ("run_id", "task", "resume_atif_step", "cut_line", "agent_budget_s",
+                                           "n_replay_actions", "aux_counts", "n_compactions_before_cut",
+                                           "orig_request_at_k")}, ensure_ascii=False))
+    if not meta.get("orig_request_at_k"):
+        print(f"warning: original request at the cut not located ({meta.get('orig_request_locate_error')}); "
+              "the first-request parity gate cannot run for this bundle", file=sys.stderr)
     return 0
 
 
@@ -94,7 +103,10 @@ def cmd_launch(a):
                            jobs_dir=Path(a.jobs_dir), snapshot_state=Path(a.snapshot_state) if a.snapshot_state else None,
                            snapshot_id=a.snapshot_id, fake=a.fake, verifier=not a.no_verifier, model=a.model,
                            upstream_url=a.upstream_url, extra_env=_kv(a.agent_env),
-                           original_trial_dir=a.original_trial_dir or meta.get("trial_dir"))
+                           original_trial_dir=a.original_trial_dir or meta.get("trial_dir"),
+                           passthrough_args=shlex.split(a.passthrough_args) if a.passthrough_args else None,
+                           parity_gate=a.parity_gate, max_model_requests=a.max_model_requests,
+                           freeze_first_request=a.freeze_first_request)
     validate_job_config(cfg)
     runs = Path(a.runs_dir) / job
     runs.mkdir(parents=True, exist_ok=True)
@@ -110,6 +122,24 @@ def cmd_launch(a):
 def cmd_equiv(a):
     from . import equiv
     return equiv.main(a)
+
+
+def cmd_screen(a):
+    from . import screen
+    reps = screen.screen_trial(_adapter(a.agent), Path(a.trial_dir), cut_lines=a.cut_line, steps=a.step,
+                               agent_timeout_s=a.agent_timeout,
+                               task_dir=Path(a.task_dir) if a.task_dir else None)
+    print(screen.main_json(reps, a.full))
+    if a.out:
+        Path(a.out).write_text(json.dumps(reps, ensure_ascii=False, indent=1))
+    return 2 if any(r["verdict"] == "block" for r in reps) else 0
+
+
+def cmd_parity(a):
+    from . import parity
+    r = parity.check_files(a.bundle, a.request, shlex.split(a.passthrough_args) if a.passthrough_args else None)
+    print(json.dumps(r, ensure_ascii=False))
+    return 0 if r.get("ok") else 1
 
 
 def cmd_selfcheck(a):
@@ -176,11 +206,16 @@ def build_parser():
 
     p = sub.add_parser("build-bundle", help="trial dir + step k -> resume bundle")
     p.add_argument("--trial-dir", required=True, help="Harbor trial dir (contains agent/sessions/...)")
-    p.add_argument("--step", type=int, required=True, help="ATIF step_id of the first step to regenerate")
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--step", type=int, help="ATIF step_id of the first step to regenerate")
+    g.add_argument("--cut-line", type=int, help="0-based session line where the regenerated agent step starts "
+                   "(= number of prefix lines kept); may be after compaction boundaries")
     p.add_argument("--out", default="bundles")
     p.add_argument("--agent", default="claude-code")
     p.add_argument("--mode", choices=["same", "hint"], default="same")
     p.add_argument("--hint-file")
+    p.add_argument("--persist-hint", action="store_true",
+                   help="mode=hint: keep the hint after the agent compacts its context (re-injected on the summary)")
     p.add_argument("--agent-timeout", type=float, help="task agent timeout in s (default: from task.toml)")
     p.add_argument("--task-dir", help="Harbor task dir (for task.toml)")
     p.add_argument("--run-id")
@@ -226,15 +261,44 @@ def build_parser():
     p.add_argument("--upstream-url", help="default: ASR_UPSTREAM_URL")
     p.add_argument("--original-trial-dir", help="copy non-secret agent env/kwargs from <trial>/config.json")
     p.add_argument("--agent-env", action="append", metavar="KEY=VALUE", help="extra non-secret agent env (repeatable)")
+    p.add_argument("--passthrough-args", help="extra in-sandbox passthrough proxy flags, e.g. "
+                   "'--drop-fields metadata --strip-is-error' (whitelisted)")
     p.add_argument("--fake", action="store_true", help="resume proxy answers end_turn; no model call, no key")
     p.add_argument("--no-verifier", action="store_true")
     p.add_argument("--dry-run", action="store_true", help="write and print job.json, do not start Harbor")
+    p.add_argument("--parity-gate", choices=["auto", "require", "off"], default="auto",
+                   help="fail-closed first-request parity vs the original run's request at the cut (default auto: "
+                   "on whenever the bundle located that request)")
+    p.add_argument("--freeze-first-request", metavar="FIRST_REQUEST_JSON",
+                   help="first_request_rewritten.json of a --fake run of this bundle that passed the parity gate: the "
+                   "real first request must equal it in every field except metadata (required with --parity-gate "
+                   "require for real runs)")
+    p.add_argument("--max-model-requests", type=int,
+                   help="stop the continuation after N model requests, sub-agent requests included (the proxy refuses request N+1)")
     p.set_defaults(fn=cmd_launch)
 
     from .equiv import build_parser as equiv_parser
     p = sub.add_parser("equiv", help="context-equivalence check of a rewritten first request")
     equiv_parser(p)
     p.set_defaults(fn=cmd_equiv)
+
+    p = sub.add_parser("screen", help="offline replayability risks of candidate cuts")
+    p.add_argument("--trial-dir", required=True)
+    p.add_argument("--cut-line", type=int, action="append", help="0-based session line of a candidate cut (repeat)")
+    p.add_argument("--step", type=int, action="append", help="ATIF step id of a candidate cut (repeat)")
+    p.add_argument("--agent", default="claude-code")
+    p.add_argument("--agent-timeout", type=float)
+    p.add_argument("--task-dir", help="Harbor task dir (for the agent timeout in task.toml)")
+    p.add_argument("--full", action="store_true", help="print every risk, not a per-cut summary")
+    p.add_argument("--out", help="write the full reports as JSON")
+    p.set_defaults(fn=cmd_screen)
+
+    p = sub.add_parser("parity", help="first rewritten request vs the original run's request at the cut")
+    p.add_argument("bundle")
+    p.add_argument("request", help="first_request_rewritten.json captured by the resume proxy")
+    p.add_argument("--passthrough-args", help="the original route's passthrough flags, e.g. "
+                   "'--drop-fields metadata --strip-is-error'")
+    p.set_defaults(fn=cmd_parity)
 
     p = sub.add_parser("selfcheck", help="offline: simulated resumed request -> rewrite -> equiv")
     p.add_argument("--bundle", required=True)
