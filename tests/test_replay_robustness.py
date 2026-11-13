@@ -128,6 +128,30 @@ class AutomaticEquivalence(unittest.TestCase):
         self.assertFalse(passes(*one("python3 mk.py; ls -la out", o, n.replace(" 5 ", " 6 "), stderr="w\n")))
         self.assertFalse(passes(*one("cat log", "w\nrun Nov  2 20:17 ok", "run Nov 13 04:47 ok\n", stderr="w\n")))
 
+    def test_task_timestamps_rejected_even_in_order_and_under_time(self):
+        o, n = "event 2020-01-01T00:00:00 a", "event 2021-05-05T00:00:00 a\n"
+        self.assertFalse(passes(*one("cat records", o, n)))
+        self.assertFalse(passes(*one("time cat records", "real\t0m0.1s\n" + o, n, stderr="real\t0m0.2s\n")))
+        # a clock read in the command makes its own timestamps volatile
+        cmd = "python3 -c 'import datetime; print(datetime.datetime.now())'"
+        self.assertTrue(passes(*one(cmd, "2026-11-02 20:17:01.5", "2026-11-13 04:47:09.1\n")))
+
+    def test_ls_file_names_kept_exact(self):
+        o = "total 8\n-rw-r--r-- 1 root root 5 Oct 1 00:00 a b"
+        n = ("total 16\ndrwxr-xr-x 2 root root 4096 Oct 1 00:00 .\n"
+             "-rw-r--r-- 1 root root 5 Oct 1 00:00 a  b")
+        self.assertFalse(passes(*one("ls -la d", o, n)))
+
+    def test_script_timing_recorded_by_replayer(self):
+        p, r = one("python3 gencheck.py", "OK 6.0s n=49", "OK 6.1s n=49\n")
+        self.assertFalse(passes(p, r))
+        r["results"][0]["scripts_measure_time"] = True
+        self.assertTrue(passes(p, r))
+        with tempfile.TemporaryDirectory() as td:
+            Path(td, "g.py").write_text("import time\nt=time.time()\n")
+            self.assertTrue(replay.scripts_measure_time("python3 -B g.py x", td))
+            self.assertFalse(replay.scripts_measure_time("python3 other.py", td))
+
     def test_task_data_dates_reordered_are_rejected(self):
         # review counterexample: dates that are task data, changed and reordered, must not pass
         o = "event 2020-01-01 a\nevent 2020-01-02 b"

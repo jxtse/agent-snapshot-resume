@@ -72,19 +72,39 @@ def check_shared_snapshot(source: dict[str, Any], bundle: Path) -> None:
           "(identical cut identity)", file=sys.stderr)
 
 
-def frozen_first_request_digest(path: Path, meta: dict[str, Any]) -> str:
+FREEZE_IDENTITY_KEYS = ("run_id", "session_sha256", "cut_line", "sentinel", "mode", "hint", "agent_version_orig",
+                        "orig_request_at_k")
+
+
+def frozen_first_request_digest(path: Path, meta: dict[str, Any], passthrough_args: list[str] | None) -> str:
     """Digest of a fake run's rewritten first request (every field except `metadata`), to require the real run's
-    first request to be byte-identical in content and settings. The fake run must have passed the parity gate."""
-    from .proxy.resume_proxy import request_digest
+    first request to be identical. Verified provenance: the parity report next to it judged exactly this request
+    (request_sha256), passed, came from a fake run, used the same passthrough route as this launch, and the fake
+    run's bundle has the same identity (session, cut, sentinel, mode, hint, original request) as this bundle."""
+    from .proxy.resume_proxy import request_digest, route_from_passthrough_args
 
     rec = json.loads(path.read_text())
     body = rec.get("body", rec)
+    digest = request_digest(body)
     rep_path = path.with_name("first_request_parity.json")
-    if not rep_path.is_file() or not json.loads(rep_path.read_text()).get("ok"):
-        raise SystemExit(f"{rep_path} missing or not ok: freeze only a first request that passed the parity gate")
-    if path.parent.name != meta["run_id"]:
-        raise SystemExit(f"{path} belongs to run {path.parent.name}, not this bundle ({meta['run_id']})")
-    return request_digest(body)
+    rep = json.loads(rep_path.read_text()) if rep_path.is_file() else {}
+    problems = []
+    if not rep.get("ok"):
+        problems.append("parity report missing or not ok")
+    if rep.get("request_sha256") != digest:
+        problems.append("parity report did not judge this request")
+    if rep.get("upstream_fake") is not True:
+        problems.append("not a --fake run")
+    if (rep.get("route") or {}) != route_from_passthrough_args(passthrough_args or []):
+        problems.append(f"fake run route {rep.get('route')} differs from this launch's passthrough args")
+    fake_bundle = path.parent.parent.parent / "resume" / "bundle.json"  # <trial>/agent/resume/bundle.json
+    fake_meta = json.loads(fake_bundle.read_text()) if fake_bundle.is_file() else {}
+    diff = [k for k in FREEZE_IDENTITY_KEYS if fake_meta.get(k) != meta.get(k)]
+    if diff:
+        problems.append(f"fake run's bundle differs from this bundle in {diff}")
+    if problems:
+        raise SystemExit(f"--freeze-first-request {path}: " + "; ".join(problems))
+    return digest
 
 
 def build_job_config(*, adapter, bundle: Path, task_dir: Path, job_name: str, jobs_dir: Path,
@@ -129,7 +149,8 @@ def build_job_config(*, adapter, bundle: Path, task_dir: Path, job_name: str, jo
         raise SystemExit("--parity-gate require: bundle has no orig_request_at_k "
                          f"({meta.get('orig_request_locate_error')})")
     if freeze_first_request:
-        kwargs["expected_first_request_sha256"] = frozen_first_request_digest(Path(freeze_first_request), meta)
+        kwargs["expected_first_request_sha256"] = frozen_first_request_digest(
+            Path(freeze_first_request), meta, passthrough_args)
     elif parity_gate == "require" and not fake:
         raise SystemExit("--parity-gate require for a real run needs --freeze-first-request <first_request_rewritten.json "
                          "of a --fake run of this bundle that passed the parity gate>")

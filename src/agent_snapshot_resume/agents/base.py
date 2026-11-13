@@ -141,6 +141,11 @@ class SnapshotResumeAgentMixin:
         if spec.get("model"):
             raise ValueError("proxy-side model override is not supported; set the agent model in the job config")
         gate = getattr(self.options, "parity_gate", "auto") or "auto"
+        if (gate == "require" and not self.options.upstream_fake
+                and not getattr(self.options, "expected_first_request_sha256", None)):
+            # enforced here too, not only in `asr launch`: a hand-written job config must not bypass it
+            raise RuntimeError("parity_gate=require for a real run needs expected_first_request_sha256 "
+                               "(asr launch --freeze-first-request)")
         if gate != "off":
             from ..proxy.resume_proxy import route_from_passthrough_args
             exp = meta.get("orig_request_at_k")

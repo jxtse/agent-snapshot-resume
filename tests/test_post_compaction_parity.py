@@ -259,6 +259,22 @@ class ProxyGateFailClosed(unittest.IsolatedAsyncioTestCase):
         self.assertIn("max_model_requests", recs[-1]["local_gate_error"])
 
 
+class StrictRealRunNeedsFrozenRequest(unittest.IsolatedAsyncioTestCase):
+    async def test_agent_refuses_require_without_frozen_digest(self):
+        from types import SimpleNamespace
+        from agent_snapshot_resume.agents.base import SnapshotResumeAgentMixin
+        with tempfile.TemporaryDirectory() as td:
+            b = Path(td)
+            (b / "proxy_spec.json").write_text(json.dumps({"mode": "same", "sentinel": SENT}))
+            agent = SnapshotResumeAgentMixin()
+            agent.options = SimpleNamespace(upstream_fake=False, upstream_url="https://x.invalid", parity_gate="require",
+                                            passthrough_args=[], max_model_requests=None,
+                                            expected_first_request_sha256=None)
+            agent.logs_dir = b / "logs"
+            with self.assertRaises(RuntimeError):
+                await agent._start_proxies(None, b, {"run_id": "r1", "orig_request_at_k": {"req_bytes": 1}})
+
+
 class LocateOriginalRequest(unittest.TestCase):
     def ir(self, usage, msg_ids=("a", "b"), compactions=0):
         steps = [{"source": "user", "events": [], "message_id": None}]

@@ -590,6 +590,9 @@ async def handle(request):
                     if exp.get("content"):
                         rep["content_problems"] = check_content(nd, exp["content"], spec_hints(spec))
                         rep["ok"] = rep["ok"] and not rep["content_problems"]
+                    # provenance for --freeze-first-request: which exact request and route this report judged
+                    rep.update(request_sha256=request_digest(nd), route=exp.get("route") or {},
+                               upstream_fake=spec.get("upstream") == "fake")
                     wlog(app, run_id, "first_request_parity.json", rep, mode="w")
                     spec["_parity_state"] = bool(rep["ok"])
                     if not rep["ok"]:

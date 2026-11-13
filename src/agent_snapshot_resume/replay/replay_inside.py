@@ -125,6 +125,22 @@ def run_bash(cmd, cwd, timeout):
         return {"rc": None, "stdout": out, "stderr": err, "dur": round(time.time() - t0, 2), "timeout": True}
 
 
+TIMING_SRC = re.compile(r"time\.time\(|perf_counter|time\.monotonic|process_time|timeit")
+
+
+def scripts_measure_time(cmd, cwd):
+    """Python scripts the command runs (python x.py) whose source measures wall time, read from this sandbox."""
+    for path in re.findall(r"\bpython3?\s+(?:-\w+\s+)*([\w./-]+\.py)\b", cmd or ""):
+        p = path if path.startswith("/") else os.path.join(cwd or "", path)
+        try:
+            with open(p, encoding="utf-8", errors="replace") as f:
+                if TIMING_SRC.search(f.read(500_000)):
+                    return True
+        except OSError:
+            continue
+    return False
+
+
 def group_alive(pgid):
     """True while any process of the replayed command's process group (e.g. a `nohup ... &` child) is alive."""
     try:
@@ -191,6 +207,7 @@ def main():
         rec = {"n": n, "call_id": a["call_id"], "tool": tool, "side_effect": se, "origin": a.get("origin"),
                "atif_step_id": a.get("atif_step_id"), "orig_is_error": a.get("is_error"),
                "orig_duration_s": a.get("duration_s")}
+        rec["started_at"] = round(time.time(), 3)  # replay clock, for the gate's clock-provenance check
         if live and not dry and tool == "Bash":
             w, met = pace_wait(live, a, cap)
             if w:
@@ -250,6 +267,8 @@ def main():
                         rec["orig_timed_out"] = True
                     else:
                         to = int(min(cap, max(60, 2 * (od or 0) + 30)))
+                    if scripts_measure_time(cmd, cwd):
+                        rec["scripts_measure_time"] = True
                     r = run_bash(cmd, cwd, to)
                     rec.update({"status": "timeout" if r["timeout"] else "ran", "rc": r["rc"], "dur_s": r["dur"],
                                 "timeout_s": to})

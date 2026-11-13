@@ -41,6 +41,36 @@ WRITES = re.compile(r"open\([^)]*['\"][wax]b?\+?['\"]|\.to_(?:csv|parquet|pickle
                     r"shutil|os\.remove|unlink|\bsed\s+-i|pip3?\s+install")
 
 
+# `ls -l` row: (permissions links owner group size) (date) (name, kept exactly)
+LS_ROW = re.compile(r"^([-dlcbps][-rwxsStT]{9}[.+@]?\s+\d+\s+\S+\s+\S+\s+[\d,]+)\s+"
+                    r"([A-Z][a-z]{2}\s+\d{1,2}\s+(?:\d{2}:\d{2}|\d{4}))\s(.+)$")
+TIME_REPORT = re.compile(r"^(?:real|user|sys)\s+(?:\d+m\d+(?:\.\d+)?s|\d+(?:\.\d+)?)$")
+
+
+def provenance_masks(command, scripts_time=False):
+    """Maskers for values whose source is known from the command itself (never applied otherwise):
+    memory addresses and pids always; ls -l dates and totals only for commands running `ls -l`; durations only for
+    commands that measure time (in the command, or in a script it runs: the replayer records that inside the
+    sandbox as `scripts_measure_time`); wall-clock timestamps only for commands that read the clock."""
+    masks = [(re.compile(r"0x[0-9a-fA-F]{6,}"), "<ADDR>"), (re.compile(r"\bpid[= ]\d+"), "pid <N>")]
+    if re.search(r"\bls\s+-\w*l", command):
+        masks += [(LS_ROW, r"\1 <MTIME> \3"), (re.compile(r"^total \d+$"), "total <N>")]
+    if re.search(TIMING_CALL, command) or re.search(r"(?:^|[;&|(]\s*)time\s|\bTIMEFORMAT=|/usr/bin/time\b",
+                                                     command, re.M) or scripts_time:
+        masks += [(TIME_REPORT, "<TIME_REPORT>"),
+                  (re.compile(r"\d+(?:\.\d+)?\s?(?:s|ms|sec|secs|seconds)\b"), "<DUR>")]
+    if re.search(r"datetime\.(?:datetime\.)?now\(|date\.today\(|time\.time\(|(?:^|[;&|]\s*)date(?:\s|$)",
+                 command, re.M):
+        masks += [(re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?"), "<NOW>")]
+    return masks
+
+
+def masked(line, masks):
+    for rx, rep in masks:
+        line = rx.sub(rep, line)
+    return line
+
+
 TIMING_BEFORE = r"(?i)\b(?:time|timing|elapsed|took|duration|runtime|wall(?:time)?|wall[ -]clock)\s*[:=]?\s*$"
 TIMING_AFTER = r"(?i)^\s*(?:s|sec|secs|seconds|ms|min|minutes)\b"
 
@@ -127,15 +157,20 @@ def automatic_equivalence(action, result):
       cc_grep_no_match      last pipeline stage is grep/rg, replay rc=1 (no match), the original was not an error (CC
                             renders that case as success) and the full stdout is identical; no stderr.
       ls_dot_entries_only   `ls -l*` listings whose only difference is the `.`/`..` rows and `total` block counts
-                            (some sandbox filesystems omit them); every other line identical up to column padding.
+                            (some sandbox filesystems omit them); every other row identical up to metadata-column
+                            padding, file names exact.
+      volatile_with_provenance
+                            line by line, in order, every differing value is masked by provenance_masks (its source
+                            is visible in the command: ls dates, durations of timed commands, clock reads, addresses).
       shell_diagnostic_prefix_only
                             bash's own error prefix differs (`/bin/bash: eval: line 18:` vs `bash: -c: line 9:`);
                             the original equals the replay's stdout in order once the replay's stderr lines are
                             taken out (stderr placement is the only other freedom).
       shell_time_report_only
                             the command uses the shell `time` keyword (TIMEFORMAT) or /usr/bin/time; after removing
-                            the timing report lines and blank lines the output is identical in order (after the
-                            replayer's volatile masking of dates/addresses/durations).
+                            the timing report lines and blank lines the output is identical in order, up to values
+                            whose source the command shows (provenance_masks: ls dates for ls -l, durations for
+                            timed commands, wall-clock stamps for clock reads; addresses, pids).
       ls_mtime_and_stderr_placement_only
                             the command runs `ls -l`; only the date column of rows in ls -l format differs (files
                             the replay re-created), plus the stderr placement freedom above; stdout order kept.
@@ -164,7 +199,10 @@ def automatic_equivalence(action, result):
     new = norm(_replayed_text(result)).splitlines()
     ls_dot = re.compile(r"^d\S+\s+\d+\s+\S+\s+\S+\s+\d+\s+\S+\s+\d+\s+\S+\s\.{1,2}$")
     if re.search(r"\bls\s+-\w*l", command):
-        strip = lambda ls: [l.split() for l in ls if not ls_dot.fullmatch(l) and not re.fullmatch(r"total \d+", l)]
+        def row(l):  # metadata columns compared up to padding; the file name (rest of the line) exactly
+            m = LS_ROW.match(l)
+            return (tuple(m.group(1).split()), m.group(2), m.group(3)) if m else ("line", l)
+        strip = lambda ls: [row(l) for l in ls if not ls_dot.fullmatch(l) and not re.fullmatch(r"total \d+", l)]
         if strip(old) == strip(new) and strip(old) and any(ls_dot.fullmatch(l) for l in old + new):
             return "ls_dot_entries_only"
     # bash diagnostics carry the shell's own location prefix, which depends on how the command was invoked
@@ -183,16 +221,14 @@ def automatic_equivalence(action, result):
             rep.append(re.compile("^" + pat + "$"))
         drop = lambda ls: [l for l in ls if l.strip() and not any(r.match(l.strip()) for r in rep)]
         n_rep = sum(1 for l in old + new if l.strip() and any(r.match(l.strip()) for r in rep))
-        from .replay_inside import volatile_free
+        pm = provenance_masks(command, bool(result.get("scripts_measure_time")))
         if n_rep and (drop(old) == drop(new) or
-                      volatile_free("\n".join(drop(old))) == volatile_free("\n".join(drop(new)))):
+                      [masked(l, pm) for l in drop(old)] == [masked(l, pm) for l in drop(new)]):
             return "shell_time_report_only"
     # `ls -l` rows of files the command itself (re)created carry the replay's mtime: mask only the date column of
     # rows in ls -l format, in commands that run ls -l, combined with stderr placement
     if re.search(r"\bls\s+-\w*l", command):
-        ls_row = re.compile(r"^([-dlcbps][-rwxsStT]{9}[.+@]?\s+\d+\s+\S+\s+\S+\s+\d+\s+)"
-                            r"[A-Z][a-z]{2}\s+\d{1,2}\s+(?:\d{2}:\d{2}|\d{4})(\s+.+)$")
-        mask = lambda l: ls_row.sub(r"\1<mtime>\2", l)
+        mask = lambda l: LS_ROW.sub(r"\1 <MTIME> \3", l)
         if (_stderr_placement_equal(action, result, mask) and not _stderr_placement_equal(action, result, None)):
             return "ls_mtime_and_stderr_placement_only"
     if re.search(r"\bcProfile\b|\bprofile\.run\(|pstats", command) and len(old) == len(new):
@@ -201,6 +237,9 @@ def automatic_equivalence(action, result):
         key = lambda l: (row.fullmatch(l).groups() if row.fullmatch(l) else ("", hdr.sub(r"\1<t>\2", l)))
         if any(row.fullmatch(l) for l in old) and [key(l) for l in old] == [key(l) for l in new]:
             return "cprofile_timings_only"
+    pm = provenance_masks(command, bool(result.get("scripts_measure_time")))
+    if len(old) == len(new) and old != new and [masked(l, pm) for l in old] == [masked(l, pm) for l in new]:
+        return "volatile_with_provenance"
     if re.search(TIMING_CALL, command) and len(old) == len(new):
         diff = [(a, b) for a, b in zip(old, new) if a != b]
         if diff and all(_only_timing_numbers_differ(a, b) for a, b in diff):
@@ -212,7 +251,7 @@ def validate_replay(plan, report, rc, reviewed_exceptions=None):
     reviewed_exceptions = reviewed_exceptions or {}
     if str(rc).strip() != '0' or len(report.get('results', [])) != len(plan['actions']):
         raise RuntimeError('Replay did not complete all planned actions')
-    allowed={'exact','normalized','volatile_only','error_reproduced','orig_error_not_applied'}
+    allowed={'exact','normalized','error_reproduced','orig_error_not_applied'}
     # Line-order classes of the replayer are accepted only when the reordering is explained by stderr placement
     # (Claude Code interleaves stderr into the text differently); reordered stdout is never accepted silently.
     import re as _re

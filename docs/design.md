@@ -78,7 +78,10 @@ Harbor's `override_timeout_sec`. The sandbox also enforces it itself (`bounded_r
   interleaving), `volatile_only` (addresses, dates, timings), `address_and_order_only`,
   `line_alignment_and_order_only`, `numbers_differ`, `differs`. The gate accepts the three order classes only when
   the reordering is explained by stderr placement (the original equals the replay's stdout in order once the
-  replay's stderr lines are taken out). An empty successful result equals Claude Code's
+  replay's stderr lines are taken out), and `volatile_only` only when every masked value has a source visible in
+  the command (`provenance_masks`: ls dates for `ls -l`, durations for commands or scripts that measure time,
+  timestamps for clock reads, addresses, pids; the replayer records `scripts_measure_time` inside the sandbox).
+  Dates that are task data are never masked. An empty successful result equals Claude Code's
   `(Bash completed with no output)`.
 - Background output files get the agent's completion trailer (`plan.json["bg_output_trailer"]`; Claude Code 2.1.280
   appends `\n[exited with code N]\n`), so later reads of the file see the same bytes.
@@ -210,7 +213,11 @@ history. Rendered attachment text and request settings that are not in the origi
 parameters, the prose of a reminder) cannot be bound to the original run, so the strict mode adds a second, exact
 gate for real runs: `launch --freeze-first-request <first_request_rewritten.json>` takes the first request of a
 `--fake` run of the same bundle that passed the parity gate and requires the real run's first request to have the
-same digest (every field except `metadata`; `expected_first_request_sha256`). Fake and real runs of one bundle send
+same digest (every field except `metadata`; `expected_first_request_sha256`). Provenance is verified: the fake
+run's parity report must have judged exactly that request (`request_sha256`), come from a fake run, with the same
+passthrough route as this launch, and the fake run's bundle must have the same session, cut, sentinel, mode, hint
+and original request. The agent itself refuses a real `require` run without the digest (a hand-written job config
+cannot skip it). Fake and real runs of one bundle send
 identical first requests (checked on two real runs), so this binds everything a fake run can show. With
 `--parity-gate require` a real launch without `--freeze-first-request` is refused. Once a gate failed, every later
 request of that run is refused too. The report is `first_request_parity.json`.

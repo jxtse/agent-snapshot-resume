@@ -38,18 +38,32 @@ class LaunchConfig(unittest.TestCase):
         meta = dict(json.loads((self.bdir / "bundle.json").read_text()),
                     orig_request_at_k={"req_bytes": 1, "content": {"message_block_sha256": []}})
         (self.bdir / "bundle.json").write_text(json.dumps(meta))
+        route = ["--drop-fields", "metadata", "--strip-is-error"]
+        trial = self.root / "fakejob" / "t__x" / "agent"
+        logs = trial / "resume-proxy" / self.meta["run_id"]
+        logs.mkdir(parents=True)
+        (trial / "resume").mkdir()
+        (trial / "resume" / "bundle.json").write_text(json.dumps(meta))
+        body = {"model": "m", "messages": [], "temperature": 1}
+        freeze = str(logs / "first_request_rewritten.json")
+        (logs / "first_request_rewritten.json").write_text(json.dumps({"body": body}))
+        good = {"ok": True, "request_sha256": request_digest(body), "upstream_fake": True,
+                "route": {"drop_fields": ["metadata"], "strip_is_error": True, "strip_thinking": False}}
+        kw = dict(fake=False, parity_gate="require", passthrough_args=route)
         with patch.dict(os.environ, {"ASR_UPSTREAM_URL": "https://example.invalid"}):
             with self.assertRaises(SystemExit):
-                self.cfg(fake=False, parity_gate="require")
-            logs = self.root / "fake-logs" / self.meta["run_id"]
-            logs.mkdir(parents=True)
-            body = {"model": "m", "messages": [], "temperature": 1}
-            (logs / "first_request_rewritten.json").write_text(json.dumps({"body": body}))
-            (logs / "first_request_parity.json").write_text(json.dumps({"ok": False}))
+                self.cfg(**kw)
+            for bad in ({"ok": False}, {"request_sha256": "x"}, {"upstream_fake": False},
+                        {"route": {"drop_fields": ["temperature"], "strip_is_error": True, "strip_thinking": False}}):
+                (logs / "first_request_parity.json").write_text(json.dumps(dict(good, **bad)))
+                with self.assertRaises(SystemExit, msg=str(bad)):
+                    self.cfg(freeze_first_request=freeze, **kw)
+            (logs / "first_request_parity.json").write_text(json.dumps(good))
+            (trial / "resume" / "bundle.json").write_text(json.dumps(dict(meta, hint="other")))
             with self.assertRaises(SystemExit):
-                self.cfg(fake=False, parity_gate="require", freeze_first_request=str(logs / "first_request_rewritten.json"))
-            (logs / "first_request_parity.json").write_text(json.dumps({"ok": True}))
-            cfg = self.cfg(fake=False, parity_gate="require", freeze_first_request=str(logs / "first_request_rewritten.json"))
+                self.cfg(freeze_first_request=freeze, **kw)
+            (trial / "resume" / "bundle.json").write_text(json.dumps(meta))
+            cfg = self.cfg(freeze_first_request=freeze, **kw)
             self.assertEqual(cfg["agents"][0]["kwargs"]["expected_first_request_sha256"], request_digest(body))
 
     def test_fake_config_valid_and_secret_free(self):
