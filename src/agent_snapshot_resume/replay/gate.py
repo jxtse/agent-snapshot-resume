@@ -41,7 +41,7 @@ WRITES = re.compile(r"open\([^)]*['\"][wax]b?\+?['\"]|\.to_(?:csv|parquet|pickle
                     r"shutil|os\.remove|unlink|\bsed\s+-i|pip3?\s+install")
 
 
-TIMING_BEFORE = r"(?i)\b(?:time|timing|elapsed|took|duration|runtime|wall(?:time)?|wall[ -]clock|in)\s*[:=]?\s*$"
+TIMING_BEFORE = r"(?i)\b(?:time|timing|elapsed|took|duration|runtime|wall(?:time)?|wall[ -]clock)\s*[:=]?\s*$"
 TIMING_AFTER = r"(?i)^\s*(?:s|sec|secs|seconds|ms|min|minutes)\b"
 
 
@@ -208,8 +208,13 @@ def validate_replay(plan, report, rc, reviewed_exceptions=None):
     reviewed_exceptions = reviewed_exceptions or {}
     if str(rc).strip() != '0' or len(report.get('results', [])) != len(plan['actions']):
         raise RuntimeError('Replay did not complete all planned actions')
-    allowed={'exact','normalized','same_lines_reordered','volatile_only','address_and_order_only',
-             'line_alignment_and_order_only','error_reproduced','orig_error_not_applied'}
+    allowed={'exact','normalized','volatile_only','error_reproduced','orig_error_not_applied'}
+    # Line-order classes of the replayer are accepted only when the reordering is explained by stderr placement
+    # (Claude Code interleaves stderr into the text differently); reordered stdout is never accepted silently.
+    import re as _re
+    order_maps = {'same_lines_reordered': None,
+                  'address_and_order_only': lambda l: _re.sub(r"0x[0-9a-fA-F]{6,}", "<ADDR>", l),
+                  'line_alignment_and_order_only': lambda l: l.strip()}
     for action, result in zip(plan['actions'],report['results']):
         if result.get('call_id') != action['call_id']:
             raise RuntimeError('Replay action identity mismatch')
@@ -230,6 +235,8 @@ def validate_replay(plan, report, rc, reviewed_exceptions=None):
         elif (action['side_effect']=='task_mgmt' and action.get('tool') in ('TaskCreate','TaskUpdate')
               and fidelity=='task_mgmt_restored_from_session'):
             result['deferred_gate'] = 'session auxiliary files must be hash-verified after clone seeding, before CC starts'
+        elif fidelity in order_maps and _stderr_placement_equal(action, result, order_maps[fidelity]):
+            result['order_explained_by'] = 'stderr_placement'
         elif fidelity not in allowed and action['side_effect'] == 'exec' and automatic_equivalence(action, result):
             result['automatic_equivalence'] = automatic_equivalence(action, result)
             exit_reviewed = result['automatic_equivalence'] == 'cc_grep_no_match'

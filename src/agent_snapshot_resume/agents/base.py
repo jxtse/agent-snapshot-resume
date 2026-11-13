@@ -147,6 +147,10 @@ class SnapshotResumeAgentMixin:
             if exp:
                 spec["first_request_parity"] = dict(exp, route=route_from_passthrough_args(
                     getattr(self.options, "passthrough_args", None) or []))
+                if gate == "require":
+                    if not exp.get("content"):
+                        raise RuntimeError("parity_gate=require but the bundle has no content reference; rebuild it")
+                    spec["first_request_parity"]["content"] = dict(exp["content"], require_complete=True)
             elif gate == "require":
                 raise RuntimeError("parity_gate=require but the bundle has no orig_request_at_k (original proxy log "
                                    f"missing or ambiguous: {meta.get('orig_request_locate_error')}); "

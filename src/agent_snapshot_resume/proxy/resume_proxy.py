@@ -291,6 +291,22 @@ def strip_reminder_suffix(blk):
 
 
 ATTACHMENT_TEXT_PREFIXES = ("<system-reminder>", "<task-notification>")
+_TAG_RE = re.compile(r"</?[A-Za-z_][\w-]*>")
+_LINENO_RE = re.compile(r"(?m)^\s*\d+\t")  # Read-tool rendering "N<TAB>line"
+_EVIDENCE_TOKEN_RE = re.compile(r"[\w./:@+%-]*[\d/][\w./:@+%-]*")
+
+
+def evidence_tokens(text, rendered=False):
+    """Tokens that carry data (contain a digit or '/'): numbers, dates, paths, versions, ids. In rendered text,
+    markup tags and Read-style line-number prefixes are removed first."""
+    if rendered:
+        text = _LINENO_RE.sub("", _TAG_RE.sub(" ", text))
+    out = set()
+    for t in _EVIDENCE_TOKEN_RE.findall(text):
+        t = t.strip(".:,;-")
+        if t and re.search(r"[\d/]", t):
+            out.add(t)
+    return out
 
 
 def tool_digest(t):
@@ -312,7 +328,9 @@ def check_content(body, ref, hints):
       messages       every reference block (session prefix after compaction rebuild) present in order, byte-identical
                      (a tool_result may carry an appended <system-reminder> suffix); every other block must be a
                      system-role message, an exact hint block, or user text that starts with a rendered-attachment
-                     marker; their number must not exceed the prefix's attachment count
+                     marker; their number must not exceed the prefix's attachment count, and every data token
+                     (digit or '/') in them must occur in the persisted attachments (evidence_tokens)
+      completeness   require_complete: fail if the prefix had no prompt snapshot (system/tools unbound)
     """
     problems = []
     if ref.get("system_sha256"):
@@ -329,10 +347,13 @@ def check_content(body, ref, hints):
         extra = [n for n in got if n not in ref["tools"] and n not in allowed]
         if extra:
             problems.append(f"unexpected tools {extra}")
+    if ref.get("require_complete") and not (ref.get("system_sha256") and ref.get("tools")):
+        problems.append("content evidence incomplete: the session prefix has no prompt snapshot with the system "
+                        "prompt and tools")
     want = ref.get("message_block_sha256")
     if want is not None:
         hint_blocks = {hint_block_text(h) for h in hints or []}
-        j, extras = 0, 0
+        j, extras, rendered = 0, 0, []
         for blk, _ in blocks_from_request(body.get("messages") or []):
             if j < len(want) and block_digest(blk) == want[j]:
                 j += 1
@@ -341,12 +362,14 @@ def check_content(body, ref, hints):
             if j < len(want) and stripped is not None and block_digest(stripped) == want[j]:
                 j += 1
                 extras += 1
+                rendered.append(blk[4][len(stripped[4]):])
                 continue
             if blk[1] == "text" and blk[2] in hint_blocks:
                 continue
             if blk[0] == "system" or (blk[0] == "user" and blk[1] == "text"
                                       and blk[2].lstrip().startswith(ATTACHMENT_TEXT_PREFIXES)):
                 extras += 1
+                rendered.append(blk[2] if isinstance(blk[2], str) else json.dumps(blk[2], ensure_ascii=False))
                 continue
             problems.append(f"unexplained {blk[0]} {blk[1]} block before reference block {j}")
             break
@@ -354,6 +377,14 @@ def check_content(body, ref, hints):
             problems.append(f"reference block {j} of {len(want)} missing or different")
         if extras > int(ref.get("n_attachments", 0)):
             problems.append(f"{extras} rendered-attachment blocks for {ref.get('n_attachments', 0)} attachments")
+        # Rendered attachment text may only carry data (numbers, dates, paths, ids) that the persisted attachments
+        # carry: a resume-time date, token count, path or environment value that differs is caught here.
+        if "attachment_tokens" in ref:
+            known = set(ref["attachment_tokens"])
+            foreign = sorted({t for txt in rendered for t in evidence_tokens(txt, rendered=True)} - known)
+            if foreign:
+                problems.append(f"rendered attachment text carries data not in the persisted attachments: "
+                                f"{foreign[:8]}")
     return problems
 
 

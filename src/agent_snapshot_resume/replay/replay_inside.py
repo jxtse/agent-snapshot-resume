@@ -24,7 +24,8 @@ Policy (per side-effect class):
               alive; while it is, later Bash actions wait until the original time gap since that command has elapsed
               (capped by --exec-cap), so polls and log reads see a comparable progress point ("paced_wait_s"). If the
               wait cannot be kept (beyond the cap, or the action's original time is unknown), the action is marked
-              "pacing_unmet" and the replay gate rejects the snapshot.
+              "pacing_unmet" and the replay gate rejects the snapshot. A surviving job whose own original start time
+              is unknown makes every later Bash action pacing_unmet.
   subagent    Agent/Task spawn: not replayed as a model call; the sidechain's own side-effecting tool calls that
               finished before step k are included in the plan (merged by timestamp) and replayed like main calls.
   task_mgmt   TaskCreate/TaskUpdate: restored from the session by the agent adapter (Claude Code:
@@ -152,7 +153,7 @@ def pace_wait(live, a, cap):
         if not group_alive(job["pgid"]):
             live.remove(job)
             continue
-        if t is None:
+        if t is None or job.get("orig_t") is None:
             return round(waited, 1), False
         target = job["replay_t"] + max(0.0, t - job["orig_t"])
         if target - time.time() > cap - waited:
@@ -252,7 +253,8 @@ def main():
                     r = run_bash(cmd, cwd, to)
                     rec.update({"status": "timeout" if r["timeout"] else "ran", "rc": r["rc"], "dur_s": r["dur"],
                                 "timeout_s": to})
-                    if not r["timeout"] and r.get("pgid") and group_alive(r["pgid"]) and iso_ts(a.get("timestamp")):
+                    if not r["timeout"] and r.get("pgid") and group_alive(r["pgid"]):
+                        # orig_t None (no original start time): any later action while it lives is pacing_unmet
                         live.append({"pgid": r["pgid"], "replay_t": time.time() - r["dur"],
                                      "orig_t": iso_ts(a.get("timestamp")), "call_id": a["call_id"]})
                         rec["left_background_job"] = True

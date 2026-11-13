@@ -76,14 +76,17 @@ Harbor's `override_timeout_sec`. The sandbox also enforces it itself (`bounded_r
   calls: skipped.
 - Output comparison classes: `exact`, `normalized` (whitespace/ANSI), `same_lines_reordered` (stdout/stderr
   interleaving), `volatile_only` (addresses, dates, timings), `address_and_order_only`,
-  `line_alignment_and_order_only`, `numbers_differ`, `differs`. An empty successful result equals Claude Code's
+  `line_alignment_and_order_only`, `numbers_differ`, `differs`. The gate accepts the three order classes only when
+  the reordering is explained by stderr placement (the original equals the replay's stdout in order once the
+  replay's stderr lines are taken out). An empty successful result equals Claude Code's
   `(Bash completed with no output)`.
 - Background output files get the agent's completion trailer (`plan.json["bg_output_trailer"]`; Claude Code 2.1.280
   appends `\n[exited with code N]\n`), so later reads of the file see the same bytes.
 - Pacing: a replayed foreground command that leaves processes running (`nohup … &`) keeps its process group alive.
   While it is alive, each later `Bash` action waits until the original time gap since that command has elapsed
   (bounded by `--exec-cap`; recorded as `paced_wait_s`), so polls and log reads see a comparable progress point.
-  Replay otherwise runs back to back.
+  If the gap cannot be kept (beyond the cap, or a start time is unknown) the action is `pacing_unmet` and the gate
+  fails. Replay otherwise runs back to back.
 
 ### Replay gate
 
@@ -198,7 +201,9 @@ rejects the first request with 400, before anything is sent upstream, unless
   recorded tool has the same name, description and input schema (only the deferred-loading placeholder may be
   added), and every message block of the rebuilt context is present in order and byte-identical; other blocks may
   only be system-role messages, the hint block, or user text that starts with a rendered-attachment marker, no
-  more of them than the prefix has attachments.
+  more of them than the prefix has attachments, and every data token in them (anything with a digit or `/`:
+  dates, token counts, paths, versions) must occur in the persisted attachments. With `--parity-gate require` a
+  prefix without a prompt snapshot (system prompt and tools unbound) fails.
 
 Byte length alone would accept an equal-length substitution; the content check closes that. Once the gate failed,
 every later request of that run is refused too. The report is `first_request_parity.json`.

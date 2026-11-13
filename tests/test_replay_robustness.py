@@ -17,9 +17,11 @@ def sha(s):
     return hashlib.sha256(s.encode()).hexdigest()
 
 
-def one(command, orig, stdout, stderr="", rc=0, is_error=False, fidelity="differs", side_effect="exec", **extra):
+def one(command, orig, stdout, stderr="", rc=0, is_error=False, fidelity=None, side_effect="exec", **extra):
     a = {"call_id": "c1", "side_effect": side_effect, "tool": "Bash", "args": {"command": command},
          "orig_text": orig, "is_error": is_error, **extra}
+    if fidelity is None:  # classify exactly as the replayer does
+        fidelity = replay.compare(orig, replay.cc_bash_text({"stdout": stdout, "stderr": stderr}), rc)
     r = {"call_id": "c1", "fidelity": fidelity, "stdout_full": stdout, "stderr_full": stderr, "rc": rc,
          "status": "ran", "timeout": False}
     return {"actions": [a]}, {"results": [r]}
@@ -106,6 +108,15 @@ class AutomaticEquivalence(unittest.TestCase):
         n = "drwxr-xr-x 2 root root 4096 Nov 13 04:47 .\nres 1\n"
         self.assertTrue(passes(*one("python3 a.py; ls -la d", o, n, stderr="<stdin>:15: RuntimeWarning: x\n")))
 
+    def test_reordered_stdout_rejected_reordered_stderr_accepted(self):
+        self.assertFalse(passes(*one("python3 rank.py", "first a\nsecond b", "second b\nfirst a\n")))
+        self.assertTrue(passes(*one("python3 rank.py", "warn x\nfirst a\nsecond b", "first a\nsecond b\n",
+                                    stderr="warn x\n")))
+
+    def test_bare_in_is_not_a_duration(self):
+        cmd = "python3 - <<'EOF'\nimport time\nt=time.time()\nprint('samples in', n)\nEOF"
+        self.assertFalse(passes(*one(cmd, "samples in 10", "samples in 11\n")))
+
     def test_task_data_dates_reordered_are_rejected(self):
         # review counterexample: dates that are task data, changed and reordered, must not pass
         o = "event 2020-01-01 a\nevent 2020-01-02 b"
@@ -151,6 +162,23 @@ class Pacing(unittest.TestCase):
         p, r = one("cat log", "x", "x\n", fidelity="exact")
         r["results"][0]["pacing_unmet"] = True
         self.assertFalse(passes(p, r))
+
+    def test_surviving_job_without_start_time_marks_later_actions_unmet(self):
+        with tempfile.TemporaryDirectory() as td:
+            plan = {"initial_cwd": td, "actions": [
+                {"call_id": "s1", "tool": "Bash", "side_effect": "exec", "timestamp": None,
+                 "args": {"command": "nohup sleep 3 >/dev/null 2>&1 &"}, "orig_text": "(Bash completed with no output)"},
+                {"call_id": "r1", "tool": "Bash", "side_effect": "exec", "timestamp": "2026-01-01T00:00:01.000Z",
+                 "args": {"command": "echo hi"}, "orig_text": "hi"}]}
+            pp, rp = Path(td) / "plan.json", Path(td) / "report.json"
+            pp.write_text(json.dumps(plan))
+            import subprocess
+            import sys
+            subprocess.run([sys.executable, replay.__file__, str(pp), str(rp), "--exec-cap", "30"], check=False)
+            rep = json.loads(rp.read_text())
+            self.assertTrue(rep["results"][1].get("pacing_unmet"))
+            with self.assertRaises(RuntimeError):
+                gate.validate_replay(plan, rep, 0, {})
 
     def test_pace_wait_reports_unmet_beyond_cap(self):
         import subprocess

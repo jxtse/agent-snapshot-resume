@@ -70,12 +70,24 @@ def locate_request(ir: dict[str, Any], k_index: int, requests: list[dict[str, An
     return {"error": "original request for step k not identifiable (no unique usage match, failed attempts logged)"}
 
 
+def _strings(x):
+    if isinstance(x, str):
+        yield x
+    elif isinstance(x, dict):
+        for v in x.values():
+            yield from _strings(v)
+    elif isinstance(x, list):
+        for v in x:
+            yield from _strings(v)
+
+
 def content_reference(session_lines: list[dict[str, Any]]) -> dict[str, Any]:
     """Model-visible content the first resumed request must carry, from the truncated session prefix:
     the system prompt and tools of the agent's last persisted `prompt_snapshot` attachments (Claude Code 2.1.280
     writes them; absent -> not checked), and the digest of every message block of the context rebuilt after the last
     compaction (equiv.context_lines), in order."""
     from .equiv import blocks_from_session, context_lines
+    from .proxy.resume_proxy import evidence_tokens
     cli = sysp = tools = None
     for d in session_lines:
         a = d.get("attachment") or {}
@@ -84,8 +96,14 @@ def content_reference(session_lines: list[dict[str, Any]]) -> dict[str, Any]:
             sysp = a.get("systemPrompt", sysp)
             tools = a.get("tools", tools)
     ctx = context_lines(session_lines)
+    att_tokens: set[str] = set()
+    for d in ctx:
+        if d.get("type") == "attachment":
+            for text in _strings(d.get("attachment")):
+                att_tokens |= evidence_tokens(text)
     ref: dict[str, Any] = {"message_block_sha256": [block_digest(b) for b in blocks_from_session(ctx)],
-                           "n_attachments": sum(1 for d in ctx if d.get("type") == "attachment")}
+                           "n_attachments": sum(1 for d in ctx if d.get("type") == "attachment"),
+                           "attachment_tokens": sorted(att_tokens)}
     if cli is not None and sysp is not None:
         ref["system_sha256"] = system_digest([cli, "\n\n".join(sysp)])
     if tools:
