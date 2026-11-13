@@ -213,6 +213,22 @@ class ContentParity(unittest.TestCase):
                     ok + ok):                                                                     # leaf twice
             self.assertTrue(proxy.rendered_text_problems(bad, att, tpl), bad)
 
+    def test_two_files_cannot_swap_contents(self):
+        mk = lambda fn, body: {"type": "file", "leaves": [fn, body], "fields": {"file.filename": [fn]}}
+        atts = [mk("/app/a.cfg", "mode = fast\nretries = 1\n"), mk("/app/b.cfg", "mode = safe\nretries = 9\n")]
+        tpl = {"fixed": ["Result of calling the Read tool:"],
+               "slots": [['Called the Read tool with the following input: {"file_path":"\x00"}', ["file.filename"]]]}
+        hdr = lambda fn: f'Called the Read tool with the following input: {{"file_path":"{fn}"}}\nResult of calling the Read tool:\n'
+        body = lambda c: "".join(f"{k + 1}\t{x}\n" for k, x in enumerate(c.split("\n")))
+        ok = hdr("/app/a.cfg") + body("mode = fast\nretries = 1\n") + "\n" + hdr("/app/b.cfg") + body("mode = safe\nretries = 9\n")
+        self.assertEqual(proxy.rendered_text_problems(ok, atts, tpl), [])
+        swapped = hdr("/app/a.cfg") + body("mode = safe\nretries = 9\n") + "\n" + hdr("/app/b.cfg") + body("mode = fast\nretries = 1\n")
+        self.assertTrue(proxy.rendered_text_problems(swapped, atts, tpl))
+        # a leaf is consumed across rendered blocks too
+        used = set()
+        self.assertEqual(proxy.rendered_text_problems(ok, atts, tpl, used), [])
+        self.assertTrue(proxy.rendered_text_problems(ok, atts, tpl, used))
+
     def test_template_slots_bound_to_fields(self):
         env = {"type": "environment", "leaves": ["/app/aaa", "/app/bbb", "linux"],
                "fields": {"environment.snapshot.workingDirectory": ["/app/aaa"],

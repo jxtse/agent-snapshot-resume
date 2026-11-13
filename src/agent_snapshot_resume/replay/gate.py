@@ -189,7 +189,9 @@ def _final_stage_is_grep(command):
     left side could return 1 itself), no stderr redirection (a failing earlier stage must show on stderr), no
     subshell/substitution/braces; `pipefail` anywhere disqualifies. Anything else is ambiguous."""
     sh = _heredoc_split(command)[0]
-    if "pipefail" in sh or re.search(r"`|\$\(", sh):
+    # errexit (set -e / -o errexit / bash -e) can stop before the grep runs, with the same output
+    if ("pipefail" in sh or "errexit" in sh or re.search(r"`|\$\(|\bset\s+-\w*e|\bbash\s+-\w*e", sh)
+            or re.search(r"\bexit\b|\breturn\b|\btrap\b", sh)):
         return False
     final = [seg.strip() for seg in re.split(r"[\n;]", sh) if seg.strip()]
     if not final:
@@ -228,7 +230,7 @@ def automatic_equivalence(action, result):
     different task state. Returns a reason string or None. Each class is narrow and checked on the full output:
       cc_grep_no_match      the command's last command (after the last newline/`;`) is a plain pipeline ending in
                             grep/rg (_final_stage_is_grep: no `&&`, `||`, `&`, stderr redirection, subshell; no
-                            pipefail), replay rc=1 (no match), the original was not an error (CC renders that case as
+                            pipefail, errexit, exit/return/trap), replay rc=1 (no match), the original was not an error (CC renders that case as
                             success), the full stdout is identical; no stderr.
       ls_dot_entries_only   `ls -l*` listings whose only difference is the `.`/`..` rows and `total` block counts
                             (some sandbox filesystems omit them); every other row identical up to metadata-column
@@ -332,6 +334,7 @@ def automatic_equivalence(action, result):
 
 
 def validate_replay(plan, report, rc, reviewed_exceptions=None):
+    import hashlib
     reviewed_exceptions = reviewed_exceptions or {}
     if str(rc).strip() != '0' or len(report.get('results', [])) != len(plan['actions']):
         raise RuntimeError('Replay did not complete all planned actions')
@@ -341,6 +344,7 @@ def validate_replay(plan, report, rc, reviewed_exceptions=None):
     order_maps = {'same_lines_reordered': None, 'line_alignment_and_order_only': lambda l: l.strip()}
     import re as _re
     run_start = (plan.get('actions') or [{}])[0].get('timestamp')  # original run's first action (UTC)
+    planned_ids = {a['call_id'] for a in plan['actions']}
     # background output files written by a command that uses the shell `time` keyword: a later read of such a file
     # shows that command's timing report (provenance from the plan, not from the reading command)
     time_files = []
@@ -362,8 +366,19 @@ def validate_replay(plan, report, rc, reviewed_exceptions=None):
         exit_reviewed = False
         if action['side_effect']=='exec_background':
             # completed -> rc 0; failed (Claude Code: non-zero exit) -> non-zero rc, same as the original task status
-            status_same = ((action.get('bg_status') == 'completed' and result.get('rc') == 0) or
-                           (action.get('bg_status') == 'failed' and result.get('rc') not in (None, 0)))
+            # completed -> rc 0. failed -> the same non-zero exit code as the original task-notification reported
+            # (Claude Code: "failed with exit code N"; unknown -> refused) AND evidence that it failed the same way:
+            # a later read of its output file that is part of this replay plan (that read compares the original
+            # text with the restored file like any other read; bundles built with --include-read-only-reads keep
+            # such reads), or a command-bound reviewed exception of kind background_failure.
+            orig_code = action.get('bg_exit_code')
+            failed_ok = (action.get('bg_status') == 'failed' and orig_code not in (None, 0)
+                         and result.get('rc') == orig_code
+                         and (any(c in planned_ids for c in action.get('bg_output_read_later') or ())
+                              or reviewed_exceptions.get(action['call_id'], {}).get('kind') == 'background_failure'
+                              and reviewed_exceptions[action['call_id']].get('command_sha256')
+                              == hashlib.sha256((action.get('args') or {}).get('command', '').encode()).hexdigest()))
+            status_same = (action.get('bg_status') == 'completed' and result.get('rc') == 0) or failed_ok
             if not (action.get('bg_finished_before_k',True) and status_same
                     and fidelity=='bg_rerun_foreground'
                     and result.get('background_output_file')==action.get('background_output_file')

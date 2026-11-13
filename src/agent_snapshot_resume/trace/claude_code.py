@@ -234,8 +234,10 @@ def load_trial(trial_dir, agent_timeout_s=None, task=None, reward=None):
                       "text": _attachment_text(a), "timestamp": d.get("timestamp")}
                 if a.get("type") == "queued_command" and isinstance(a.get("prompt"), str) and "<task-notification>" in a["prompt"]:
                     tn = dict(re.findall(r"<(task-id|status|tool-use-id|output-file)>([^<]*)<", a["prompt"]))
+                    ec = re.search(r"<summary>[^<]*\bexit code (\d+)", a["prompt"])
                     ae.update({"bg_task_id": tn.get("task-id"), "bg_status": tn.get("status"),
-                               "bg_call_id": tn.get("tool-use-id"), "bg_output_file": tn.get("output-file")})
+                               "bg_call_id": tn.get("tool-use-id"), "bg_output_file": tn.get("output-file"),
+                               "bg_exit_code": int(ec.group(1)) if ec else None})
                 ev.append(ae)
             elif t == "system":
                 st = d.get("subtype")

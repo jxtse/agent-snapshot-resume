@@ -98,7 +98,10 @@ class AutomaticEquivalence(unittest.TestCase):
         for bad in ("echo done; printf x | grep x >/dev/null; test -f /app/required",
                     "echo done; test -f /app/required && cat f | grep x",
                     "echo done; cat f | grep x || true", "set -o pipefail; cat f | grep x",
-                    "echo done; cat f 2>/dev/null | grep x", "echo done; (cat f | grep x)"):
+                    "echo done; cat f 2>/dev/null | grep x", "echo done; (cat f | grep x)",
+                    'set -e; printf "ready\\n"; test "$READY" = yes; printf "" | grep optional',
+                    'set -o errexit; echo done; false; cat f | grep x', "bash -e -c 'echo done; false'; cat f | grep x",
+                    "echo done; test -f x || exit 1; cat f | grep x"):
             self.assertFalse(passes(*one(bad, "done", "done\n", rc=1)), bad)
 
     def test_listing_order_is_not_automatic(self):
@@ -270,18 +273,69 @@ class ReviewedKinds(unittest.TestCase):
 
 
 class BackgroundTasks(unittest.TestCase):
-    def bg(self, status, rc):
+    def bg(self, status, rc, code=None, read_later=(), review=None):
         a = {"call_id": "c1", "side_effect": "exec_background", "tool": "Bash", "args": {"command": "x"},
-             "bg_finished_before_k": True, "bg_status": status, "background_output_file": "/tmp/t.output"}
+             "bg_finished_before_k": True, "bg_status": status, "background_output_file": "/tmp/t.output",
+             "bg_exit_code": code, "bg_output_read_later": read_later}
         r = {"call_id": "c1", "fidelity": "bg_rerun_foreground", "rc": rc, "background_output_file": "/tmp/t.output",
              "background_output_sha256": "ab"}
-        return {"actions": [a]}, {"results": [r]}
+        return {"actions": [a]}, {"results": [r]}, review
 
-    def test_failed_task_reproduced_failed(self):
-        self.assertTrue(passes(*self.bg("failed", 1)))
-        self.assertFalse(passes(*self.bg("failed", 0)))
-        self.assertTrue(passes(*self.bg("completed", 0)))
-        self.assertFalse(passes(*self.bg("completed", 1)))
+    def ok(self, *args, **kw):
+        p, r, review = self.bg(*args, **kw)
+        return passes(p, r, review)
+
+    def test_completed(self):
+        self.assertTrue(self.ok("completed", 0))
+        self.assertFalse(self.ok("completed", 1))
+
+    def test_failed_needs_same_code_and_output_evidence(self):
+        sha = hashlib.sha256(b"x").hexdigest()
+        rv = {"c1": {"kind": "background_failure", "command_sha256": sha}}
+        self.assertTrue(self.ok("failed", 1, code=1, review=rv))
+        self.assertFalse(self.ok("failed", 0, code=1, review=rv))
+        self.assertFalse(self.ok("failed", 2, code=1, review=rv), "different exit code")
+        self.assertFalse(self.ok("failed", 1, code=None, review=rv), "original exit code unknown")
+        self.assertFalse(self.ok("failed", 1, code=1), "no evidence of the failure output")
+        self.assertTrue(self.ok("failed", 1, code=1, review={"c1": {"kind": "background_failure", "command_sha256": sha}}))
+        self.assertFalse(self.ok("failed", 1, code=1, review={"c1": {"kind": "background_failure", "command_sha256": "0"}}))
+
+
+class FailedBackgroundEvidence(unittest.TestCase):
+    def test_plan_records_exit_code_and_adds_output_read(self):
+        from agent_snapshot_resume.trace.ir import replay_plan
+        f = "/tmp/claude-0/-app/s/tasks/b1.output"
+        tc = lambda cid, cmd, se, ts, **kw: {"type": "tool_call", "call_id": cid, "tool": "Bash", "side_effect": se,
+                                             "args": {"command": cmd}, "timestamp": ts, **kw}
+        steps = [
+            {"index": 0, "atif_step_id": 1, "source": "user", "timestamp": "2026-01-01T00:00:00.000Z", "events": []},
+            {"index": 1, "atif_step_id": 2, "source": "agent", "timestamp": "2026-01-01T00:00:01.000Z", "events": [
+                tc("b1", "python3 train.py", "exec", "2026-01-01T00:00:01.000Z", background_task_id="t1",
+                   background_output_file=f)]},
+            {"index": 2, "atif_step_id": 3, "source": "agent", "timestamp": "2026-01-01T00:00:05.000Z", "events": [
+                {"type": "attachment", "bg_task_id": "t1", "bg_status": "failed", "bg_exit_code": 1,
+                 "timestamp": "2026-01-01T00:00:04.000Z"},
+                tc("r1", f"cat {f}", "read_only", "2026-01-01T00:00:05.000Z")]},
+            {"index": 3, "atif_step_id": 4, "source": "agent", "timestamp": "2026-01-01T00:00:09.000Z", "events": []}]
+        plan = replay_plan({"trial": "t", "steps": steps}, 3)
+        bg = next(a for a in plan["actions"] if a["call_id"] == "b1")
+        self.assertEqual((bg["bg_status"], bg["bg_exit_code"], bg["bg_output_read_later"]), ("failed", 1, ["r1"]))
+        rd = next(a for a in plan["actions"] if a["call_id"] == "r1")
+        self.assertEqual((rd["side_effect"], rd["evidence_read_for"]), ("exec", "failed_background_output"))
+
+    def test_gate_requires_the_evidence_read_in_the_plan(self):
+        a = {"call_id": "b1", "side_effect": "exec_background", "tool": "Bash", "args": {"command": "x"},
+             "bg_finished_before_k": True, "bg_status": "failed", "background_output_file": "/tmp/t.output",
+             "bg_exit_code": 1, "bg_output_read_later": ["r1"]}
+        r = {"call_id": "b1", "fidelity": "bg_rerun_foreground", "rc": 1, "background_output_file": "/tmp/t.output",
+             "background_output_sha256": "ab"}
+        self.assertFalse(passes({"actions": [a]}, {"results": [r]}), "read not in this plan")
+        rd = {"call_id": "r1", "side_effect": "exec", "tool": "Bash", "args": {"command": "cat /tmp/t.output"},
+              "orig_text": "Traceback: KeyError", "is_error": False}
+        good = {"call_id": "r1", "fidelity": "exact", "rc": 0, "status": "ran", "stdout_full": "Traceback: KeyError\n"}
+        self.assertTrue(passes({"actions": [a, rd]}, {"results": [r, good]}))
+        other = dict(good, fidelity="differs", stdout_full="Traceback: ModuleNotFoundError\n")
+        self.assertFalse(passes({"actions": [a, rd]}, {"results": [r, other]}), "failed for another reason")
 
 
 class Pacing(unittest.TestCase):

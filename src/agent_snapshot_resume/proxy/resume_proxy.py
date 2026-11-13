@@ -328,34 +328,55 @@ def _leaf_forms(v):
     return forms + [[f"{k + 1}\t{x}" for k, x in enumerate(f)] for f in forms]
 
 
-def rendered_text_problems(text, attachments, templates):
+def rendered_text_problems(text, attachments, templates, consumed=None):
     """Parse rendered attachment text in order. Each line must start a whole persisted leaf value of one of
-    `attachments` (multi-line values as one contiguous block, exactly, each leaf consumed at most once), or be a
-    fixed rendering line / filled slot template (rendered_line_ok). Reordered, duplicated, altered or foreign lines
-    fail; the longest leaf match wins. attachments: [{"leaves": [...], "fields": {...}}]."""
+    `attachments` (multi-line values as one contiguous block, exactly), or be a fixed rendering line / filled slot
+    template (rendered_line_ok). Reordered, duplicated, altered or foreign lines fail; the longest leaf match wins.
+    A file header (slot template filled by exactly one attachment that has multi-line content) binds the
+    following leaf values to that attachment until its content block is matched (a file's header and its content
+    come from one attachment: no cross-file swaps). Each leaf is
+    used at most once across all rendered blocks (`consumed`: shared set of (attachment id, leaf index)).
+    attachments: [{"leaves": [...], "fields": {...}}]."""
+    consumed = set() if consumed is None else consumed
     lines = text.split("\n")
-    avail = {}
-    for ai, a in enumerate(attachments):
-        for li, v in enumerate(a.get("leaves", ())):
-            avail[(ai, li)] = _leaf_forms(v)
-    bad, i = [], 0
+    bad, i, bound = [], 0, None
     while i < len(lines):
         if lines[i] == "":
             i += 1
             continue
         best = None
-        for key, forms in avail.items():
-            for f in forms:
-                if f and lines[i:i + len(f)] == f and (best is None or len(f) > best[0]):
-                    best = (len(f), key)
+        for a in attachments:
+            if bound is not None and a is not bound:
+                continue
+            for li, v in enumerate(a.get("leaves", ())):
+                key = (id(a), li)
+                if key in consumed:
+                    continue
+                for f in _leaf_forms(v):
+                    if f and lines[i:i + len(f)] == f and (best is None or len(f) > best[0]):
+                        best = (len(f), key)
         if best:
-            del avail[best[1]]
+            consumed.add(best[1])
             i += best[0]
+            if bound is not None and best[0] > 1:
+                bound = None  # the bound file's content block is done; later lines belong to any attachment
             continue
-        if not rendered_line_ok(lines[i], attachments, templates):
+        owner = _template_owner(lines[i], attachments, templates)
+        if owner is False:
             bad.append(lines[i])
+        elif owner is not None or lines[i] not in (templates or {}).get("fixed", ()):
+            bound = owner  # a file header binds; another slot template unbinds; fixed lines keep the binding
         i += 1
     return bad
+
+
+def _template_owner(line, attachments, templates):
+    """False: not a rendering line. Otherwise the single attachment whose fields fill a slot template (when the
+    line is a file-style header naming exactly one attachment), else None."""
+    if not rendered_line_ok(line, attachments, templates):
+        return False
+    owners = [a for a in attachments if rendered_line_ok(line, [a], {"slots": (templates or {}).get("slots", ())})]
+    return owners[0] if len(owners) == 1 and any(len(v.split("\n")) > 1 for v in owners[0].get("leaves", ())) else None
 
 
 def tool_digest(t):
@@ -437,10 +458,10 @@ def check_content(body, ref, hints):
                     problems.append("rendered attachment text present but this agent version has no rendering "
                                     "templates: cannot bind it")
             else:
-                bad = []
+                bad, consumed = [], set()
                 for pos, txt in rendered:
                     near = [a for a in ref["attachments"] if abs(a["pos"] - pos) <= 1]
-                    bad += rendered_text_problems(txt, near, templates)
+                    bad += rendered_text_problems(txt, near, templates, consumed)
                 if bad:
                     problems.append(f"rendered attachment text not explained by the attachments persisted at that "
                                     f"position: {[b[:120] for b in bad[:3]]}")

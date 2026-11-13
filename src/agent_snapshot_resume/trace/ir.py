@@ -128,15 +128,41 @@ def replay_plan(ir, k_index, include_read_only=False):
     for st in ir["steps"][:k]:
         for e in st["events"]:
             if e["type"] == "attachment" and e.get("bg_task_id"):
-                done[e["bg_task_id"]] = {"status": e.get("bg_status"), "timestamp": e.get("timestamp")}
+                done[e["bg_task_id"]] = {"status": e.get("bg_status"), "timestamp": e.get("timestamp"),
+                                         "exit_code": e.get("bg_exit_code")}
     for a in actions:
         if a.get("background_task_id"):
             info = done.get(a["background_task_id"])
             a["bg_finished_before_k"] = bool(info)
             a["bg_status"] = info["status"] if info else None
             a["bg_finished_ts"] = info["timestamp"] if info else None
+            a["bg_exit_code"] = info.get("exit_code") if info else None
             if info and a.get("timestamp"):
                 a["bg_duration_s"] = round(_ts(info["timestamp"]) - _ts(a["timestamp"]), 1)
+    # evidence of a background task's output: a later tool call before k (read-only ones included) that read its
+    # output file. The replay plan then must contain that read so the gate compares its original text.
+    calls_before_k = [(e["timestamp"], e) for st in ir["steps"][:k] for e in st["events"] if e["type"] == "tool_call"]
+    for a in actions:
+        f = a.get("background_output_file")
+        if f:
+            a["bg_output_read_later"] = [e["call_id"] for ts, e in calls_before_k
+                                         if e["call_id"] != a["call_id"] and (_ts(ts) or 0) >= (_ts(a["timestamp"]) or 0)
+                                         and f in json.dumps(e.get("args") or {})]
+    # A failed background task is only reproduced faithfully if its failure output is too: add the read-only Bash
+    # reads of its output file (they change nothing) so the gate compares their original text with the replay.
+    have = {a["call_id"] for a in actions}
+    want = {c for a in actions if a.get("bg_status") == "failed" for c in a.get("bg_output_read_later") or ()}
+    for st in ir["steps"][:k]:
+        for e in st["events"]:
+            if (e["type"] == "tool_call" and e["call_id"] in want and e["call_id"] not in have
+                    and e["tool"] == "Bash" and e["side_effect"] == "read_only"):
+                actions.append({"origin": "main", "atif_step_id": st["atif_step_id"], "step_index": st["index"],
+                                "call_id": e["call_id"], "tool": e["tool"], "side_effect": "exec",
+                                "args": e["args"], "timestamp": e["timestamp"], "duration_s": e.get("duration_s"),
+                                "is_error": e.get("is_error"), "background_task_id": None,
+                                "background_output_file": None, "cwd": e.get("cwd"), "auto_backgrounded": False,
+                                "evidence_read_for": "failed_background_output"})
+    actions.sort(key=lambda a: (_ts(a["timestamp"]) or 0))
     return {"trial": ir["trial"], "resume_step_atif": ir["steps"][k]["atif_step_id"], "resume_step_index": k,
             "actions": actions}
 
