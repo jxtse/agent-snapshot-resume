@@ -123,7 +123,7 @@ def build_job_config(*, adapter, bundle: Path, task_dir: Path, job_name: str, jo
     task_dir = task_dir.resolve()
     if not (task_dir / "task.toml").is_file():
         raise SystemExit(f"{task_dir} is not a Harbor task dir (no task.toml)")
-    env_kwargs: dict[str, Any] = {"owner": config.owner_tag()}
+    env_kwargs: dict[str, Any] = {"owner": config.owner_tag(), "job": job_name}
     if snapshot_state:
         source = json.loads(Path(snapshot_state).read_text())
         if snapshot_id and source.get("snapshot_id") != snapshot_id:
@@ -190,6 +190,17 @@ def validate_job_config(cfg: dict[str, Any]) -> None:
     from harbor.models.job.config import JobConfig
 
     JobConfig.model_validate(cfg)
+
+
+def start_midrun_snapshotter(*, job_dir: Path, run_dir: Path, every_s: float, poll_s: float):
+    """Snapshot this job's live clones while it runs (see `agent_snapshot_resume.midrun`)."""
+    from .midrun import MidrunSnapshotter
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+    snap = MidrunSnapshotter(job_dir, record_path=run_dir / "midrun-snapshots.jsonl", every_s=every_s,
+                             poll_s=poll_s)
+    snap.start_thread()
+    return snap
 
 
 def run_harbor(config_path: Path, fake: bool) -> int:

@@ -152,7 +152,8 @@ def kill_source(sbx, attempts: int = 30, delay_s: float = 10.0) -> None:
 
 def prepare_source(*, adapter, task_dir: Path, bundle: Path, template: str, tag: str, state_dir: Path,
                    version: str | None = None, exec_cap: int = 1800, expected_fingerprint: str | None = None,
-                   retain_on_gate_failure: bool = False, sandbox_timeout_s: int = 4 * 3600) -> dict[str, Any]:
+                   retain_on_gate_failure: bool = False, sandbox_timeout_s: int = 4 * 3600,
+                   base_snapshot: str | None = None) -> dict[str, Any]:
     Sandbox = _sandbox_cls()
     state_dir.mkdir(parents=True, exist_ok=True)
     out = state_dir / f"snapshot-{tag}.json"
@@ -184,11 +185,24 @@ def prepare_source(*, adapter, task_dir: Path, bundle: Path, template: str, tag:
         return sbx.commands.run(cmd, user="root", timeout=timeout, envs=envs, cwd=cwd)
 
     t = time.time()
-    sbx = Sandbox.create(template=template, timeout=sandbox_timeout_s,
-                         metadata={"owner": owner, "role": "source", "asr_run": tag})
+    sbx = Sandbox.create(template=base_snapshot or template, timeout=sandbox_timeout_s,
+                         metadata={"owner": owner, "role": "source", "asr_run": tag,
+                                   **({"base_snapshot": base_snapshot} if base_snapshot else {})})
     rec["source_sandbox_id"] = sbx.sandbox_id
-    step("create_source", t, sandbox_id=sbx.sandbox_id)
+    rec["base_snapshot"] = base_snapshot
+    step("create_source", t, sandbox_id=sbx.sandbox_id, base_snapshot=base_snapshot)
     try:
+        if base_snapshot:
+            # A mid-run snapshot of a live clone restarts that clone's processes (agent, proxies, background tasks).
+            # Stop them and drop the old logs before replaying the tail, otherwise the previous run keeps writing.
+            t = time.time()
+            run(sbx, "pkill -9 -f '[/]claude' ; pkill -9 -f 'asr_proxy_runtime|resume_proxy|passthrough_proxy' ; "
+                     "pkill -9 -f '[/]asr/' ; sleep 2; rm -rf /logs/agent /logs/verifier /logs/artifacts /tmp/.asr-resume; "
+                     "ps -eo pid,args --sort=pid | grep -v -E 'ps -eo|grep' | tail -30 || true", timeout=300)
+            left = run(sbx, "ps -eo pid,args | grep -E '[/]claude|claude-code|asr_proxy_runtime' || true").stdout.strip()
+            if left:
+                raise RuntimeError("live clone processes survived the base-snapshot cleanup: " + left[-400:])
+            step("base_snapshot_cleanup", t, base_snapshot=base_snapshot)
         t = time.time()
         run(sbx, (healthcheck + " && " if healthcheck else "") + "chmod 1777 /tmp")
         r = run(sbx, "uname -a; nproc; free -m | head -2; df -h / | tail -1; cat /etc/os-release | head -2")

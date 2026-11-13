@@ -3,7 +3,8 @@
   build-bundle      Harbor trial dir + step k -> resume bundle (offline)
   build-template    register a snapshot-capable sandbox template from a task image
   prepare-snapshot  source sandbox: install agent, replay steps < k, gate, fingerprint, snapshot
-  launch            write the Harbor job config (and run Harbor unless --dry-run)
+  launch            write the Harbor job config (and run Harbor unless --dry-run); snapshots the live clone
+  snapshot-midrun   snapshot a running job's live clones (periodic + after every compaction)
   equiv             check a rewritten first request against the original session prefix (offline)
   parity            check a rewritten first request against the original run's request at the cut (offline)
   screen            replayability risks of candidate cuts (offline, no sandbox)
@@ -28,20 +29,40 @@ def _adapter(name):
     return get_adapter(name)
 
 
+def _load_snapshot_record(path):
+    """A mid-run snapshot record: one JSON object, or a .jsonl file (its last line)."""
+    text = Path(path).read_text().strip()
+    if text.startswith("{"):
+        return json.loads(text)
+    lines = [l for l in text.splitlines() if l.strip()]
+    return json.loads(lines[-1])
+
+
 def cmd_build_bundle(a):
     from .bundle import build
 
     hint = Path(a.hint_file).read_text().strip() if a.hint_file else None
+    prior = [Path(f).read_text().strip() for f in (a.prior_hint_file or [])] or None
+    base = _load_snapshot_record(a.base_snapshot) if a.base_snapshot else None
+    if base is not None:
+        base = dict(base, record_path=str(Path(a.base_snapshot).resolve()))
     bdir, meta = build(adapter=_adapter(a.agent), trial_dir=Path(a.trial_dir), atif_step=a.step, out=Path(a.out),
                        cut_line=a.cut_line,
                        mode=a.mode, hint=hint, agent_timeout=a.agent_timeout,
                        task_dir=Path(a.task_dir) if a.task_dir else None, run_id=a.run_id, model=a.model,
                        pin_date=not a.no_pin_date, fingerprint_roots=a.fingerprint_root or None, force=a.force,
-                       persist_hint=a.persist_hint)
+                       persist_hint=a.persist_hint, prior_hints=prior, base_snapshot=base)
     print(bdir)
     print(json.dumps({k: meta[k] for k in ("run_id", "task", "resume_atif_step", "cut_line", "agent_budget_s",
                                            "n_replay_actions", "aux_counts", "n_compactions_before_cut",
-                                           "orig_request_at_k")}, ensure_ascii=False))
+                                           "orig_request_at_k", "n_hints", "agent_budget_source")},
+                     ensure_ascii=False))
+    if meta.get("chain"):
+        print(json.dumps({"chain": {"parent_run_id": meta["chain"]["parent_run_id"],
+                                    "stripped_lines": sum(len(s["removed_lines"]) for s in meta["chain"]["stripped"]),
+                                    "materialised": [m["where"] for m in meta["chain"]["materialised"]]}}, ensure_ascii=False))
+    if meta.get("base_snapshot"):
+        print(json.dumps({"base_snapshot": meta["base_snapshot"]}, ensure_ascii=False))
     if not meta.get("orig_request_at_k"):
         print(f"warning: original request at the cut not located ({meta.get('orig_request_locate_error')}); "
               "the first-request parity gate cannot run for this bundle", file=sys.stderr)
@@ -72,11 +93,16 @@ def cmd_prepare_snapshot(a):
             if "ready" not in str(t.get("status")):
                 raise SystemExit(f"template not ready: {t.get('status')}")
             template = t["template_id"]
+        base = None
+        if not a.full_replay:
+            bmeta = json.loads((Path(a.bundle) / "bundle.json").read_text())
+            base = (bmeta.get("base_snapshot") or {}).get("snapshot_id")
         rec = source.prepare_source(adapter=_adapter(a.agent), task_dir=Path(a.task_dir), bundle=Path(a.bundle),
                                     template=template, tag=a.tag, state_dir=Path(a.state_dir), version=a.version,
                                     exec_cap=a.exec_cap, expected_fingerprint=a.expected_fingerprint,
-                                    retain_on_gate_failure=a.retain_on_gate_failure)
-    print(json.dumps({k: rec.get(k) for k in ("snapshot_id", "fingerprint_source", "replay_gate_passed")}))
+                                    retain_on_gate_failure=a.retain_on_gate_failure, base_snapshot=base)
+    print(json.dumps({k: rec.get(k) for k in ("snapshot_id", "fingerprint_source", "replay_gate_passed",
+                                              "base_snapshot")}))
     return 0 if rec.get("snapshot_id") else 1
 
 
@@ -93,7 +119,7 @@ def _kv(items):
 
 
 def cmd_launch(a):
-    from .launch import build_job_config, run_harbor, validate_job_config
+    from .launch import build_job_config, run_harbor, start_midrun_snapshotter, validate_job_config
 
     bundle = Path(a.bundle)
     meta = json.loads((bundle / "bundle.json").read_text())
@@ -116,7 +142,34 @@ def cmd_launch(a):
         print(path)
         print(json.dumps(cfg, indent=1))
         return 0
-    return run_harbor(path, a.fake)
+    snap = None
+    if a.midrun_snapshot_every and not a.fake:
+        snap = start_midrun_snapshotter(job_dir=Path(a.jobs_dir).resolve() / job, run_dir=runs.resolve(),
+                                        every_s=a.midrun_snapshot_every, poll_s=a.midrun_snapshot_poll)
+    try:
+        return run_harbor(path, a.fake)
+    finally:
+        if snap is not None:
+            snap.stop()
+            if snap.errors:
+                print(json.dumps({"midrun_snapshot_errors": snap.errors[-5:]}, ensure_ascii=False), file=sys.stderr)
+
+
+def cmd_snapshot_midrun(a):
+    """Attach the mid-run snapshotter to a job that is already running (no-op if it has its own)."""
+    from .midrun import MidrunSnapshotter
+
+    job_dir = Path(a.jobs_dir).resolve() / a.job
+    run_dir = Path(a.runs_dir).resolve() / a.job
+    run_dir.mkdir(parents=True, exist_ok=True)
+    snap = MidrunSnapshotter(job_dir, record_path=run_dir / "midrun-snapshots.jsonl", every_s=a.every_s,
+                             poll_s=a.poll_s)
+    if a.once:
+        n = snap.tick()
+        print(json.dumps({"snapshots": n, "errors": snap.errors[-5:]}, ensure_ascii=False))
+        return 0
+    snap.run()
+    return 0
 
 
 def cmd_equiv(a):
@@ -215,7 +268,14 @@ def build_parser():
     p.add_argument("--mode", choices=["same", "hint"], default="same")
     p.add_argument("--hint-file")
     p.add_argument("--persist-hint", action="store_true",
-                   help="mode=hint: keep the hint after the agent compacts its context (re-injected on the summary)")
+                   help="mode=hint: keep every hint the run carries after the agent compacts its context "
+                   "(each re-injected once on the summary)")
+    p.add_argument("--prior-hint-file", action="append", metavar="FILE",
+                   help="a hint this resumed run already carries (repeatable, oldest first); must match the run's own "
+                   "proxy spec. Default: derive the chain from the run's agent/resume/proxy_spec.json")
+    p.add_argument("--base-snapshot", metavar="RECORD",
+                   help="mid-run snapshot record (a line of runs/<job>/midrun-snapshots.jsonl, or a .json file with "
+                   "one): replay only the tail after its session line instead of the whole prefix")
     p.add_argument("--agent-timeout", type=float, help="task agent timeout in s (default: from task.toml)")
     p.add_argument("--task-dir", help="Harbor task dir (for task.toml)")
     p.add_argument("--run-id")
@@ -245,6 +305,8 @@ def build_parser():
     p.add_argument("--exec-cap", type=int, default=1800, help="max seconds per replayed command")
     p.add_argument("--expected-fingerprint")
     p.add_argument("--retain-on-gate-failure", action="store_true")
+    p.add_argument("--full-replay", action="store_true",
+                   help="ignore the bundle's base_snapshot and replay the whole prefix from the task template")
     p.add_argument("--continue", dest="continue_state", help="finish a retained source from its state json")
     p.set_defaults(fn=cmd_prepare_snapshot)
 
@@ -256,6 +318,10 @@ def build_parser():
     p.add_argument("--job-name")
     p.add_argument("--jobs-dir", default="jobs")
     p.add_argument("--runs-dir", default="runs", help="where job.json is written")
+    p.add_argument("--midrun-snapshot-every", type=float, default=1200.0, metavar="SECONDS",
+                   help="snapshot the live clone every N seconds and after each compaction (0 disables); records go "
+                   "to <runs-dir>/<job>/midrun-snapshots.jsonl")
+    p.add_argument("--midrun-snapshot-poll", type=float, default=60.0, metavar="SECONDS")
     p.add_argument("--agent", default="claude-code")
     p.add_argument("--model")
     p.add_argument("--upstream-url", help="default: ASR_UPSTREAM_URL")
@@ -278,6 +344,15 @@ def build_parser():
     p.set_defaults(fn=cmd_launch)
 
     from .equiv import build_parser as equiv_parser
+    p = sub.add_parser("snapshot-midrun", help="snapshot a running job's live clones (attach to a running launch)")
+    p.add_argument("--job", required=True, help="Harbor job name (its trials live in <jobs-dir>/<job>/)")
+    p.add_argument("--jobs-dir", default="jobs")
+    p.add_argument("--runs-dir", default="runs", help="where midrun-snapshots.jsonl is appended")
+    p.add_argument("--every-s", type=float, default=1200.0)
+    p.add_argument("--poll-s", type=float, default=60.0)
+    p.add_argument("--once", action="store_true", help="one pass, then exit")
+    p.set_defaults(fn=cmd_snapshot_midrun)
+
     p = sub.add_parser("equiv", help="context-equivalence check of a rewritten first request")
     equiv_parser(p)
     p.set_defaults(fn=cmd_equiv)
