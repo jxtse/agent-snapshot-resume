@@ -95,7 +95,7 @@ class Batch:
                  passthrough_args: list[str] | None = None, model: str | None = None,
                  upstream_url: str | None = None, hinted_reps: int = 2, control_reps: int = 1,
                  midrun_snapshot_every: float = 1200.0, cut_window: int = 200, max_cut_candidates: int = 16,
-                 prep_concurrency: int = 6,
+                 retry_failed: str = "off", prep_concurrency: int = 6,
                  launch_concurrency: int = 20, only: list[str] | None = None, agent: str = "claude-code",
                  verifier: bool = True, log=print):
         self.name, self.work = name, Path(work_dir)
@@ -112,6 +112,7 @@ class Batch:
         self.midrun_every = midrun_snapshot_every
         self.cut_window = cut_window
         self.max_cut_candidates = max_cut_candidates
+        self.retry_failed = retry_failed
         self.prep_concurrency, self.launch_concurrency = prep_concurrency, launch_concurrency
         self.agent_name, self.verifier = agent, verifier
         self.state = State(self.batch_dir)
@@ -293,15 +294,24 @@ class Batch:
         from .sandbox import source
 
         task = row["task"]
-        tag = f"{task}-s{cut}"
+        base_tag = f"{task}-s{cut}"
         if not tmpl_id:
             raise RuntimeError("no ready template id for this task")
-        out = self.state_dir / f"snapshot-{tag}.json"
-        if out.is_file():
+        tag, attempt = base_tag, 0
+        while True:
+            out = self.state_dir / f"snapshot-{tag}.json"
+            if not out.is_file():
+                break
             rec = json.loads(out.read_text())
             if rec.get("replay_gate_passed") and rec.get("snapshot_id"):
                 return rec
-            raise RuntimeError(f"snapshot state {out} exists without a passed replay gate; inspect and use a new tag")
+            if rec.get("snapshot_id"):
+                # a snapshot exists but its gate was never passed: a human must look at it
+                raise RuntimeError(f"{out} holds a snapshot without a passed replay gate; inspect it")
+            # an interrupted attempt (the driver was killed mid-replay): keep the evidence, take a fresh tag
+            attempt += 1
+            out.rename(out.with_name(out.name + f".stale-{attempt}"))
+            tag = f"{base_tag}-r{attempt}"
         rec = source.prepare_source(adapter=self.adapter, task_dir=self.task_dir(row),
                                     bundle=Path(bundled["bundles"]["hinted"]["dir"]),
                                     template=str(tmpl_id), tag=tag, state_dir=self.state_dir)
@@ -419,7 +429,7 @@ class Batch:
             tmpl = self.stage_template(row)
             self.state.update(task, stage="snapshot", template_id=tmpl.get("template_id"))
             snap = self.stage_snapshot(row, cut, bundled, tmpl.get("template_id"))
-            snap_path = self.state_dir / f"snapshot-{task}-s{cut}.json"
+            snap_path = self.state_dir / f"snapshot-{snap['tag']}.json"
             self.state.update(task, stage="fake", snapshot_id=snap["snapshot_id"])
             fake = self.stage_fake(row, cut, bundled, snap_path)
             self.state.update(task, stage="ready")
@@ -440,7 +450,13 @@ class Batch:
         for r in self.rows:
             st = self.state.unit(r["task"])
             if st.get("stage") == "failed":
-                results["failed"].append(r["task"])
+                retry = (self.retry_failed == "all" or
+                         (self.retry_failed == "infra" and "Unaccepted replay fidelity" not in (st.get("error") or "")))
+                if retry:
+                    self.state.update(r["task"], stage="bundles", retry_of=st.get("error"))
+                    prep_q.put(r)
+                else:
+                    results["failed"].append(r["task"])
             else:
                 prep_q.put(r)
 

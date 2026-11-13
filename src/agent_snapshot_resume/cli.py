@@ -187,7 +187,7 @@ def cmd_batch(a):
               passthrough_args=shlex.split(a.passthrough_args) if a.passthrough_args else None,
               model=a.model, upstream_url=a.upstream_url, hinted_reps=a.hinted_reps,
               control_reps=a.control_reps, midrun_snapshot_every=a.midrun_snapshot_every,
-              cut_window=a.cut_window, max_cut_candidates=a.max_cut_candidates,
+              cut_window=a.cut_window, max_cut_candidates=a.max_cut_candidates, retry_failed=a.retry_failed,
               prep_concurrency=a.prep_concurrency,
               launch_concurrency=a.launch_concurrency, only=a.only.split(",") if a.only else None,
               agent=a.agent, verifier=not a.no_verifier)
@@ -422,6 +422,9 @@ def build_parser():
                    help="when a cut blocks the replay screen, try agent-step starts up to this many lines away "
                         "(always before the fork)")
     p.add_argument("--max-cut-candidates", type=int, default=16)
+    p.add_argument("--retry-failed", choices=["off", "infra", "all"], default="off",
+                   help="reset failed units before running: 'infra' retries those whose failure was not a replay-gate "
+                        "refusal (e.g. an interrupted preparation), 'all' retries every failed unit")
     p.add_argument("--prep-concurrency", type=int, default=6)
     p.add_argument("--launch-concurrency", type=int, default=20)
     p.add_argument("--only", help="comma-separated task names")
