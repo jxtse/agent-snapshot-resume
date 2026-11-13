@@ -39,6 +39,38 @@ LS_NEW = ("total 16\ndrwxr-xr-x 2 root root 4096 Oct 1 00:00 .\ndrwxr-xr-x 3 roo
           "-rw-r--r-- 1 root root 5 Oct 1 00:00 a.csv\n-rw-r--r-- 1 root root 7 Oct 1 00:00 b.csv")
 
 
+class BackgroundOutputOrder(unittest.TestCase):
+    def test_merged_stream_keeps_write_order(self):
+        # Claude Code writes a background task's stdout and stderr into one file in write order
+        cmd = "echo a; echo b >&2; echo c"
+        r = replay.run_bash(cmd, None, 10, merge_stderr=True)
+        self.assertEqual((r["stdout"], r["stderr"], r["rc"]), ("a\nb\nc\n", "", 0))
+        r = replay.run_bash(cmd, None, 10)
+        self.assertEqual((r["stdout"], r["stderr"]), ("a\nc\n", "b\n"))
+
+
+class TimeReportProvenance(unittest.TestCase):
+    def plan(self, bg_cmd, read_cmd):
+        f = "/tmp/claude-0/-root/s/tasks/b1.output"
+        bg = {"call_id": "b1", "side_effect": "exec_background", "tool": "Bash", "args": {"command": bg_cmd},
+              "orig_text": "Command running in background", "is_error": False, "background_output_file": f,
+              "bg_status": "completed", "timestamp": "2026-11-02T20:00:00.000Z"}
+        rd = {"call_id": "r1", "side_effect": "exec", "tool": "Bash", "args": {"command": read_cmd.format(f=f)},
+              "orig_text": "=== t ===\nreal\t0m29.375s\nexit=0", "is_error": False}
+        res_bg = {"call_id": "b1", "fidelity": "bg_rerun_foreground", "rc": 0, "status": "ran",
+                  "background_output_file": f, "background_output_sha256": "x"}
+        out = "=== t ===\nreal\t0m29.363s\nexit=0\n"
+        res_rd = {"call_id": "r1", "fidelity": replay.compare(rd["orig_text"], out, 0), "stdout_full": out,
+                  "stderr_full": "", "rc": 0, "status": "ran", "timeout": False}
+        return {"actions": [bg, rd]}, {"results": [res_bg, res_rd]}
+
+    def test_read_of_timed_background_output(self):
+        self.assertTrue(passes(*self.plan("time python3 s.py; echo exit=$?", "echo '=== t ==='; grep -E 'real|exit' {f}")))
+
+    def test_untimed_background_output_values_not_masked(self):
+        self.assertFalse(passes(*self.plan("python3 s.py; echo exit=$?", "echo '=== t ==='; grep -E 'real|exit' {f}")))
+
+
 class AutomaticEquivalence(unittest.TestCase):
     def test_ls_dot_entries(self):
         self.assertTrue(passes(*one("ls -la /app/data", LS_OLD, LS_NEW)))

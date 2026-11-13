@@ -140,6 +140,7 @@ def _only_timing_numbers_differ(a, b):
         if abs(u - v) > max(0.5 * max(u, v), 0.05):  # run-to-run jitter only
             return False
     return True
+SHELL_TIME = r"(?:^|[;&|({]\s*)time\s|\bTIMEFORMAT=|/usr/bin/time\b"
 TIMING_CALL = r"time\.time\(|perf_counter|time\.monotonic|process_time|timeit|datetime\.now\("
 
 
@@ -243,7 +244,9 @@ def automatic_equivalence(action, result):
                             the original equals the replay's stdout in order once the replay's stderr lines are
                             taken out (stderr placement is the only other freedom).
       shell_time_report_only
-                            the command uses the shell `time` keyword (TIMEFORMAT) or /usr/bin/time; after removing
+                            the command uses the shell `time` keyword (TIMEFORMAT) or /usr/bin/time, or reads the
+                            output file of an earlier background command that does (provenance from the plan);
+                            after removing
                             the timing report lines and blank lines the output is equal line by line in order
                             (line_equivalent, as for evidence_bound_volatile).
       ls_mtime_and_stderr_placement_only
@@ -287,7 +290,7 @@ def automatic_equivalence(action, result):
             action, result, lambda l: diag.sub("bash: line <n>: ", l)):
         return "shell_diagnostic_prefix_only"
     # `time cmd` / TIMEFORMAT / /usr/bin/time reports go to stderr, which Claude Code interleaves differently
-    if re.search(r"(?:^|[;&|({]\s*)time\s|\bTIMEFORMAT=|/usr/bin/time\b", command, re.M):
+    if re.search(SHELL_TIME, command, re.M) or result.get("_reads_time_report"):
         tfmt = re.search(r"TIMEFORMAT=['\"]?([^'\";]*)", command)
         rep = [re.compile(r"^(?:real|user|sys)\s+\d+m\d+(?:\.\d+)?s$|^(?:real|user|sys)\s+\d+(?:\.\d+)?$")]
         if tfmt:
@@ -336,9 +339,20 @@ def validate_replay(plan, report, rc, reviewed_exceptions=None):
     # Line-order classes of the replayer are accepted only when the reordering is explained by stderr placement
     # (Claude Code interleaves stderr into the text differently); reordered stdout is never accepted silently.
     order_maps = {'same_lines_reordered': None, 'line_alignment_and_order_only': lambda l: l.strip()}
+    import re as _re
     run_start = (plan.get('actions') or [{}])[0].get('timestamp')  # original run's first action (UTC)
-    for action, result in zip(plan['actions'],report['results']):
+    # background output files written by a command that uses the shell `time` keyword: a later read of such a file
+    # shows that command's timing report (provenance from the plan, not from the reading command)
+    time_files = []
+    for action, result in zip(plan['actions'], report['results']):
+        f = action.get('background_output_file')
+        if (f and action['side_effect'] == 'exec_background'
+                and _re.search(SHELL_TIME, (action.get('args') or {}).get('command', ''), _re.M)):
+            time_files.append(f)
         result['_run_start'] = run_start
+        cmd = (action.get('args') or {}).get('command', '')
+        result['_reads_time_report'] = any(tf in cmd for tf in time_files)
+    for action, result in zip(plan['actions'],report['results']):
         if result.get('call_id') != action['call_id']:
             raise RuntimeError('Replay action identity mismatch')
         if result.get('pacing_unmet'):

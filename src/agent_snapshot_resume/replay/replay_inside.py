@@ -100,14 +100,17 @@ def original_timeout(text):
     return int(match[1]) * 60 + int(match[2]) if match else None
 
 
-def run_bash(cmd, cwd, timeout):
+def run_bash(cmd, cwd, timeout, merge_stderr=False):
+    """merge_stderr: one pipe for both streams, in write order (how Claude Code captures a background task's
+    output file); stderr is then empty."""
     t0 = time.time()
     p = subprocess.Popen(["bash", "-c", cmd], cwd=cwd if cwd and os.path.isdir(cwd) else None,
-                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
+                         start_new_session=True)
     try:
         stdout, stderr = p.communicate(timeout=timeout)
         out = stdout.decode(errors="replace")
-        err = stderr.decode(errors="replace")
+        err = (stderr or b"").decode(errors="replace")
         return {"rc": p.returncode, "stdout": out, "stderr": err, "dur": round(time.time() - t0, 2), "timeout": False,
                 "pgid": p.pid}
     except subprocess.TimeoutExpired:
@@ -269,7 +272,7 @@ def main():
                         to = int(min(cap, max(60, 2 * (od or 0) + 30)))
                     if scripts_measure_time(cmd, cwd):
                         rec["scripts_measure_time"] = True
-                    r = run_bash(cmd, cwd, to)
+                    r = run_bash(cmd, cwd, to, merge_stderr=(se == "exec_background"))
                     rec.update({"status": "timeout" if r["timeout"] else "ran", "rc": r["rc"], "dur_s": r["dur"],
                                 "timeout_s": to})
                     if not r["timeout"] and r.get("pgid") and group_alive(r["pgid"]):
