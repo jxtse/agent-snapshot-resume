@@ -302,9 +302,69 @@ def validate_replay(plan, report, rc, reviewed_exceptions=None):
             # Bound to the command and to the sha256 of the replay's stdout + NUL + stderr + NUL + rc.
             exact_reviewed = (review.get('kind') == 'reviewed_replay_output' and bound and
                 review.get('replay_output_sha256') == replay_output_sha256(result))
+            # A Python `set` printed directly: the repr order follows the hash seed, so the same items can print in
+            # another order. Accept only when every line is identical after canonicalising Python set literals of
+            # quoted strings (items sorted inside the braces) and at least one line did differ.
+            def _canon_sets(lines):
+                """Sort the members of every Python `set` literal of strings, leaving everything else alone.
+
+                Braces are located by a scanner that skips quoted strings (so a set printed *inside* a string is
+                never rewritten) and the group is only accepted when `ast.literal_eval` returns a set of strings.
+                """
+                import ast
+
+                def fix_line(line):
+                    out, i, n = [], 0, len(line)
+                    while i < n:
+                        ch = line[i]
+                        if ch in ("'", '"'):
+                            j = i + 1
+                            while j < n:
+                                if line[j] == "\\":
+                                    j += 2
+                                    continue
+                                if line[j] == ch:
+                                    break
+                                j += 1
+                            out.append(line[i:j + 1])
+                            i = j + 1
+                            continue
+                        if ch == '{':
+                            depth, j = 0, i
+                            while j < n:
+                                if line[j] == '{':
+                                    depth += 1
+                                elif line[j] == '}':
+                                    depth -= 1
+                                    if depth == 0:
+                                        break
+                                elif line[j] in ("'", '"'):
+                                    q = line[j]
+                                    j += 1
+                                    while j < n and line[j] != q:
+                                        j += 2 if line[j] == "\\" else 1
+                                j += 1
+                            group = line[i:j + 1]
+                            try:
+                                val = ast.literal_eval(group)
+                            except (ValueError, SyntaxError):
+                                val = None
+                            if isinstance(val, set) and val and all(isinstance(x, str) for x in val):
+                                out.append('{' + ', '.join(repr(x) for x in sorted(val)) + '}')
+                            else:
+                                out.append(group)
+                            i = j + 1
+                            continue
+                        out.append(ch)
+                        i += 1
+                    return ''.join(out)
+                return '\n'.join(fix_line(l) for l in lines)
+            set_order = (review.get('kind') == 'python_set_repr_order' and bound and fidelity == 'differs' and
+                result.get('rc') == 0 and not result.get('stderr_full') and not action.get('is_error') and
+                len(old) == len(new) and old != new and _canon_sets(old) == _canon_sets(new))
             if not (hardware_only or memory_only or terminal_grep_only or profile_only or timed_grep or timeout_same
                     or ls_dot_only or unseeded or persisted_same or glob_order or timing_number or listing_line
-                    or agent_state or exact_reviewed):
+                    or agent_state or exact_reviewed or set_order):
                 raise RuntimeError('Unaccepted replay fidelity '+str(fidelity)+': '+action['call_id'])
             exit_reviewed = terminal_grep_only or timed_grep or timeout_same or agent_state or exact_reviewed
             result['reviewed_exception'] = ('exact replay output reviewed: ' + str(review.get('note', ''))[:200] if exact_reviewed else
@@ -320,6 +380,7 @@ def validate_replay(plan, report, rc, reviewed_exceptions=None):
                 'identical scientific stdout; command-bound terminal grep returns1 and stderr contains only shell clocks' if timed_grep else
                 'identical scientific output and profiled function identities/counts; explicitly bound aggregate profiler-count difference plus timings' if profile_only and aggregate_reviewed else
                 'identical scientific output, cProfile call counts and profiled function identities; performance timings/order only' if profile_only else
+                'python set(s) printed directly: identical items, hash-seed repr order only' if set_order else
                 'same package/version/CPU output; host-memory report only' if memory_only else
                 'same Python release/compiler, scientific package versions and CPU count; reviewed Python build timestamp and host free-memory report differences')
         if action['side_effect']=='exec' and not exit_reviewed and bool(result.get('rc')) != bool(action.get('is_error')):

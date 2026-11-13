@@ -22,6 +22,7 @@ Usage:
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import os
 import queue
@@ -50,6 +51,10 @@ def load_manifest(path: Path) -> list[dict[str, Any]]:
             rows.append(row)
     if not rows:
         raise SystemExit(f"{path}: no rows")
+    dup = sorted({r["task"] for r in rows if [x["task"] for x in rows].count(r["task"]) > 1})
+    if dup:
+        # one unit per task: two rows for the same task would share one unit key and launch the wrong bundle
+        raise SystemExit(f"{path}: duplicate task rows {dup}; split them into separate batches")
     return rows
 
 
@@ -89,7 +94,8 @@ class Batch:
                  runs_dir: Path, state_dir: Path, agent_env: dict[str, str] | None = None,
                  passthrough_args: list[str] | None = None, model: str | None = None,
                  upstream_url: str | None = None, hinted_reps: int = 2, control_reps: int = 1,
-                 midrun_snapshot_every: float = 1200.0, cut_window: int = 24, prep_concurrency: int = 6,
+                 midrun_snapshot_every: float = 1200.0, cut_window: int = 200, max_cut_candidates: int = 16,
+                 prep_concurrency: int = 6,
                  launch_concurrency: int = 20, only: list[str] | None = None, agent: str = "claude-code",
                  verifier: bool = True, log=print):
         self.name, self.work = name, Path(work_dir)
@@ -105,6 +111,7 @@ class Batch:
         self.hinted_reps, self.control_reps = hinted_reps, control_reps
         self.midrun_every = midrun_snapshot_every
         self.cut_window = cut_window
+        self.max_cut_candidates = max_cut_candidates
         self.prep_concurrency, self.launch_concurrency = prep_concurrency, launch_concurrency
         self.agent_name, self.verifier = agent, verifier
         self.state = State(self.batch_dir)
@@ -133,6 +140,16 @@ class Batch:
                 return src
         return {"trial_dir": row.get("source_dir") or "", "trial": row.get("source_trial")}
 
+    def source_session_sha(self, row: dict[str, Any]) -> str | None:
+        """Session hash of the source trial (part of the bundle input identity)."""
+        src = self.source(row)
+        p = Path(src["trial_dir"])
+        js = p / "agent" / "sessions" / "projects"
+        cand = sorted(js.glob("*/*.jsonl"))
+        if not cand:
+            return None
+        return __import__("hashlib").sha256(cand[-1].read_bytes()).hexdigest()
+
     def task_dir(self, row: dict[str, Any]) -> Path:
         return self.tasks_dir / row["task"]
 
@@ -150,6 +167,9 @@ class Batch:
         if out.is_file():
             rep = json.loads(out.read_text())
             if rep.get("manifest_cut") == row["cut_line"]:
+                if rep.get("cut_line") is None:
+                    raise RuntimeError(f"every cut in the fork window blocks ({len(rep.get('candidates') or [])} "
+                                       "candidates): see screen.json")
                 return rep
         src = self.source(row)
         trial_dir = Path(src["trial_dir"])
@@ -179,7 +199,7 @@ class Batch:
         cands = [near] + sorted((s for s in pool if s != near), key=lambda s: (abs(s - near), s))
         by_cut: dict[int, dict[str, Any]] = {}
         skipped: list[dict[str, Any]] = []
-        for c in cands[:8]:
+        for c in cands[:self.max_cut_candidates]:
             try:
                 rep = screen.screen_trial(self.adapter, trial_dir, cut_lines=[c], task_dir=self.task_dir(row), ir=ir)
             except (SystemExit, ValueError) as exc:  # e.g. a step at index 0 has no prefix to replay
@@ -219,16 +239,30 @@ class Batch:
         src = self.source(row)
         specs = {"hinted": {"mode": "hint", "hint": hint, "run_id": f"{task}-s{cut}-hint"},
                  "control": {"mode": "same", "hint": None, "run_id": f"{task}-s{cut}-control"}}
-        out: dict[str, Any] = {"cut_line": cut, "bundles": {}}
+        # A cached bundle is only reusable if it was built from the same inputs; a changed hint file, cut or source
+        # session must rebuild it, and a downstream fake/parity proof must never legitimise the stale one.
+        inputs = {"cut_line": cut, "source_trial_dir": str(Path(src["trial_dir"]).resolve()),
+                  "hint_sha256": hashlib.sha256(hint.encode()).hexdigest() if hint else None,
+                  "session_sha256": self.source_session_sha(row)}
+        cached = {}
+        if (ud / "bundles.json").is_file():
+            try:
+                cached = json.loads((ud / "bundles.json").read_text())
+            except ValueError:
+                cached = {}
+        rebuild = bool(cached) and cached.get("inputs") != inputs
+        out: dict[str, Any] = {"cut_line": cut, "inputs": inputs, "bundles": {},
+                               "rebuilt_for_input_change": rebuild}
         for kind, spec in specs.items():
             bdir = ud / "bundles" / spec["run_id"]
-            if bdir.is_dir() and (bdir / "bundle.json").is_file():
+            if bdir.is_dir() and (bdir / "bundle.json").is_file() and not rebuild:
                 meta = json.loads((bdir / "bundle.json").read_text())
             else:
                 bdir, meta = bundle_mod.build(adapter=self.adapter, trial_dir=Path(src["trial_dir"]),
                                              atif_step=None, cut_line=cut, out=ud / "bundles",
                                              task_dir=self.task_dir(row), mode=spec["mode"], hint=spec["hint"],
-                                             run_id=spec["run_id"], persist_hint=(spec["mode"] == "hint"))
+                                             run_id=spec["run_id"], persist_hint=(spec["mode"] == "hint"),
+                                             force=True)
             out["bundles"][kind] = {"dir": str(bdir), "run_id": spec["run_id"], "cut_line": meta.get("cut_line"),
                                     "agent_budget_s": meta.get("agent_budget_s"),
                                     "n_replay_actions": meta.get("n_replay_actions"),
@@ -282,12 +316,13 @@ class Batch:
         task = row["task"]
         ud = self.unit_dir(task)
         out: dict[str, Any] = {"runs": {}}
+        cache_path = ud / "fake.json"
+        cache = json.loads(cache_path.read_text()) if cache_path.is_file() else {}
         for kind, b in bundled["bundles"].items():
             job = f"{self.job(row, 'fake-' + kind)}"
-            frozen = ud / f"freeze-{kind}.json"
-            rep = ud / f"fake-parity-{kind}.json"
-            if frozen.is_file() and rep.is_file() and json.loads(rep.read_text()).get("ok"):
-                out["runs"][kind] = {"job": job, "first_request": str(frozen), "parity_ok": True, "cached": True}
+            cached = (cache.get("runs") or {}).get(kind) or {}
+            if cached.get("parity_ok") and Path(cached.get("first_request", "")).is_file():
+                out["runs"][kind] = {**cached, "cached": True}
                 continue
             rc = launch_one(adapter=self.adapter, bundle=Path(b["dir"]), task_dir=self.task_dir(row), job_name=job,
                             jobs_dir=self.jobs_dir, runs_dir=self.runs_dir, snapshot_state=snap_path, fake=True,
@@ -306,11 +341,13 @@ class Batch:
             if not first.is_file() or not parity.is_file():
                 raise RuntimeError(f"fake run {job} missed {first.name}/{parity.name}")
             ok = bool(json.loads(parity.read_text()).get("ok"))
-            frozen.write_text(first.read_text())
-            rep.write_text(parity.read_text())
+            (ud / f"fake-parity-{kind}.json").write_text(parity.read_text())  # record for the batch, not for freezing
             if not ok:
                 raise RuntimeError(f"fake parity failed for {kind}: {parity}")
-            out["runs"][kind] = {"job": job, "first_request": str(frozen), "parity_ok": True, "trial": str(trial)}
+            # --freeze-first-request resolves the parity report and the bundle identity *next to* this file, so pass
+            # the request where the fake run wrote it (inside the trial's resume-proxy log), never a copy.
+            out["runs"][kind] = {"job": job, "first_request": str(first), "parity_ok": True, "trial": str(trial),
+                                 "parity_report": str(parity)}
         (ud / "fake.json").write_text(json.dumps(out, indent=1))
         return out
 
@@ -337,7 +374,18 @@ class Batch:
         launched = []
         for item in plan:
             u = self.state.unit(task)
-            if item["job"] in (u.get("runs") or {}) and (self.runs_dir / item["job"] / "job.json").is_file():
+            already = (self.runs_dir / item["job"] / "job.json").is_file() or self.find_trial(item["job"])
+            if already:
+                # the run dir (written before Harbor starts) and the trial dir are the markers: a lost state entry
+                # must never cause a second launch of the same job
+                runs = u.get("runs") or {}
+                if item["job"] not in runs:
+                    trials = [p.name for p in (self.jobs_dir / item["job"]).glob("*") if p.is_dir()] \
+                        if (self.jobs_dir / item["job"]).is_dir() else []
+                    runs[item["job"]] = {"run": item["run"], "kind": item["kind"], "job": item["job"],
+                                         "trial": (trials[-1] if trials else None), "rc": None,
+                                         "launched": "(recovered from the run dir)"}
+                    self.state.update(task, runs=runs)
                 launched.append({**item, "cached": True})
                 continue
             rc = launch_one(adapter=self.adapter, bundle=Path(item["bundle"]), task_dir=self.task_dir(row),
@@ -455,7 +503,16 @@ class Batch:
         for row in self.rows:
             task = row["task"]
             st = self.state.unit(task)
-            runs = st.get("runs") or {}
+            runs = dict(st.get("runs") or {})
+            # the run dirs are the source of truth for "this was launched": a lost state entry must not hide a run
+            for job_dir in sorted(self.runs_dir.glob(f"{self.name}-{task}-s*-*")):
+                job = job_dir.name
+                if job in runs or "fake" in job:
+                    continue
+                trials = [p.name for p in (self.jobs_dir / job).glob("*") if p.is_dir()] \
+                    if (self.jobs_dir / job).is_dir() else []
+                runs[job] = {"run": job.rsplit("-", 1)[-1], "kind": "hinted" if "control" not in job else "control",
+                             "job": job, "trial": (trials[-1] if trials else None), "launched": "(from the run dir)"}
             for job, info in sorted(runs.items()):
                 rows.append(self.run_status(row, st, job, info))
             if not runs:

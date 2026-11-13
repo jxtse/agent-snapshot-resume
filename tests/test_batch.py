@@ -32,13 +32,15 @@ def manifest(tmp: Path, rows=None) -> Path:
     (tmp / TASK / "source.json").write_text(json.dumps({"trial_dir": str(tmp / "l0" / f"{TASK}__abc")}))
     (tmp / "tasks" / TASK).mkdir(parents=True, exist_ok=True)
     (tmp / "tasks" / TASK / "task.toml").write_text("[agent]\ntimeout_sec = 600\n")
-    (tmp / "l0" / f"{TASK}__abc").mkdir(parents=True)
+    (tmp / "l0" / f"{TASK}__abc").mkdir(parents=True, exist_ok=True)
     (tmp / TASK / "fork.json").write_text(json.dumps({"forks": [{"session_line": 140}]}))
     return p
 
 
 def make_batch(tmp: Path, **kw) -> batch.Batch:
-    args = dict(name="r1", work_dir=tmp, manifest=manifest(tmp), tasks_dir=tmp / "tasks",
+    args = dict(name="r1", work_dir=tmp,
+                manifest=(tmp / "manifest.csv") if (tmp / "manifest.csv").is_file() else manifest(tmp),
+                tasks_dir=tmp / "tasks",
                 jobs_dir=tmp / "jobs", runs_dir=tmp / "runs", state_dir=tmp / "state",
                 prep_concurrency=1, launch_concurrency=1)
     args.update(kw)
@@ -180,6 +182,30 @@ class Prep(unittest.TestCase):
         st = b.state.unit(TASK)
         self.assertEqual(st["stage"], "failed")
         self.assertIn("blocks", st["error"])
+
+    def test_changed_hint_rebuilds_the_bundles(self):
+        b = make_batch(self.root)
+        launches = []
+        self.run_prep(b, Screen({}), launches)
+        first = json.loads((self.root / "batch" / "r1" / "units" / TASK / "bundles.json").read_text())
+        (self.root / "hint.txt").write_text(HINT + " Also: report the median.")
+        b2 = make_batch(self.root)
+        launches2 = []
+        self.run_prep(b2, Screen({}), launches2)
+        second = json.loads((self.root / "batch" / "r1" / "units" / TASK / "bundles.json").read_text())
+        self.assertNotEqual(first["inputs"], second["inputs"])
+        self.assertTrue(second["rebuilt_for_input_change"])
+
+    def test_duplicate_task_rows_are_refused(self):
+        (self.root / "manifest.csv").unlink(missing_ok=True)
+        manifest(self.root, [{"task": TASK, "group": "g", "source_trial": f"{TASK}__abc", "cut_line": 100,
+                              "after_compaction": "True", "n_forks": "1", "class": "single_fork", "hint_path": "",
+                              "leak_ok": "True"},
+                             {"task": TASK, "group": "g", "source_trial": f"{TASK}__abc", "cut_line": 96,
+                              "after_compaction": "True", "n_forks": "1", "class": "single_fork", "hint_path": "",
+                              "leak_ok": "True"}])
+        with self.assertRaises(SystemExit):
+            make_batch(self.root)
 
     def test_missing_parity_reference_fails_before_launch(self):
         b = make_batch(self.root)
