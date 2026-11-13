@@ -179,6 +179,29 @@ uv run asr launch --bundle bundles/<run_id> --task-dir /path/to/tasks/<task> \
 # add --dry-run to only write/print runs/<job>/job.json
 ```
 
+### 5b. Batch (many cuts at once)
+
+`asr batch run` drives a manifest end to end and is resumable:
+
+```bash
+asr batch run --name o70-r1 --manifest round1/manifest.csv --work-dir . \
+  --tasks-dir ../tbs-aliyun/tasks/o70 --hinted-reps 2 --control-reps 1 \
+  --prep-concurrency 6 --launch-concurrency 20 \
+  --agent-env CLAUDE_CODE_MAX_OUTPUT_TOKENS=128000 --passthrough-args '--drop-fields metadata --strip-is-error'
+asr batch status --name o70-r1          # or --json
+```
+
+Per manifest row (one *unit*, state in `<work-dir>/batch/<name>/state.json` + `events.jsonl`): `screen` (offline; a
+cut that blocks the replay gate is moved to a nearby agent-step start inside the fork window, earlier first) →
+`bundles` (one `--mode hint` bundle shared by the hinted replicates + one `--mode same` control) → `template` (one
+per task, reused) → `snapshot` (replay once, shared by every bundle with the same cut identity) → `fake`
+(`--fake` launch of each bundle: parity gate + the request to freeze) → `launch` (the real runs, `--freeze-first-request`
+so any first-request drift aborts). A unit that fails is recorded with its stage and does not stop the batch; a run
+is never launched twice (`runs/<job>/job.json` is the marker).
+
+`asr batch status` reports per run: state, reward, failed tests from the verifier log, native `cost_usd`, per-request
+hint counts and compaction count from the resume proxy log, first-request parity, and an infra-vs-model failure class.
+
 ### 6. Clean up
 
 ```bash
