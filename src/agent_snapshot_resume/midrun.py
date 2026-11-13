@@ -42,6 +42,7 @@ def lines_of(p):
     n = 0
     comp = 0
     ts = []
+    pending = []
     with open(p, "rb") as f:
         for line in f:
             if not line.strip():
@@ -52,16 +53,23 @@ def lines_of(p):
             i = line.find(b'"timestamp":"')
             if i >= 0:
                 ts.append(line[i + 13:i + 36].decode("ascii", "replace"))
-    return n, comp, ts
+            if b'"tool_use_id":"' in line and b'"type":"tool_result"' in line:
+                j = line.find(b'"tool_use_id":"') + 15
+                pending = [x for x in pending if x != line[j:j + 40]]
+            if b'"type":"tool_use"' in line:
+                j = line.find(b'"id":"') + 6
+                pending.append(line[j:j + 40])
+    return n, comp, ts, len(pending)
 out = {"sessions": []}
 for pat in ("/logs/agent/resume/sessions/projects/*/*.jsonl", "/logs/agent/sessions/projects/*/*.jsonl"):
     for p in sorted(glob.glob(pat)):
-        n, comp, ts = lines_of(p)
-        out["sessions"].append({"path": p, "lines": n, "compactions": comp, "ts": ts,
+        n, comp, ts, pending = lines_of(p)
+        out["sessions"].append({"path": p, "lines": n, "compactions": comp, "ts": ts, "pending_tools": pending,
                                 "bytes": os.path.getsize(p)})
 try:
     with open("/tmp/.asr-midrun/ticks") as f:
-        out["ticks"] = [float(x) for x in f.read().split()[-400:]]
+        # "monotonic epoch" per tick: the guest clock is what the session timestamps use
+        out["ticks"] = [tuple(float(y) for y in x.split()) for x in f.read().splitlines()[-400:]]
 except OSError:
     out["ticks"] = []
 print(json.dumps(out))
@@ -71,7 +79,7 @@ TICKER = (
     "import time\n"
     "f = open('/tmp/.asr-midrun/ticks', 'a', buffering=1)\n"
     "while True:\n"
-    "    f.write('%.3f\\n' % time.monotonic())\n"
+    "    f.write('%.3f %.3f\\n' % (time.monotonic(), time.time()))\n"
     "    time.sleep(0.05)\n"
 )
 
@@ -91,38 +99,36 @@ def parse_ts(ts: str) -> float | None:
         return None
 
 
-def pause_window(before: list[float], after: list[float]) -> tuple[float, float] | None:
-    """(start, end) of the suspension, from the ticker values around the snapshot call."""
+def pause_window(before: list[Any], after: list[Any]) -> tuple[float, float] | None:
+    """(start, end) of the suspension in guest *epoch* seconds, from the ticker values around the snapshot call."""
     if not before or not after:
         return None
-    last_before, new = before[-1], [t for t in after if t > before[-1]]
-    if not new:
-        return None
-    # the pause is the gap between the last tick the guest wrote before the freeze and the first one after it
-    first_after = new[0]
-    gap = first_after - last_before
+    last_before, newest_after = before[-1][1], max(t[1] for t in after)
+    gap = newest_after - last_before
     if gap <= 0.2:  # no suspension longer than two tick periods: cannot bound the freeze this way
         return None
-    return last_before, first_after
+    return last_before, newest_after
 
 
-def session_line_at(probe: dict[str, Any], pause: tuple[float, float] | None) -> tuple[int, str]:
-    """(line count the snapshot contains, session path) for the resumed session.
+def session_line_at(probe: dict[str, Any], pause: tuple[float, float] | None) -> tuple[int, str, bool]:
+    """(line count the snapshot contains, session path, reliable) for the resumed session.
 
-    Before the snapshot the file had `lines_before` lines; anything written during the pause is impossible, so the
-    extra lines are attributed by their own timestamps: all lines written up to the pause start are in the image.
+    Every session line carries a timestamp in the guest clock, and the guest cannot write during the freeze, so the
+    image holds exactly the lines written up to the pause start. If the pause cannot be measured the line count is
+    unknown (``reliable`` false) and callers must not use this snapshot for a tail replay.
     """
     ses = max(probe.get("sessions") or [], key=lambda s: s["lines"])
     lines = int(ses["lines"])
     if pause is None:
-        return lines, ses["path"]
-    start = pause[0]
+        return lines, ses["path"], False
     keep = 0
     for ts in ses.get("ts") or []:
         t = parse_ts(ts)
-        if t is not None and t <= start:
+        if t is not None and t <= pause[0]:
             keep += 1
-    return min(lines, keep) if keep else lines, ses["path"]
+    if not keep:
+        return lines, ses["path"], False
+    return min(lines, keep), ses["path"], True
 
 
 def read_records(path: Path) -> list[dict[str, Any]]:
@@ -216,15 +222,32 @@ class MidrunSnapshotter:
         create_s = round(time.time() - t0, 2)
         after = self.probe(sbx)
         pause = pause_window(before.get("ticks") or [], after.get("ticks") or [])
-        line, path = session_line_at(after, pause)
-        ses = max(before.get("sessions") or [], key=lambda s: s["lines"])
+        line, path, measurable = session_line_at(after, pause)
+        ses = max(after.get("sessions") or [], key=lambda s: s["lines"])
+        before_ses = max(before.get("sessions") or [], key=lambda s: s["lines"], default=ses)
+        # a tool call in flight at the freeze may have applied part of its effect already: replaying it would apply
+        # that part twice, so such a snapshot is not a valid tail-replay base
+        in_flight = int(ses.get("pending_tools") or 0)
         entry = {"trial": rec.get("trial"), "sandbox_id": rec.get("sandbox_id"), "snapshot_id": snap.snapshot_id,
-                 "session_line": line, "session_line_before": ses["lines"],
-                 "session_line_after": max((s["lines"] for s in after.get("sessions") or []), default=ses["lines"]),
-                 "session_path": path, "n_compactions": ses["compactions"], "trigger": trigger,
+                 "session_line": line, "session_line_before": before_ses["lines"],
+                 "session_line_after": ses["lines"], "session_line_reliable": bool(measurable and not in_flight),
+                 "in_flight_tools": in_flight,
+                 "prefix_sha256": self.prefix_sha(sbx, path, line) if measurable else None,
+                 "session_path": path, "n_compactions": before_ses["compactions"], "trigger": trigger,
                  "pause_s": round(pause[1] - pause[0], 3) if pause else None, "create_s": create_s,
                  "run_id": rec.get("run_id"), "session_id": rec.get("session_id")}
         return self.recorder.append(entry)
+
+    def prefix_sha(self, sbx, path: str, line: int) -> str | None:
+        """sha256 of the session prefix the image holds, so a later build can prove it resumes the same history."""
+        if not path or line <= 0:
+            return None
+        try:
+            r = sbx.commands.run(f"head -n {int(line)} {path} | sha256sum", user="root", timeout=120)
+        except Exception:  # noqa: BLE001 - best effort: an unbound record is simply unusable for a tail replay
+            return None
+        out = (r.stdout or "").split()
+        return out[0] if out and len(out[0]) == 64 else None
 
     # -- loop
     def tick(self) -> int:

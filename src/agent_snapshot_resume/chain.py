@@ -116,7 +116,13 @@ def _is_synthetic_assistant(rec: dict[str, Any], txt: str) -> bool:
 
 def strip_scaffolding(records: list[dict[str, Any]], sentinel: str, continue_txt: str = CONTINUE_TXT,
                       synth_txt: str = SYNTH_TXT) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Drop the previous run's resume scaffolding and reconnect the parent chain across the hole."""
+    """Drop the previous run's resume scaffolding and reconnect the parent chain across the hole.
+
+    The range removed is exactly what the proxy dropped from that run's requests: the continue turn, the synthetic
+    assistant reply, the sentinel prompt and every non-assistant message after it (resume-time environment/date/
+    token attachments). A continue block that Claude Code merged into the anchor message is removed from that
+    message instead.
+    """
     out = list(records)
     audit: list[dict[str, Any]] = []
     while True:
@@ -129,7 +135,7 @@ def strip_scaffolding(records: list[dict[str, Any]], sentinel: str, continue_txt
         if lo - 1 >= 0 and _is_user_text(out[lo - 1], continue_txt):
             lo -= 1
         hi = idx + 1
-        while hi < len(out) and out[hi].get("type") in NON_CONTENT_TYPES:
+        while hi < len(out) and out[hi].get("type") != "assistant":
             hi += 1
         removed = out[lo:hi]
         audit.append({"removed_lines": [i for i in range(lo, hi)], "reason": "resume scaffolding",
@@ -145,6 +151,16 @@ def strip_scaffolding(records: list[dict[str, Any]], sentinel: str, continue_txt
         # A run whose session has no sentinel line cannot be chained safely: the next resume would inherit a
         # history whose last model-visible turn is the previous prompt, not the state the proxy injected into.
         raise ValueError("no resume sentinel found in the session: not a resumed run (or the sentinel was edited)")
+    # Claude Code can keep the continue cue as a block of the last user message instead of its own turn.
+    for i, r in enumerate(out):
+        if r.get("type") != "user" or not isinstance((r.get("message") or {}).get("content"), list):
+            continue
+        body = list(r["message"]["content"])
+        keep = [b for b in body if not (isinstance(b, dict) and b.get("type") == "text"
+                                        and (b.get("text") or "").strip() == continue_txt)]
+        if len(keep) != len(body):
+            out[i] = {**r, "message": {**r["message"], "content": keep}}
+            audit.append({"reason": "continue block inside the anchor message", "line": i})
     left = [i for i, r in enumerate(out)
             if _is_user_text(r, sentinel) or _is_user_text(r, continue_txt) or _is_synthetic_assistant(r, synth_txt)]
     if left:
@@ -194,12 +210,14 @@ def _summary_index(records: list[dict[str, Any]], cut: int) -> int | None:
 
 
 def materialize_hints(records: list[dict[str, Any]], hints: list[str], anchors: list[dict[str, Any]],
-                      cut: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+                      cut: int, *, persistent: bool = True) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Put each hint exactly once into the model context of ``records[:cut]``.
 
     The hint is appended to the record it was injected on (the message carrying the anchor tool result). When that
     record is no longer in the model context (a compaction happened after the injection) the hint is appended to
-    the compaction summary instead, which is where the proxy re-injects it after every compaction.
+    the compaction summary instead — but only if the previous run actually re-injected it after its compactions
+    (``persistent``, i.e. its spec had ``persist_hint``); otherwise the hint was *gone* from that run's requests and
+    seeding it would invent an instruction the model never saw.
     """
     out = list(records)
     audit: list[dict[str, Any]] = []
@@ -216,6 +234,10 @@ def materialize_hints(records: list[dict[str, Any]], hints: list[str], anchors: 
         idx = _find_tool_result(out, tid, cut) if tid else None
         ctx_ids = {id(r) for r in ctx}
         if idx is None or id(out[idx]) not in ctx_ids:
+            if not persistent:
+                raise ValueError(f"hint {pos} is no longer in the model context (compacted away) and the previous run "
+                                 "did not persist hints: it cannot be re-seeded without inventing a turn the model "
+                                 "never saw")
             sidx = _summary_index(out, cut)
             if sidx is None:
                 raise ValueError(f"hint {pos}: anchor tool result {tid} is not in the model context and there is no "
@@ -276,17 +298,50 @@ def cut_after_strip(original: list[dict[str, Any]], stripped: list[dict[str, Any
 
 
 def tail_actions(actions: list[dict[str, Any]], session_line: int) -> list[dict[str, Any]]:
-    """Actions a snapshot at `session_line` does not already contain: those whose observation landed after it.
+    """Actions a snapshot at `session_line` does not already contain: those observed at or after it.
 
-    An action's effect is complete once its observation is written, so every action observed at or before the
-    snapshot line is in the snapshot's filesystem. Actions without a line (sub-agent calls) are replayed.
+    `session_line` is a *count* (the image holds lines 0..session_line-1) while `obs_line` is a 0-based index, so an
+    observation at index == session_line is not in the image and must be replayed. An action's effect is complete
+    once its observation is written, so every action observed before that line is in the snapshot's filesystem.
+    Actions without a line (sub-agent calls) are replayed.
     """
     out = []
     for a in actions:
         line = a.get("obs_line")
-        if line is None or int(line) > int(session_line):
+        if line is None or int(line) >= int(session_line):
             out.append(a)
     return out
+
+
+def check_base_snapshot(record: dict[str, Any], *, trial: str, session_id: str | None,
+                        raw_lines: list[str]) -> None:
+    """Bind a mid-run snapshot record to the run it claims to come from, before it is used as an environment.
+
+    The record must prove (a) it was taken from a clone of *this* trial's session, (b) its freeze point was
+    measurable (a suspension the guest's ticker saw, no tool call in flight) and (c) the session prefix in the image
+    is byte-identical to the first `session_line` lines of this run's session. Without (c) a record from another run
+    (or another cut) would silently transplant a foreign filesystem into this resume.
+    """
+    import hashlib
+
+    need = ("snapshot_id", "session_line", "prefix_sha256")
+    missing = [k for k in need if not record.get(k)]
+    if missing:
+        raise ValueError(f"base snapshot record lacks {missing} (taken by an older snapshotter?): re-snapshot it")
+    if record.get("trial") and record["trial"] != trial:
+        raise ValueError(f"base snapshot belongs to trial {record['trial']}, not {trial}")
+    if record.get("session_id") and session_id and record["session_id"] != session_id:
+        raise ValueError("base snapshot was taken from a different session than this run's")
+    if record.get("session_line_reliable") is False:
+        raise ValueError("base snapshot's freeze point was not measurable (no tick gap or a tool call in flight); "
+                         "it cannot be used for a tail replay")
+    line = int(record["session_line"])
+    if line > len(raw_lines):
+        raise ValueError(f"base snapshot line {line} is past the end of this session ({len(raw_lines)} lines)")
+    data = ("\n".join(raw_lines[:line]) + "\n").encode()
+    if hashlib.sha256(data).hexdigest() != record["prefix_sha256"]:
+        raise ValueError("base snapshot's session prefix does not match this run's session (wrong record, or the "
+                         "session changed after the snapshot)")
 
 
 # ------------------------------------------------------------------- budget

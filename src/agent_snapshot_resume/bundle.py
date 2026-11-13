@@ -146,8 +146,8 @@ def build(*, adapter, trial_dir: Path, atif_step: int | None, out: Path, mode: s
         raise SystemExit("--mode must be same or hint")
     if mode == "hint" and not hint:
         raise SystemExit("--mode hint needs --hint-file")
-    if persist_hint and mode != "hint":
-        raise SystemExit("--persist-hint needs --mode hint")
+    if prior_hints and mode != "hint":
+        raise SystemExit("--prior-hint-file needs --mode hint (or none: these bundles keep the chain metadata)")
     trial_dir = Path(trial_dir).resolve()
     trial = trial_dir.name
     result = _trial_result(trial_dir)
@@ -173,6 +173,8 @@ def build(*, adapter, trial_dir: Path, atif_step: int | None, out: Path, mode: s
     plan = plan_with_observations(ir, k)
     # ---- chained round-N build: a resumed trial's session must be normalised before it can seed the next run
     evidence = chain.run_evidence(trial_dir)
+    if persist_hint and mode != "hint" and not evidence:
+        raise SystemExit("--persist-hint needs --mode hint (a chained mode=same bundle may use it too)")
     chain_audit: dict[str, Any] | None = None
     seed_lines = raw_lines
     carried: list[str] = []
@@ -190,14 +192,21 @@ def build(*, adapter, trial_dir: Path, atif_step: int | None, out: Path, mode: s
                              "hints the run carried (needed to seed a chained resume)")
         recs = [json.loads(trace_ir._REDACT_RE.sub(r"\1null", l)) for l in raw_lines]
         art = evidence["spec"].get("resume_artifacts") or {}
-        stripped, strip_audit = chain.strip_scaffolding(recs, evidence["spec"]["sentinel"],
-                                                        art.get("continue_text", chain.CONTINUE_TXT),
-                                                        art.get("synthetic_assistant_text", chain.SYNTH_TXT))
-        cut = chain.cut_after_strip(recs, stripped, cut)
-        # Only the hints this run already carried are in its session; the new hint is injected by the proxy at the
-        # cut, exactly like a first-round hint bundle, so it must NOT be seeded into the history.
-        anchors = chain.first_request_hints(evidence["first_request"]["body"], carried)
-        seeded, hint_audit = chain.materialize_hints(stripped, carried, anchors, cut)
+        try:
+            if base_snapshot:
+                chain.check_base_snapshot(base_snapshot, trial=trial, session_id=ir.get("session_id"),
+                                          raw_lines=raw_lines)
+            stripped, strip_audit = chain.strip_scaffolding(recs, evidence["spec"]["sentinel"],
+                                                            art.get("continue_text", chain.CONTINUE_TXT),
+                                                            art.get("synthetic_assistant_text", chain.SYNTH_TXT))
+            cut = chain.cut_after_strip(recs, stripped, cut)
+            # Only the hints this run already carried are in its session; the new hint is injected by the proxy at
+            # the cut, exactly like a first-round hint bundle, so it must NOT be seeded into the history.
+            anchors = chain.first_request_hints(evidence["first_request"]["body"], carried)
+            seeded, hint_audit = chain.materialize_hints(stripped, carried, anchors, cut,
+                                                        persistent=bool(evidence["spec"].get("persist_hint")))
+        except ValueError as exc:  # every chained-build refusal is a user-facing error, never a traceback
+            raise SystemExit(f"{trial}: cannot seed a chained resume: {exc}") from exc
         hint_anchors = chain.anchors_for(seeded, carried, cut)
         seed_lines = [json.dumps(r, ensure_ascii=False, separators=(",", ":")) for r in seeded]
         chain_audit = {"parent_run_id": (evidence.get("parent_bundle") or {}).get("run_id"),
@@ -293,8 +302,9 @@ def build(*, adapter, trial_dir: Path, atif_step: int | None, out: Path, mode: s
     spec = {"mode": mode, "sentinel": sentinel, "hint": hint if mode == "hint" else None,
             "upstream": "http://127.0.0.1:4013", "model": None, "pin_date": orig_date if pin_date else None,
             "resume_artifacts": dict(adapter.resume_artifacts)}
-    if mode == "hint" and wanted[:-1]:
-        spec["prior_hints"] = list(wanted[:-1])
+    carried_hints = list(wanted[:-1] if mode == "hint" else wanted)
+    if carried_hints:
+        spec["prior_hints"] = carried_hints  # both modes: the next round must know which hints this run carried
     if wanted:
         # Every hint the run carries must be in the request exactly once, in this order, and (anchor entries) right
         # after the tool result it originally followed: a lost, duplicated or moved hint fails closed.

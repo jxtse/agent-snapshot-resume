@@ -519,7 +519,7 @@ def rewrite(body, spec):
         if spec.get('require_sentinel'):
             raise ValueError('Required resume sentinel missing; refusing unverified continuation')
         acts.append("sentinel_not_found")
-        if spec.get("mode") == "hint" and spec.get("hint") and spec.get("persist_hint"):
+        if spec.get("persist_hint") and spec_hints(spec):
             body = reinject_after_compaction(body, spec, acts)
         return body, acts
     dropped = []

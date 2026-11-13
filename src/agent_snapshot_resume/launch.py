@@ -192,6 +192,38 @@ def validate_job_config(cfg: dict[str, Any]) -> None:
     JobConfig.model_validate(cfg)
 
 
+def launch_one(*, adapter, bundle: Path, task_dir: Path, job_name: str, jobs_dir: Path, runs_dir: Path,
+               snapshot_state: Path | None = None, snapshot_id: str | None = None, fake: bool = False,
+               verifier: bool = True, model: str | None = None, upstream_url: str | None = None,
+               extra_env: dict[str, str] | None = None, original_trial_dir: str | None = None,
+               passthrough_args: list[str] | None = None, parity_gate: str = "auto",
+               max_model_requests: int | None = None, freeze_first_request: str | None = None,
+               midrun_snapshot_every: float = 1200.0, midrun_snapshot_poll: float = 60.0) -> int:
+    """Write runs/<job>/job.json, start the mid-run snapshotter, run Harbor. Returns Harbor's exit code."""
+    cfg = build_job_config(adapter=adapter, bundle=bundle, task_dir=task_dir, job_name=job_name, jobs_dir=jobs_dir,
+                           snapshot_state=snapshot_state, snapshot_id=snapshot_id, fake=fake, verifier=verifier,
+                           model=model, upstream_url=upstream_url, extra_env=extra_env,
+                           original_trial_dir=original_trial_dir, passthrough_args=passthrough_args,
+                           parity_gate=parity_gate, max_model_requests=max_model_requests,
+                           freeze_first_request=freeze_first_request)
+    validate_job_config(cfg)
+    run_dir = Path(runs_dir) / job_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    path = run_dir / "job.json"
+    path.write_text(json.dumps(cfg, indent=1) + "\n")
+    snap = None
+    if midrun_snapshot_every and not fake:
+        snap = start_midrun_snapshotter(job_dir=Path(jobs_dir).resolve() / job_name, run_dir=run_dir.resolve(),
+                                        every_s=midrun_snapshot_every, poll_s=midrun_snapshot_poll)
+    try:
+        return run_harbor(path, fake)
+    finally:
+        if snap is not None:
+            snap.stop()
+            if snap.errors:
+                print(json.dumps({"midrun_snapshot_errors": snap.errors[-5:]}, ensure_ascii=False), file=sys.stderr)
+
+
 def start_midrun_snapshotter(*, job_dir: Path, run_dir: Path, every_s: float, poll_s: float):
     """Snapshot this job's live clones while it runs (see `agent_snapshot_resume.midrun`)."""
     from .midrun import MidrunSnapshotter

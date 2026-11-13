@@ -184,6 +184,64 @@ class ChainedBuild(unittest.TestCase):
                            hint=H2, prior_hints=prior)
         self.assertEqual(meta["n_hints"], 2)
 
+    def test_resume_attachments_are_not_inherited(self):
+        recs = self.fx["records"]
+        stripped, audit = chain.strip_scaffolding(recs, self.fx["spec1"]["sentinel"])
+        # continue turn + synthetic reply + sentinel + the resume-time environment attachment
+        self.assertEqual(audit[0]["types"], ["user", "assistant", "user", "attachment"])
+        self.assertEqual(len(audit[0]["removed_lines"]), 4)
+        self.assertFalse(any(r.get("type") == "attachment" and "environment" in json.dumps(r) for r in stripped))
+
+    def test_compacted_away_hint_is_refused_when_the_run_did_not_persist(self):
+        recs = [{"type": "user", "uuid": "u1", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_b1", "content": "x"}]}},
+                {"type": "system", "subtype": "compact_boundary", "uuid": "b1",
+                 "compactMetadata": {"preservedMessages": {"uuids": []}}},
+                {"type": "user", "uuid": "s1", "isCompactSummary": True,
+                 "message": {"role": "user", "content": "This session is being continued from a previous conversation"}}]
+        anchors = [{"tool_use_id": "toolu_b1"}]
+        with self.assertRaises(ValueError):
+            chain.materialize_hints(recs, [H1], anchors, len(recs), persistent=False)
+        out, audit = chain.materialize_hints(recs, [H1], anchors, len(recs), persistent=True)
+        self.assertEqual(audit[0]["where"], "compaction_summary")
+
+    def test_same_mode_chain_keeps_the_chain_metadata(self):
+        ir, steps = self._steps(self.fx["trial"])
+        bdir, meta = build(adapter=get_adapter("claude-code"), trial_dir=self.fx["trial"],
+                           atif_step=steps[-1]["atif_step_id"], out=self.out / "same", task_dir=TASK, mode="same")
+        spec = json.loads((bdir / "proxy_spec.json").read_text())
+        self.assertEqual(spec["mode"], "same")
+        self.assertEqual(spec["prior_hints"], [H1])
+        self.assertEqual(spec["required_hint_blocks"], [hint_block_text(H1)])
+        self.assertEqual(meta["n_hints"], 1)
+        # the hint is in the seed, so a compaction must re-apply it instead of losing it
+        seed = [json.loads(l) for l in (bdir / "session_trunc.jsonl").read_text().splitlines()]
+        body, acts = rewrite(simulate_resume_request(seed, spec["sentinel"]), spec)
+        self.assertNotIn("inject_hint", acts)  # same mode never injects, the seed carries it
+        texts = [b.get("text") for m in body["messages"] for b in (m["content"] if isinstance(m["content"], list)
+                                                                  else [])]
+        self.assertEqual(texts.count(hint_block_text(H1)), 1)
+
+    def test_base_snapshot_must_match_the_run(self):
+        import hashlib
+        ir, steps = self._steps(self.fx["trial"])
+        raw = Path(self.fx["session"]).read_text().splitlines()
+        good = {"snapshot_id": "s", "session_line": 5, "session_line_reliable": True,
+                "prefix_sha256": hashlib.sha256(("\n".join(raw[:5]) + "\n").encode()).hexdigest(),
+                "trial": self.fx["trial"].name}
+        chain.check_base_snapshot(good, trial=self.fx["trial"].name, session_id=None, raw_lines=raw)
+        for bad in ({"trial": "other__trial"},
+                    {"session_line_reliable": False},
+                    {"prefix_sha256": "0" * 64},
+                    {"prefix_sha256": None}):
+            with self.assertRaises(ValueError):
+                chain.check_base_snapshot({**good, **bad}, trial=self.fx["trial"].name, session_id=None,
+                                          raw_lines=raw)
+
+    def test_tail_split_boundary_and_no_line(self):
+        acts = [{"call_id": "a", "obs_line": 7}, {"call_id": "b", "obs_line": 8}, {"call_id": "c", "obs_line": None}]
+        self.assertEqual([a["call_id"] for a in chain.tail_actions(acts, 8)], ["b", "c"])
+
     def test_non_resumed_trial_refuses_prior_hints(self):
         with self.assertRaises(SystemExit):
             build(adapter=get_adapter("claude-code"), trial_dir=TRIAL, atif_step=4, out=self.out / "x", task_dir=TASK,
@@ -198,15 +256,22 @@ class ChainedBuild(unittest.TestCase):
         lines = [a["obs_line"] for a in plan["actions"]]
         self.assertTrue(all(l is not None for l in lines))
         self.assertGreater(len(plan["actions"]), 1)
+        import hashlib
+        raw = (self.fx["session"]).read_text().splitlines()
         base = {"snapshot_id": "snap-1", "session_line": lines[0], "ts": "2026-01-01T00:00:00Z",
+                "trial": self.fx["trial"].name, "session_id": meta["session_id"],
+                "session_line_reliable": True,
+                "prefix_sha256": hashlib.sha256(("\n".join(raw[:lines[0]]) + "\n").encode()).hexdigest(),
                 "record_path": "runs/x/midrun-snapshots.jsonl", "run_id": meta["run_id"]}
         tail, meta2 = build(adapter=get_adapter("claude-code"), trial_dir=self.fx["trial"],
                             atif_step=steps[-1]["atif_step_id"], out=self.out / "tail", task_dir=TASK, mode="hint",
                             hint=H2, base_snapshot=base)
         plan2 = json.loads((tail / "plan.json").read_text())
-        self.assertEqual(len(plan2["actions"]), len(plan["actions"]) - 1)  # the action observed at that line is in it
+        # the action observed at exactly session_line is NOT in the image (session_line is a count): it is replayed
+        self.assertEqual(len(plan2["actions"]), len(plan["actions"]))
         self.assertEqual(meta2["base_snapshot"]["snapshot_id"], "snap-1")
-        self.assertEqual(meta2["base_snapshot"]["n_actions_from_snapshot"], 1)
+        self.assertEqual(meta2["base_snapshot"]["n_actions_from_snapshot"],
+                         len(plan["actions"]) - len(plan2["actions"]))
         self.assertEqual(plan2["base_snapshot"], meta2["base_snapshot"])
 
     def test_base_snapshot_must_precede_the_cut(self):

@@ -93,10 +93,11 @@ def cmd_prepare_snapshot(a):
             if "ready" not in str(t.get("status")):
                 raise SystemExit(f"template not ready: {t.get('status')}")
             template = t["template_id"]
-        base = None
-        if not a.full_replay:
-            bmeta = json.loads((Path(a.bundle) / "bundle.json").read_text())
-            base = (bmeta.get("base_snapshot") or {}).get("snapshot_id")
+        bmeta = json.loads((Path(a.bundle) / "bundle.json").read_text())
+        base = (bmeta.get("base_snapshot") or {}).get("snapshot_id")
+        if base and a.full_replay:
+            raise SystemExit("this bundle's plan.json was trimmed to the post-snapshot tail: rebuild the bundle "
+                             "without --base-snapshot for a full replay")
         rec = source.prepare_source(adapter=_adapter(a.agent), task_dir=Path(a.task_dir), bundle=Path(a.bundle),
                                     template=template, tag=a.tag, state_dir=Path(a.state_dir), version=a.version,
                                     exec_cap=a.exec_cap, expected_fingerprint=a.expected_fingerprint,
@@ -119,40 +120,41 @@ def _kv(items):
 
 
 def cmd_launch(a):
-    from .launch import build_job_config, run_harbor, start_midrun_snapshotter, validate_job_config
+    from .launch import launch_one
 
     bundle = Path(a.bundle)
     meta = json.loads((bundle / "bundle.json").read_text())
     adapter = _adapter(meta.get("agent") or a.agent)
     job = a.job_name or f"asr-{meta['run_id']}{'-fake' if a.fake else ''}"
-    cfg = build_job_config(adapter=adapter, bundle=bundle, task_dir=Path(a.task_dir), job_name=job,
-                           jobs_dir=Path(a.jobs_dir), snapshot_state=Path(a.snapshot_state) if a.snapshot_state else None,
-                           snapshot_id=a.snapshot_id, fake=a.fake, verifier=not a.no_verifier, model=a.model,
-                           upstream_url=a.upstream_url, extra_env=_kv(a.agent_env),
-                           original_trial_dir=a.original_trial_dir or meta.get("trial_dir"),
-                           passthrough_args=shlex.split(a.passthrough_args) if a.passthrough_args else None,
-                           parity_gate=a.parity_gate, max_model_requests=a.max_model_requests,
-                           freeze_first_request=a.freeze_first_request)
-    validate_job_config(cfg)
-    runs = Path(a.runs_dir) / job
-    runs.mkdir(parents=True, exist_ok=True)
-    path = runs / "job.json"
-    path.write_text(json.dumps(cfg, indent=1) + "\n")
     if a.dry_run:
+        from .launch import build_job_config, validate_job_config
+        cfg = build_job_config(adapter=adapter, bundle=bundle, task_dir=Path(a.task_dir), job_name=job,
+                              jobs_dir=Path(a.jobs_dir),
+                              snapshot_state=Path(a.snapshot_state) if a.snapshot_state else None,
+                              snapshot_id=a.snapshot_id, fake=a.fake, verifier=not a.no_verifier, model=a.model,
+                              upstream_url=a.upstream_url, extra_env=_kv(a.agent_env),
+                              original_trial_dir=a.original_trial_dir or meta.get("trial_dir"),
+                              passthrough_args=shlex.split(a.passthrough_args) if a.passthrough_args else None,
+                              parity_gate=a.parity_gate, max_model_requests=a.max_model_requests,
+                              freeze_first_request=a.freeze_first_request)
+        validate_job_config(cfg)
+        runs = Path(a.runs_dir) / job
+        runs.mkdir(parents=True, exist_ok=True)
+        path = runs / "job.json"
+        path.write_text(json.dumps(cfg, indent=1) + "\n")
         print(path)
         print(json.dumps(cfg, indent=1))
         return 0
-    snap = None
-    if a.midrun_snapshot_every and not a.fake:
-        snap = start_midrun_snapshotter(job_dir=Path(a.jobs_dir).resolve() / job, run_dir=runs.resolve(),
-                                        every_s=a.midrun_snapshot_every, poll_s=a.midrun_snapshot_poll)
-    try:
-        return run_harbor(path, a.fake)
-    finally:
-        if snap is not None:
-            snap.stop()
-            if snap.errors:
-                print(json.dumps({"midrun_snapshot_errors": snap.errors[-5:]}, ensure_ascii=False), file=sys.stderr)
+    return launch_one(adapter=adapter, bundle=bundle, task_dir=Path(a.task_dir), job_name=job,
+                      jobs_dir=Path(a.jobs_dir), runs_dir=Path(a.runs_dir),
+                      snapshot_state=Path(a.snapshot_state) if a.snapshot_state else None,
+                      snapshot_id=a.snapshot_id, fake=a.fake, verifier=not a.no_verifier, model=a.model,
+                      upstream_url=a.upstream_url, extra_env=_kv(a.agent_env),
+                      original_trial_dir=a.original_trial_dir or meta.get("trial_dir"),
+                      passthrough_args=shlex.split(a.passthrough_args) if a.passthrough_args else None,
+                      parity_gate=a.parity_gate, max_model_requests=a.max_model_requests,
+                      freeze_first_request=a.freeze_first_request,
+                      midrun_snapshot_every=a.midrun_snapshot_every, midrun_snapshot_poll=a.midrun_snapshot_poll)
 
 
 def cmd_snapshot_midrun(a):
@@ -170,6 +172,47 @@ def cmd_snapshot_midrun(a):
         return 0
     snap.run()
     return 0
+
+
+def cmd_batch(a):
+    from .batch import Batch, print_status
+
+    work = Path(a.work_dir).resolve()
+    b = Batch(name=a.name, work_dir=work, manifest=Path(a.manifest),
+              tasks_dir=Path(a.tasks_dir) if a.tasks_dir else work / "tasks",
+              jobs_dir=Path(a.jobs_dir) if a.jobs_dir else work / "jobs",
+              runs_dir=Path(a.runs_dir) if a.runs_dir else work / "runs",
+              state_dir=Path(a.state_dir) if a.state_dir else work / "state",
+              agent_env=_kv(a.agent_env),
+              passthrough_args=shlex.split(a.passthrough_args) if a.passthrough_args else None,
+              model=a.model, upstream_url=a.upstream_url, hinted_reps=a.hinted_reps,
+              control_reps=a.control_reps, midrun_snapshot_every=a.midrun_snapshot_every,
+              cut_window=a.cut_window, prep_concurrency=a.prep_concurrency,
+              launch_concurrency=a.launch_concurrency, only=a.only.split(",") if a.only else None,
+              agent=a.agent, verifier=not a.no_verifier)
+    if a.mode == "status":
+        rows = b.status()
+        if a.json:
+            print(json.dumps(rows, indent=1, ensure_ascii=False))
+        else:
+            print_status(rows)
+            done = sum(1 for r in rows if r["state"] == "done")
+            running = sum(1 for r in rows if r["state"] == "running")
+            print(f"\n{len(rows)} runs: {done} done, {running} running, "
+                  f"{len({r['task'] for r in rows})} tasks")
+        return 0
+    if not a.manifest:
+        raise SystemExit("--manifest is required for run/prep/launch")
+    if a.mode == "prep":
+        res = b.run(do_launch=False)
+    elif a.mode == "launch":
+        res = b.run(do_launch=True)
+    else:
+        res = b.run(do_launch=True)
+    print(json.dumps({"prepared": len(res["prepared"]), "failed": res["failed"],
+                      "launched": len(res["launched"]), "launch_failed": res["launch_failed"]},
+                     ensure_ascii=False, indent=1))
+    return 0 if not res["failed"] and not res["launch_failed"] else 1
 
 
 def cmd_equiv(a):
@@ -352,6 +395,36 @@ def build_parser():
     p.add_argument("--poll-s", type=float, default=60.0)
     p.add_argument("--once", action="store_true", help="one pass, then exit")
     p.set_defaults(fn=cmd_snapshot_midrun)
+
+    p = sub.add_parser("batch", help="manifest-driven batch: screen -> bundles -> template -> snapshot -> fake -> "
+                                     "real launches (idempotent, resumable)")
+    p.add_argument("mode", choices=["run", "prep", "launch", "status"],
+                   help="run = prepare and launch, prep = stop before the real launches, launch = launch what is "
+                        "prepared, status = table of every run")
+    p.add_argument("--name", required=True, help="batch name (state lives in <work-dir>/batch/<name>/)")
+    p.add_argument("--manifest", help="CSV: task,cut_line,hint_path,... (default: round1/manifest.csv columns)")
+    p.add_argument("--work-dir", default=".", help="base for jobs/runs/state/tasks and batch/<name>/")
+    p.add_argument("--tasks-dir", help="Harbor task dirs (default <work-dir>/tasks)")
+    p.add_argument("--jobs-dir", help="Harbor jobs dir (default <work-dir>/jobs)")
+    p.add_argument("--runs-dir", help="job.json + midrun-snapshots (default <work-dir>/runs)")
+    p.add_argument("--state-dir", help="template/snapshot state (default <work-dir>/state)")
+    p.add_argument("--agent", default="claude-code")
+    p.add_argument("--model")
+    p.add_argument("--upstream-url", help="default: ASR_UPSTREAM_URL")
+    p.add_argument("--agent-env", action="append", metavar="KEY=VALUE")
+    p.add_argument("--passthrough-args", help="in-sandbox passthrough proxy flags for every run")
+    p.add_argument("--hinted-reps", type=int, default=2)
+    p.add_argument("--control-reps", type=int, default=1)
+    p.add_argument("--midrun-snapshot-every", type=float, default=1200.0,
+                   help="mid-run snapshots for the hinted runs (0 disables; controls never snapshot)")
+    p.add_argument("--cut-window", type=int, default=24,
+                   help="when a cut blocks the replay screen, try cuts up to this many lines away")
+    p.add_argument("--prep-concurrency", type=int, default=6)
+    p.add_argument("--launch-concurrency", type=int, default=20)
+    p.add_argument("--only", help="comma-separated task names")
+    p.add_argument("--no-verifier", action="store_true")
+    p.add_argument("--json", action="store_true", help="status: machine-readable")
+    p.set_defaults(fn=cmd_batch)
 
     p = sub.add_parser("equiv", help="context-equivalence check of a rewritten first request")
     equiv_parser(p)

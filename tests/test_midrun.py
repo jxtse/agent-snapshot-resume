@@ -39,25 +39,43 @@ class FakeSandbox:
         return Snap()
 
 
-def probe(lines, compactions=0, ts=None, ticks=None):
+def probe(lines, compactions=0, ts=None, ticks=None, pending_tools=0):
     return {"sessions": [{"path": "/logs/agent/resume/sessions/projects/-app/s.jsonl", "lines": lines,
-                          "compactions": compactions, "bytes": 10, "ts": ts or []}],
+                          "compactions": compactions, "bytes": 10, "ts": ts or [],
+                          "pending_tools": pending_tools}],
             "ticks": ticks or []}
+
+
+T0 = midrun.parse_ts("2026-01-01T00:00:00.000Z")
+
+
+def ticks(*epochs):
+    """Ticker values as the guest writes them: (monotonic, epoch)."""
+    return [(e - T0, e) for e in epochs]
 
 
 class PauseWindow(unittest.TestCase):
     def test_gap_between_last_tick_before_and_first_after(self):
-        self.assertEqual(midrun.pause_window([1.0, 1.05, 1.1], [1.95, 2.0]), (1.1, 1.95))
-        self.assertIsNone(midrun.pause_window([1.0], [1.05]))  # not a suspension
-        self.assertIsNone(midrun.pause_window([], [1.0]))
+        # the guest clock is what matters: the pause is measured on the epoch part
+        self.assertEqual(midrun.pause_window(ticks(T0 + 1.0, T0 + 1.05, T0 + 1.1), ticks(T0 + 1.95, T0 + 2.0)),
+                         (T0 + 1.1, T0 + 2.0))
+        self.assertIsNone(midrun.pause_window(ticks(T0 + 1.0), ticks(T0 + 1.05)))  # not a suspension
+        self.assertIsNone(midrun.pause_window([], ticks(T0 + 1.0)))
 
     def test_session_line_is_the_state_at_the_pause(self):
         ts = ["2026-01-01T00:00:00.000Z"] * 5 + ["2026-01-01T00:10:00.000Z"] * 3
         # five lines written before the pause; the three written after it are not in the image
         pause = (midrun.parse_ts("2026-01-01T00:05:00.000Z"), midrun.parse_ts("2026-01-01T00:09:00.000Z"))
-        line, path = midrun.session_line_at(probe(8, ts=ts), pause)
-        self.assertEqual(line, 5)
+        line, path, reliable = midrun.session_line_at(probe(8, ts=ts), pause)
+        self.assertEqual((line, reliable), (5, True))
         self.assertTrue(path.endswith(".jsonl"))
+
+    def test_unmeasurable_pause_is_flagged_unreliable(self):
+        ts = ["2026-01-01T00:00:00.000Z"] * 8
+        line, _path, reliable = midrun.session_line_at(probe(8, ts=ts), None)
+        self.assertFalse(reliable)
+        line, _path, reliable = midrun.session_line_at(probe(8, ts=ts, ticks=ticks(1.0)), None)
+        self.assertFalse(reliable)
 
 
 class TickLoop(unittest.TestCase):
@@ -78,15 +96,16 @@ class TickLoop(unittest.TestCase):
                                         connect=lambda sid: sandbox)
 
     def test_periodic_start_and_compaction_triggers(self):
+        ts20 = ["2026-01-01T00:00:00.000Z"] * 20
         sbx = FakeSandbox([
             # one tick = probe (state), then a snapshot = probe before + probe after
-            probe(20, compactions=0, ticks=[1.0]),
-            probe(20, compactions=0, ticks=[1.0]),
-            probe(20, compactions=0, ticks=[1.05]),
-            probe(20, compactions=1, ticks=[10.0]),   # the agent compacted between polls
-            probe(20, compactions=1, ticks=[10.0]),
-            probe(20, compactions=1, ticks=[10.8]),
-            probe(20, compactions=1, ticks=[20.0]),
+            probe(20, 0, ts=ts20, ticks=ticks(T0 + 1.0)),
+            probe(20, 0, ts=ts20, ticks=ticks(T0 + 1.0)),
+            probe(20, 0, ts=ts20, ticks=ticks(T0 + 1.05, T0 + 2.0)),
+            probe(20, 1, ts=ts20, ticks=ticks(T0 + 10.0)),   # the agent compacted between polls
+            probe(20, 1, ts=ts20, ticks=ticks(T0 + 10.0)),
+            probe(20, 1, ts=ts20, ticks=ticks(T0 + 10.9, T0 + 11.7)),
+            probe(20, 1, ts=ts20, ticks=ticks(T0 + 20.0)),
         ])
         snap = self.snapshotter(sbx)
         self.assertEqual(snap.tick(), 1)
@@ -101,8 +120,11 @@ class TickLoop(unittest.TestCase):
             self.assertIn(key, recs[0])
 
     def test_periodic_trigger_after_interval(self):
-        sbx = FakeSandbox([probe(10, ticks=[1.0]), probe(10, ticks=[1.0]), probe(10, ticks=[1.1]),
-                           probe(10, ticks=[2.0]), probe(10, ticks=[2.0]), probe(10, ticks=[2.1])])
+        ts = ["2026-01-01T00:00:00.000Z"] * 10
+        sbx = FakeSandbox([probe(10, ts=ts, ticks=ticks(T0 + 1.0)), probe(10, ts=ts, ticks=ticks(T0 + 1.0)),
+                           probe(10, ts=ts, ticks=ticks(T0 + 1.05, T0 + 2.0)),
+                           probe(10, ts=ts, ticks=ticks(T0 + 2.0)), probe(10, ts=ts, ticks=ticks(T0 + 2.0)),
+                           probe(10, ts=ts, ticks=ticks(T0 + 2.05, T0 + 3.0))])
         snap = self.snapshotter(sbx)
         snap.tick()
         snap.state["sbx-1"]["last_t"] -= 601
@@ -114,7 +136,7 @@ class TickLoop(unittest.TestCase):
             def create_snapshot(self, request_timeout=300):
                 raise RuntimeError("HTTP 500")
 
-        sbx = Boom([probe(10, ticks=[1.0]), probe(10, ticks=[1.1])])
+        sbx = Boom([probe(10, ticks=ticks(T0 + 1.0)), probe(10, ticks=ticks(T0 + 1.1))])
         snap = self.snapshotter(sbx)
         self.assertEqual(snap.tick(), 0)
         self.assertTrue(snap.errors and "HTTP 500" in snap.errors[0])
