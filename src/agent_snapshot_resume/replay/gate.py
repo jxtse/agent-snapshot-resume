@@ -329,9 +329,22 @@ def automatic_equivalence(action, result):
         # sorted by a time column (-s cumtime/tottime/time): rows with near-equal times may swap; the same rows
         # (function identities and call counts, the deterministic part) in another order
         if (re.search(r"-s\s+(?:cumtime|cumulative|tottime|time)\b|sort_stats\(\s*['\"](?:cumtime|cumulative|tottime|time)",
-                      command)
-                and any(row.fullmatch(l) for l in old) and sorted(map(key, old)) == sorted(map(key, new))):
-            return "cprofile_time_sorted_rows_only"
+                      command) and any(row.fullmatch(l) for l in old)):
+            # only rows inside one contiguous profile table may reorder; everything else keeps its order and place
+            def segments(ls):
+                out, cur = [], None
+                for l in ls:
+                    if row.fullmatch(l):
+                        if cur is None:
+                            cur = []
+                            out.append(("rows", cur))
+                        cur.append(key(l))
+                    else:
+                        cur = None
+                        out.append(("line", key(l)))
+                return [(t, sorted(v) if t == "rows" else v) for t, v in out]
+            if segments(old) == segments(new):
+                return "cprofile_time_sorted_rows_only"
     if len(old) == len(new) and old != new and all(line_equivalent(x, y, command, result)
                                                      for x, y in zip(old, new)):
         return "evidence_bound_volatile"
@@ -364,8 +377,17 @@ def validate_replay(plan, report, rc, reviewed_exceptions=None):
         if a.get('side_effect') != 'exec' or not o_txt or o_txt == '(Bash completed with no output)':
             continue
         for bf in bg_files:
-            if _re.search(r"\b(?:cat|head|tail|sed|grep|egrep|awk)\b[^|;&]*" + _re.escape(bf), f_cmd):
-                content_reads.setdefault(bf, set()).add(a['call_id'])
+            # content-printing reads only: cat/head/tail of the file, or grep/sed/awk without filename, count or
+            # quiet modes (-l -L -c -q --files-with-matches --count --quiet -n for sed)
+            m = _re.search(r"\b(cat|head|tail|sed|grep|egrep|awk)\b([^|;&]*)" + _re.escape(bf), f_cmd)
+            if not m:
+                continue
+            tool, opts = m.group(1), m.group(2)
+            if tool in ('grep', 'egrep') and _re.search(r"(?:^|\s)-\w*[lLcqo]|--(?:files-with|files-without|count|quiet|silent|only-matching)", opts):
+                continue
+            if tool == 'sed' and _re.search(r"(?:^|\s)-\w*n", opts) and not _re.search(r"\d+,\d+p|\bp\b", opts):
+                continue
+            content_reads.setdefault(bf, set()).add(a['call_id'])
     # background output files written by a command that uses the shell `time` keyword: a later read of such a file
     # shows that command's timing report (provenance from the plan, not from the reading command)
     time_files = []

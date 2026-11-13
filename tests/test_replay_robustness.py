@@ -310,6 +310,10 @@ class CProfileSorted(unittest.TestCase):
         n = "\n".join([hdr.format("38.974")] + rows[::-1]) + "\n"
         self.assertTrue(passes(*one("python3 -m cProfile -s cumtime s.py | head", o, n)))
         self.assertFalse(passes(*one("python3 -m cProfile s.py | head", o, n)), "not time-sorted")
+        # program output around the table keeps its order
+        o3 = "case_A 1\ncase_B 2\n" + o
+        n3 = "case_B 2\ncase_A 1\n" + n
+        self.assertFalse(passes(*one("python3 -m cProfile -s cumtime s.py | head", o3, n3)), "stdout reordered")
         n2 = n.replace("37345", "37346")
         self.assertFalse(passes(*one("python3 -m cProfile -s cumtime s.py | head", o, n2)), "call count changed")
 
@@ -349,7 +353,9 @@ class FailedBackgroundEvidence(unittest.TestCase):
         self.assertTrue(passes({"actions": [a, rd]}, {"results": [r, good]}))
         other = dict(good, fidelity="differs", stdout_full="Traceback: ModuleNotFoundError\n")
         self.assertFalse(passes({"actions": [a, rd]}, {"results": [r, other]}), "failed for another reason")
-        for probe in ("ls -la /tmp/t.output", "test -f /tmp/t.output && echo yes", "stat /tmp/t.output"):
+        for probe in ("ls -la /tmp/t.output", "test -f /tmp/t.output && echo yes", "stat /tmp/t.output",
+                      "grep -l Error /tmp/t.output", "grep -c Error /tmp/t.output", "grep -q Error /tmp/t.output",
+                      "grep --count Error /tmp/t.output"):
             ls = dict(rd, args={"command": probe}, orig_text="-rw-r--r-- 1 root root 9 /tmp/t.output")
             res = dict(good, stdout_full="-rw-r--r-- 1 root root 9 /tmp/t.output\n")
             self.assertFalse(passes({"actions": [a, ls]}, {"results": [r, res]}), probe)
