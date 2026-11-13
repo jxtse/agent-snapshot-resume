@@ -44,103 +44,8 @@ WRITES = re.compile(r"open\([^)]*['\"][wax]b?\+?['\"]|\.to_(?:csv|parquet|pickle
 # `ls -l` row: (permissions links owner group size) (date) (name, kept exactly)
 LS_ROW = re.compile(r"^([-dlcbps][-rwxsStT]{9}[.+@]?\s+\d+\s+\S+\s+\S+\s+[\d,]+)\s+"
                     r"([A-Z][a-z]{2}\s+\d{1,2}\s+(?:\d{2}:\d{2}|\d{4}))\s(.+)$")
-TIME_REPORT = re.compile(r"^(?:real|user|sys)\s+(?:\d+m\d+(?:\.\d+)?s|\d+(?:\.\d+)?)$")
 
 
-DURATION = re.compile(r"(\d+(?:\.\d+)?)(\s?)(s|ms|sec|secs|seconds)\b")
-
-
-def _timing_context(command, result):
-    """The command's own code (inline, or a script it runs) measures wall time. The shell `time` keyword is not a
-    timing context for printed lines: its report is handled separately (shell_time_report_only)."""
-    return bool(re.search(TIMING_CALL, command) or result.get("scripts_measure_time"))
-
-
-def _is_measurement(before, after):
-    """Context of a duration value (number[+unit]) that shows it was measured, not configured: directly after a
-    timing label (`took 0.13s`, `elapsed: 4`), in parentheses (`(0.07s)`), after `OK`, or at the end of a
-    `<several words>: <duration>` line (`niter 6 dt_g None: 0.129s`). `key: 10 s`, `key=60s`, `timeout60s` are data."""
-    return bool(re.search(TIMING_BEFORE, before)
-                or (re.search(r"\(\s*$", before) and re.match(r"\s*\)", after))
-                or re.search(r"\bOK\s+$", before)
-                or (re.search(r"\S\s+\S[^=]*:\s*$", before) and re.fullmatch(r"\s*(?:s|ms|sec|secs|seconds)?\s*", after)))
-
-
-def _durations_close(a, b):
-    """Same line except measured durations that differ by at most 50% (run-to-run jitter). A differing duration
-    counts as a measurement only in a measurement form: directly after a timing label (`took 0.13s`, `time: 4 s`),
-    in parentheses (`(0.07s)`), after `OK`, or as a `<label>: <duration>` line end (`niter 6 dt_g None: 0.129s`)
-    where the label is not a key (no `=`, and the line is not `key: value` with a single identifier key).
-    Configuration-like values (`retry_interval=60s`, `exposure: 10 s`, `timeout60s`) are data."""
-    if DURATION.sub("<D>", a) != DURATION.sub("<D>", b):
-        return False
-    for x, y in zip(DURATION.finditer(a), DURATION.finditer(b)):
-        if x.group() == y.group():
-            continue
-        if not _is_measurement(a[:x.start()], a[x.end():]):
-            return False
-        u, v = float(x.group(1)), float(y.group(1))
-        if x.group(3) != y.group(3) or abs(u - v) > max(0.5 * max(u, v), 0.05):
-            return False
-    return True
-
-
-def _created_during_run(ls_date, run_start):
-    """The original `ls -l` date of a row is at or after the original run's first action (UTC; the task image's
-    clock), i.e. the agent created or modified that file during the run, so the replay necessarily re-created it at
-    a new time. Task inputs (older mtimes, or the `Mon DD YYYY` form) must keep their date. Unknown -> False."""
-    import datetime as dt
-    if not run_start:
-        return False
-    m = re.fullmatch(r"([A-Z][a-z]{2})\s+(\d{1,2})\s+(\d{2}):(\d{2})", ls_date.strip())
-    if not m:
-        return False
-    try:
-        t0 = dt.datetime.fromisoformat(run_start.replace("Z", "+00:00")).replace(tzinfo=None)
-        mon = dt.datetime.strptime(m.group(1), "%b").month
-        cand = dt.datetime(t0.year, mon, int(m.group(2)), int(m.group(3)), int(m.group(4)))
-    except ValueError:
-        return False
-    if cand > t0 + dt.timedelta(days=200):  # ls shows the year only for old files: Dec listing in a Jan run
-        cand = cand.replace(year=t0.year - 1)
-    return cand >= t0 - dt.timedelta(minutes=1)  # minute resolution
-
-
-def line_equivalent(a, b, command, result):
-    """One output line vs its replay, with only evidence-bound differences: an `ls -l` row whose date column alone
-    differs (command runs ls -l; name exact), or durations in a timing context within jitter."""
-    if a == b:
-        return True
-    if re.search(r"\bls\s+-\w*l", command):
-        ma, mb = LS_ROW.match(a), LS_ROW.match(b)
-        if (ma and mb and ma.group(1).split() == mb.group(1).split() and ma.group(3) == mb.group(3)
-                and _created_during_run(ma.group(2), result.get("_run_start"))
-                and _created_during_run(mb.group(2), result.get("_run_start"))):
-            return True
-    return _timing_context(command, result) and _durations_close(a, b)
-
-
-TIMING_BEFORE = r"(?i)\b(?:time|timing|elapsed|took|duration|runtime|wall(?:time)?|wall[ -]clock)\s*[:=]?\s*$"
-TIMING_AFTER = r"(?i)^\s*(?:s|sec|secs|seconds|ms|min|minutes)\b"
-
-
-def _only_timing_numbers_differ(a, b):
-    """Same line with every differing number directly labelled as a duration ("time 0.85", "took 3.2 s")."""
-    import re
-    num = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
-    ma, mb = list(num.finditer(a)), list(num.finditer(b))
-    if len(ma) != len(mb) or num.sub("#", a) != num.sub("#", b):
-        return False
-    for x, y in zip(ma, mb):
-        if x.group() == y.group():
-            continue
-        if not _is_measurement(a[:x.start()], a[x.end():]):
-            return False
-        u, v = abs(float(x.group())), abs(float(y.group()))
-        if abs(u - v) > max(0.5 * max(u, v), 0.05):  # run-to-run jitter only
-            return False
-    return True
-SHELL_TIME = r"(?:^|[;&|({]\s*)time\s|\bTIMEFORMAT=|/usr/bin/time\b"
 TIMING_CALL = r"time\.time\(|perf_counter|time\.monotonic|process_time|timeit|datetime\.now\("
 
 
@@ -173,36 +78,6 @@ def _heredoc_split(command):
     return "".join(shell), "\n".join(bodies)
 
 
-def _shell_part(command):
-    s = _heredoc_split(command)[0]
-    return s.replace("2>&1", "").replace(">/dev/null", "").replace("> /dev/null", "").replace("2>/dev/null", "")
-
-
-def _heredoc_part(command):
-    return _heredoc_split(command)[1]
-
-
-def _final_stage_is_grep(command):
-    """The command's exit status is that of a final plain pipeline ending in grep/rg/egrep, so status 1 can only
-    mean "no match". Shell text (heredoc bodies excluded) is split at newlines and `;` (the last command always runs
-    and alone sets the status); that last command must be `a | b | grep ...` with no `&&`, `||`, `&` (a failing
-    left side could return 1 itself), no stderr redirection (a failing earlier stage must show on stderr), no
-    subshell/substitution/braces; `pipefail` anywhere disqualifies. Anything else is ambiguous."""
-    sh = _heredoc_split(command)[0]
-    # errexit (set -e / -o errexit / bash -e) can stop before the grep runs, with the same output
-    if ("pipefail" in sh or "errexit" in sh or re.search(r"`|\$\(|\bset\s+-\w*e|\bbash\s+-\w*e", sh)
-            or re.search(r"\bexit\b|\breturn\b|\btrap\b", sh)):
-        return False
-    final = [seg.strip() for seg in re.split(r"[\n;]", sh) if seg.strip()]
-    if not final:
-        return False
-    last = final[-1]
-    if re.search(r"[(){}]|&&|\|\||&|2>", last):
-        return False
-    stages = last.split("|")
-    return len(stages) >= 2 and bool(re.match(r"(?:grep|egrep|rg)\s", stages[-1].strip()))
-
-
 def _stderr_placement_equal(action, result, f):
     """The original text equals the replay's stdout IN ORDER once the replay's stderr lines are taken out of it
     (Claude Code interleaves stderr differently from `stdout + stderr`), with every line mapped through f."""
@@ -227,55 +102,22 @@ def _stderr_placement_equal(action, result, f):
 
 def automatic_equivalence(action, result):
     """Generic, review-free acceptance classes for replay outputs that differ only in ways that cannot reflect a
-    different task state. Returns a reason string or None. Each class is narrow and checked on the full output:
-      cc_grep_no_match      the command's last command (after the last newline/`;`) is a plain pipeline ending in
-                            grep/rg (_final_stage_is_grep: no `&&`, `||`, `&`, stderr redirection, subshell; no
-                            pipefail, errexit, exit/return/trap), replay rc=1 (no match), the original was not an error (CC renders that case as
-                            success), the full stdout is identical; no stderr.
+    different task state. Returns a reason string or None. Deliberately minimal; everything else (timings, profiler
+    order, grep exit codes, mtimes, listing order, failed background tasks) needs a command-bound reviewed
+    exception (validate_replay) or fails closed:
       ls_dot_entries_only   `ls -l*` listings whose only difference is the `.`/`..` rows and `total` block counts
                             (some sandbox filesystems omit them); every other row identical up to metadata-column
                             padding, file names exact.
-      evidence_bound_volatile
-                            line by line, in order, every differing line is an `ls -l` row whose date column alone
-                            differs and whose original date is at/after the original run's first action (a file the
-                            run created; command runs ls -l, file name exact), or, in a timing context (the command's
-                            code or a script it runs measures time), the same line with durations in a measurement
-                            form (_durations_close) within 50% of each other. No other masking.
       shell_diagnostic_prefix_only
                             bash's own error prefix differs (`/bin/bash: eval: line 18:` vs `bash: -c: line 9:`);
                             the original equals the replay's stdout in order once the replay's stderr lines are
                             taken out (stderr placement is the only other freedom).
-      shell_time_report_only
-                            the command uses the shell `time` keyword (TIMEFORMAT) or /usr/bin/time, or reads the
-                            output file of an earlier background command that does (provenance from the plan);
-                            after removing
-                            the timing report lines and blank lines the output is equal line by line in order
-                            (line_equivalent, as for evidence_bound_volatile).
-      ls_mtime_and_stderr_placement_only
-                            the command runs `ls -l`; only the date column of rows in ls -l format differs, for rows
-                            whose original date is at/after the original run's first action (files the run created
-                            and the replay re-created), plus the stderr placement freedom above; stdout order kept.
-      cprofile_time_sorted_rows_only
-                            as cprofile_timings_only, for profiles sorted by a time column: the same rows (function
-                            identity + call counts) and header, in an order that may differ where times are close.
-      cprofile_timings_only a cProfile/pstats table (possibly truncated by head) with identical rows: call counts and
-                            function identities in the same order; only the four timing columns and the header's
-                            total seconds differ. All non-table lines identical.
-      timing_lines_only     the command measures wall time (time.time()/perf_counter/...), the exit outcome is the
-                            same, and every differing number sits directly after a duration label ("time", "took",
-                            "elapsed", ...) or before a time unit ("s", "ms", ...) and is within run-to-run jitter
-                            (50%); everything else byte-identical after whitespace normalisation.
     """
     import re
     from .replay_inside import norm
     if result.get("status") != "ran" or result.get("timeout"):
         return None
     command = (action.get("args") or {}).get("command", "")
-    # Claude Code reports a command whose last pipeline stage is grep/rg returning 1 (no match) as a non-error.
-    if (result.get("rc") == 1 and not action.get("is_error") and _final_stage_is_grep(command)
-            and not result.get("stderr_full")
-            and norm(action.get("orig_text") or "") == norm(result.get("stdout_full", ""))):
-        return "cc_grep_no_match"
     if bool(result.get("rc")) != bool(action.get("is_error")):
         return None
     old = norm(action.get("orig_text") or "").splitlines()
@@ -294,65 +136,14 @@ def automatic_equivalence(action, result):
     if any(diag.match(l) for l in old + new) and _stderr_placement_equal(
             action, result, lambda l: diag.sub("bash: line <n>: ", l)):
         return "shell_diagnostic_prefix_only"
-    # `time cmd` / TIMEFORMAT / /usr/bin/time reports go to stderr, which Claude Code interleaves differently
-    if re.search(SHELL_TIME, command, re.M) or result.get("_reads_time_report"):
-        tfmt = re.search(r"TIMEFORMAT=['\"]?([^'\";]*)", command)
-        rep = [re.compile(r"^(?:real|user|sys)\s+\d+m\d+(?:\.\d+)?s$|^(?:real|user|sys)\s+\d+(?:\.\d+)?$")]
-        if tfmt:
-            pat = re.escape(tfmt.group(1).strip())
-            pat = re.sub(r"%\\?\d?l?[RUSP]", r"\\d+(?:\\.\\d+)?", pat.replace("\\%", "%"))
-            rep.append(re.compile("^" + pat + "$"))
-        drop = lambda ls: [l for l in ls if l.strip() and not any(r.match(l.strip()) for r in rep)]
-        n_rep = sum(1 for l in old + new if l.strip() and any(r.match(l.strip()) for r in rep))
-        d_old, d_new = drop(old), drop(new)
-        if n_rep and len(d_old) == len(d_new) and all(line_equivalent(x, y, command, result)
-                                                       for x, y in zip(d_old, d_new)):
-            return "shell_time_report_only"
-    # `ls -l` rows of files the command itself (re)created carry the replay's mtime: mask only the date column of
-    # rows in ls -l format, in commands that run ls -l, combined with stderr placement
-    if re.search(r"\bls\s+-\w*l", command):
-        def mask(l):
-            # only dates at/after the original run's start: rows of files the run created (both sides; the replay's
-            # own dates are later still). An input file whose date changed stays unmasked on the original side.
-            m = LS_ROW.match(l)
-            return (LS_ROW.sub(r"\1 <MTIME> \3", l)
-                    if m and _created_during_run(m.group(2), result.get("_run_start")) else l)
-        if (_stderr_placement_equal(action, result, mask)
-                and not _stderr_placement_equal(action, result, None)):
-            return "ls_mtime_and_stderr_placement_only"
-    if re.search(r"\bcProfile\b|\bprofile\.run\(|pstats", command) and len(old) == len(new):
-        row = re.compile(r"\s*(\d+(?:/\d+)?)\s+(?:\d+\.\d+\s+){4}(.+)")
-        hdr = re.compile(r"(\s*\d+ function calls(?: \(\d+ primitive calls\))? in )\d+(?:\.\d+)?( seconds)")
-        key = lambda l: (row.fullmatch(l).groups() if row.fullmatch(l) else ("", hdr.sub(r"\1<t>\2", l)))
-        if any(row.fullmatch(l) for l in old) and [key(l) for l in old] == [key(l) for l in new]:
-            return "cprofile_timings_only"
-        # sorted by a time column (-s cumtime/tottime/time): rows with near-equal times may swap; the same rows
-        # (function identities and call counts, the deterministic part) in another order
-        if (re.search(r"-s\s+(?:cumtime|cumulative|tottime|time)\b|sort_stats\(\s*['\"](?:cumtime|cumulative|tottime|time)",
-                      command) and any(row.fullmatch(l) for l in old)):
-            # only rows inside one contiguous profile table may reorder; everything else keeps its order and place
-            def segments(ls):
-                out, cur = [], None
-                for l in ls:
-                    if row.fullmatch(l):
-                        if cur is None:
-                            cur = []
-                            out.append(("rows", cur))
-                        cur.append(key(l))
-                    else:
-                        cur = None
-                        out.append(("line", key(l)))
-                return [(t, sorted(v) if t == "rows" else v) for t, v in out]
-            if segments(old) == segments(new):
-                return "cprofile_time_sorted_rows_only"
-    if len(old) == len(new) and old != new and all(line_equivalent(x, y, command, result)
-                                                     for x, y in zip(old, new)):
-        return "evidence_bound_volatile"
-    if re.search(TIMING_CALL, command) and len(old) == len(new):
-        diff = [(a, b) for a, b in zip(old, new) if a != b]
-        if diff and all(_only_timing_numbers_differ(a, b) for a, b in diff):
-            return "timing_lines_only"
     return None
+
+
+def replay_output_sha256(result):
+    """Identity of one replayed command's observable outcome (for reviewed_replay_output exceptions)."""
+    import hashlib
+    data = "\0".join([result.get("stdout_full") or "", result.get("stderr_full") or "", str(result.get("rc"))])
+    return hashlib.sha256(data.encode()).hexdigest()
 
 
 def validate_replay(plan, report, rc, reviewed_exceptions=None):
@@ -366,39 +157,8 @@ def validate_replay(plan, report, rc, reviewed_exceptions=None):
     order_maps = {'same_lines_reordered': None, 'line_alignment_and_order_only': lambda l: l.strip()}
     import re as _re
     run_start = (plan.get('actions') or [{}])[0].get('timestamp')  # original run's first action (UTC)
-    # content reads of each background output file in this plan: a Bash cat/head/tail/sed/grep/awk of that file
-    # whose original result showed text (compared with the replay like every exec action); a path mention or
-    # metadata probe (ls, stat, test -f) is not a read of the failure output
-    bg_files = {a.get('background_output_file') for a in plan['actions'] if a.get('background_output_file')}
-    content_reads = {}
-    for a in plan['actions']:
-        f_cmd = (a.get('args') or {}).get('command', '') if a.get('tool') == 'Bash' else ''
-        o_txt = (a.get('orig_text') or '').strip()
-        if a.get('side_effect') != 'exec' or not o_txt or o_txt == '(Bash completed with no output)':
-            continue
-        for bf in bg_files:
-            # content-printing reads only: cat/head/tail of the file, or grep/sed/awk without filename, count or
-            # quiet modes (-l -L -c -q --files-with-matches --count --quiet -n for sed)
-            m = _re.search(r"\b(cat|head|tail|sed|grep|egrep|awk)\b([^|;&]*)" + _re.escape(bf), f_cmd)
-            if not m:
-                continue
-            tool, opts = m.group(1), m.group(2)
-            if tool in ('grep', 'egrep') and _re.search(r"(?:^|\s)-\w*[lLcqo]|--(?:files-with|files-without|count|quiet|silent|only-matching)", opts):
-                continue
-            if tool == 'sed' and _re.search(r"(?:^|\s)-\w*n", opts) and not _re.search(r"\d+,\d+p|\bp\b", opts):
-                continue
-            content_reads.setdefault(bf, set()).add(a['call_id'])
-    # background output files written by a command that uses the shell `time` keyword: a later read of such a file
-    # shows that command's timing report (provenance from the plan, not from the reading command)
-    time_files = []
-    for action, result in zip(plan['actions'], report['results']):
-        f = action.get('background_output_file')
-        if (f and action['side_effect'] == 'exec_background'
-                and _re.search(SHELL_TIME, (action.get('args') or {}).get('command', ''), _re.M)):
-            time_files.append(f)
+    for result in report['results']:
         result['_run_start'] = run_start
-        cmd = (action.get('args') or {}).get('command', '')
-        result['_reads_time_report'] = any(tf in cmd for tf in time_files)
     for action, result in zip(plan['actions'],report['results']):
         if result.get('call_id') != action['call_id']:
             raise RuntimeError('Replay action identity mismatch')
@@ -408,20 +168,18 @@ def validate_replay(plan, report, rc, reviewed_exceptions=None):
         fidelity=result.get('fidelity')
         exit_reviewed = False
         if action['side_effect']=='exec_background':
-            # completed -> rc 0; failed (Claude Code: non-zero exit) -> non-zero rc, same as the original task status
             # completed -> rc 0. failed -> the same non-zero exit code as the original task-notification reported
-            # (Claude Code: "failed with exit code N"; unknown -> refused) AND evidence that it failed the same way:
-            # a later read of its output file that is part of this replay plan (that read compares the original
-            # text with the restored file like any other read; bundles built with --include-read-only-reads keep
-            # such reads), or a command-bound reviewed exception of kind background_failure.
+            # (Claude Code: "failed with exit code N"; unknown -> refused) AND a reviewed exception of kind
+            # background_failure bound to the command and to the sha256 of the restored output file (the reviewer
+            # compared it with the original failure; nothing is inferred automatically).
             orig_code = action.get('bg_exit_code')
             failed_ok = (action.get('bg_status') == 'failed' and orig_code not in (None, 0)
                          and result.get('rc') == orig_code
-                         and (any(c in content_reads.get(action.get('background_output_file'), ())
-                  for c in action.get('bg_output_read_later') or ())
-                              or reviewed_exceptions.get(action['call_id'], {}).get('kind') == 'background_failure'
-                              and reviewed_exceptions[action['call_id']].get('command_sha256')
-                              == hashlib.sha256((action.get('args') or {}).get('command', '').encode()).hexdigest()))
+                         and reviewed_exceptions.get(action['call_id'], {}).get('kind') == 'background_failure'
+                         and reviewed_exceptions[action['call_id']].get('command_sha256')
+                         == hashlib.sha256((action.get('args') or {}).get('command', '').encode()).hexdigest()
+                         and reviewed_exceptions[action['call_id']].get('background_output_sha256')
+                         == result.get('background_output_sha256'))
             status_same = (action.get('bg_status') == 'completed' and result.get('rc') == 0) or failed_ok
             if not (action.get('bg_finished_before_k',True) and status_same
                     and fidelity=='bg_rerun_foreground'
@@ -435,7 +193,6 @@ def validate_replay(plan, report, rc, reviewed_exceptions=None):
             result['order_explained_by'] = 'stderr_placement'
         elif fidelity not in allowed and action['side_effect'] == 'exec' and automatic_equivalence(action, result):
             result['automatic_equivalence'] = automatic_equivalence(action, result)
-            exit_reviewed = result['automatic_equivalence'] == 'cc_grep_no_match'
         elif fidelity not in allowed:
             import hashlib, re
             review = reviewed_exceptions.get(action['call_id'], {})
@@ -541,12 +298,17 @@ def validate_replay(plan, report, rc, reviewed_exceptions=None):
                 and not result.get('stdout_full', '').strip()
                 and re.search(r"No such file or directory:? '?(?:/logs/agent/|\S*\.claude/)", result.get('stderr_full', ''))
                 is not None)
+            # Pattern-free review: a human compared this exact replay output with the original and approved it.
+            # Bound to the command and to the sha256 of the replay's stdout + NUL + stderr + NUL + rc.
+            exact_reviewed = (review.get('kind') == 'reviewed_replay_output' and bound and
+                review.get('replay_output_sha256') == replay_output_sha256(result))
             if not (hardware_only or memory_only or terminal_grep_only or profile_only or timed_grep or timeout_same
                     or ls_dot_only or unseeded or persisted_same or glob_order or timing_number or listing_line
-                    or agent_state):
+                    or agent_state or exact_reviewed):
                 raise RuntimeError('Unaccepted replay fidelity '+str(fidelity)+': '+action['call_id'])
-            exit_reviewed = terminal_grep_only or timed_grep or timeout_same or agent_state
-            result['reviewed_exception'] = ('reads the agent\'s own session/logs (seeded at launch, absent in replay); reviewed as read-only' if agent_state else
+            exit_reviewed = terminal_grep_only or timed_grep or timeout_same or agent_state or exact_reviewed
+            result['reviewed_exception'] = ('exact replay output reviewed: ' + str(review.get('note', ''))[:200] if exact_reviewed else
+                'reads the agent\'s own session/logs (seeded at launch, absent in replay); reviewed as read-only' if agent_state else
                 'single unlabelled wall-time number differs (command measures time)' if timing_number else
                 'same items listed in a different filesystem order; writes reviewed as order-independent' if listing_line else
                 'replayed stdout identical to the persisted full original output (CC showed a preview)' if persisted_same else

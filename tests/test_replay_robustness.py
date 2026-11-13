@@ -65,7 +65,7 @@ class TimeReportProvenance(unittest.TestCase):
         return {"actions": [bg, rd]}, {"results": [res_bg, res_rd]}
 
     def test_read_of_timed_background_output(self):
-        self.assertTrue(passes(*self.plan("time python3 s.py; echo exit=$?", "echo '=== t ==='; grep -E 'real|exit' {f}")))
+        self.assertFalse(passes(*self.plan("time python3 s.py; echo exit=$?", "echo '=== t ==='; grep -E 'real|exit' {f}")))
 
     def test_untimed_background_output_values_not_masked(self):
         self.assertFalse(passes(*self.plan("python3 s.py; echo exit=$?", "echo '=== t ==='; grep -E 'real|exit' {f}")))
@@ -80,7 +80,7 @@ class AutomaticEquivalence(unittest.TestCase):
 
     def test_timing_lines(self):
         cmd = "python3 - <<'EOF'\nimport time\nt=time.time()\nprint('loss 0.25')\nprint('time', time.time()-t)\nEOF"
-        self.assertTrue(passes(*one(cmd, "loss 0.25\ntime 0.851", "loss 0.25\ntime 0.862")))
+        self.assertFalse(passes(*one(cmd, "loss 0.25\ntime 0.851", "loss 0.25\ntime 0.862")))
         self.assertFalse(passes(*one(cmd, "loss 0.25\ntime 0.851", "loss 0.26\ntime 0.862")), "science number")
         self.assertFalse(passes(*one(cmd, "per-time err 0.1", "per-time err 0.2")), "label is not a duration")
         self.assertFalse(passes(*one("python3 -c 'print(1)'", "time 0.851", "time 0.862")), "command does not time")
@@ -92,7 +92,7 @@ class AutomaticEquivalence(unittest.TestCase):
 
     def test_grep_no_match_rc1(self):
         cmd = "python3 run.py\npip list | grep -i pypdf"
-        self.assertTrue(passes(*one(cmd, "saved 22", "saved 22\n", rc=1)))
+        self.assertFalse(passes(*one(cmd, "saved 22", "saved 22\n", rc=1)))
         self.assertFalse(passes(*one(cmd, "saved 22", "saved 23\n", rc=1)))
         self.assertFalse(passes(*one("python3 run.py", "saved 22", "saved 22\n", rc=1)), "not a grep pipeline")
         for bad in ("echo done; printf x | grep x >/dev/null; test -f /app/required",
@@ -118,10 +118,10 @@ class AutomaticEquivalence(unittest.TestCase):
 
     def test_shell_time_report(self):
         cmd = "TIMEFORMAT='%3R s'; time python3 solver.py; ls out"
-        self.assertTrue(passes(*one(cmd, "6.098 s\nfit ok\na.json", "fit ok\na.json\n", stderr="6.103 s\n")))
+        self.assertFalse(passes(*one(cmd, "6.098 s\nfit ok\na.json", "fit ok\na.json\n", stderr="6.103 s\n")))
         self.assertFalse(passes(*one(cmd, "6.098 s\nfit ok\na.json", "fit bad\na.json\n", stderr="6.103 s\n")))
         cmd2 = "time python3 solver.py"
-        self.assertTrue(passes(*one(cmd2, "real\t0m6.7s\nuser\t0m6.8s\nsys\t0m0.4s\nok", "ok\n",
+        self.assertFalse(passes(*one(cmd2, "real\t0m6.7s\nuser\t0m6.8s\nsys\t0m0.4s\nok", "ok\n",
                                     stderr="\nreal\t0m6.9s\nuser\t0m6.9s\nsys\t0m0.5s\n")))
 
     def test_cprofile_timings(self):
@@ -130,7 +130,7 @@ class AutomaticEquivalence(unittest.TestCase):
              "   ncalls  tottime  percall  cumtime  percall filename:lineno(function)\n"
              "    704/1    0.006    0.000   38.102   38.102 {built-in method builtins.exec}")
         n = o.replace("38.063", "38.886").replace("38.102   38.102", "38.925   38.925")
-        self.assertTrue(passes(*one(cmd, o, n)))
+        self.assertFalse(passes(*one(cmd, o, n)))
         self.assertFalse(passes(*one(cmd, o, n.replace("704/1", "705/1"))), "call counts differ")
 
     def test_agent_state_read_needs_review(self):
@@ -146,7 +146,7 @@ class AutomaticEquivalence(unittest.TestCase):
     def test_volatile_with_stderr_placement(self):
         o = "<stdin>:15: RuntimeWarning: x\ndrwxr-xr-x 2 root root 4096 Nov  2 20:17 .\nres 1"
         n = "drwxr-xr-x 2 root root 4096 Nov 13 04:47 .\nres 1\n"
-        self.assertTrue(passes(*one("python3 a.py; ls -la d", o, n, stderr="<stdin>:15: RuntimeWarning: x\n")))
+        self.assertFalse(passes(*one("python3 a.py; ls -la d", o, n, stderr="<stdin>:15: RuntimeWarning: x\n")))
 
     def test_reordered_stdout_rejected_reordered_stderr_accepted(self):
         self.assertFalse(passes(*one("python3 rank.py", "first a\nsecond b", "second b\nfirst a\n")))
@@ -165,7 +165,7 @@ class AutomaticEquivalence(unittest.TestCase):
         # run started 2026-11-02T20:00Z (first action): a.csv dated 20:17 was created by the run
         o = "w\n-rw-r--r-- 1 root root 5 Nov  2 20:17 a.csv"
         n = "-rw-r--r-- 1 root root 5 Nov 13 04:47 a.csv\n"
-        self.assertTrue(passes(*one("python3 mk.py; ls -la out", o, n, stderr="w\n")))
+        self.assertFalse(passes(*one("python3 mk.py; ls -la out", o, n, stderr="w\n")))
         self.assertFalse(passes(*one("python3 mk.py; ls -la out", o, n.replace(" 5 ", " 6 "), stderr="w\n")))
         self.assertFalse(passes(*one("cat log", "w\nrun Nov  2 20:17 ok", "run Nov 13 04:47 ok\n", stderr="w\n")))
 
@@ -204,7 +204,7 @@ class AutomaticEquivalence(unittest.TestCase):
 
     def test_braced_shell_time_report(self):
         cmd = "{ time python3 -B solver.py ; } 2>&1 | tail -4"
-        self.assertTrue(passes(*one(cmd, "done\nreal\t0m6.174s\nuser\t0m6.263s\nsys\t0m0.453s",
+        self.assertFalse(passes(*one(cmd, "done\nreal\t0m6.174s\nuser\t0m6.263s\nsys\t0m0.453s",
                                     "done\nreal\t0m6.082s\nuser\t0m6.169s\nsys\t0m0.461s\n")))
 
     def test_hex_with_stderr_move_rejected(self):
@@ -229,11 +229,11 @@ class AutomaticEquivalence(unittest.TestCase):
                      ("niter 6 dt_g None: 0.129s", "niter 6 dt_g None: 0.130s\n"),
                      ("short40   OK 4.3s nout=10", "short40   OK 4.2s nout=10\n"),
                      ("fit took 3.2 s", "fit took 3.4 s\n")):
-            self.assertTrue(passes(*one(cmd, o, n)), o)
+            self.assertFalse(passes(*one(cmd, o, n)), o)
 
     def test_durations_in_timing_context_within_jitter(self):
         cmd = "python3 - <<'EOF'\nimport time\nt=time.time()\nprint('OK %.1fs n=49' % (time.time()-t))\nEOF"
-        self.assertTrue(passes(*one(cmd, "OK 6.0s n=49", "OK 6.1s n=49\n")))
+        self.assertFalse(passes(*one(cmd, "OK 6.0s n=49", "OK 6.1s n=49\n")))
         self.assertFalse(passes(*one(cmd, "OK 6.0s n=49", "OK 60.0s n=49\n")), "beyond jitter")
         self.assertFalse(passes(*one(cmd, "OK 6.0s n=49", "OK 6.1s n=50\n")), "other number")
 
@@ -241,7 +241,7 @@ class AutomaticEquivalence(unittest.TestCase):
         p, r = one("python3 gencheck.py", "OK 6.0s n=49", "OK 6.1s n=49\n")
         self.assertFalse(passes(p, r))
         r["results"][0]["scripts_measure_time"] = True
-        self.assertTrue(passes(p, r))
+        self.assertFalse(passes(p, r))
         with tempfile.TemporaryDirectory() as td:
             Path(td, "g.py").write_text("import time\nt=time.time()\n")
             self.assertTrue(replay.scripts_measure_time("python3 -B g.py x", td))
@@ -291,14 +291,60 @@ class BackgroundTasks(unittest.TestCase):
 
     def test_failed_needs_same_code_and_output_evidence(self):
         sha = hashlib.sha256(b"x").hexdigest()
-        rv = {"c1": {"kind": "background_failure", "command_sha256": sha}}
+        rv = {"c1": {"kind": "background_failure", "command_sha256": sha, "background_output_sha256": "ab"}}
         self.assertTrue(self.ok("failed", 1, code=1, review=rv))
         self.assertFalse(self.ok("failed", 0, code=1, review=rv))
         self.assertFalse(self.ok("failed", 2, code=1, review=rv), "different exit code")
         self.assertFalse(self.ok("failed", 1, code=None, review=rv), "original exit code unknown")
         self.assertFalse(self.ok("failed", 1, code=1), "no evidence of the failure output")
-        self.assertTrue(self.ok("failed", 1, code=1, review={"c1": {"kind": "background_failure", "command_sha256": sha}}))
+        self.assertTrue(self.ok("failed", 1, code=1, review={"c1": {"kind": "background_failure", "command_sha256": sha,
+                                                                    "background_output_sha256": "ab"}}))
         self.assertFalse(self.ok("failed", 1, code=1, review={"c1": {"kind": "background_failure", "command_sha256": "0"}}))
+
+
+class RemovedAutomaticClassesNeedReview(unittest.TestCase):
+    """Timing/grep/mtime/profile/listing/background-failure differences are never accepted automatically; they pass
+    only with a command-sha256-bound reviewed exception."""
+    def sha(self, cmd):
+        return hashlib.sha256(cmd.encode()).hexdigest()
+
+    def test_grep_no_match_via_reviewed_exception(self):
+        cmd = "python3 run.py\npip list | grep -i pypdf"
+        p_, r_ = one(cmd, "saved 22", "saved 22\n", rc=1)
+        self.assertFalse(passes(p_, r_))
+        self.assertTrue(passes(p_, r_, {"c1": {"kind": "terminal_grep_no_match", "command_sha256": self.sha(cmd)}}))
+        self.assertFalse(passes(p_, r_, {"c1": {"kind": "terminal_grep_no_match", "command_sha256": "0" * 64}}))
+
+    def test_timing_number_via_reviewed_exception(self):
+        cmd = "python3 - <<'EOF'\nimport time\nt=time.time()\nEOF"
+        p_, r_ = one(cmd, "loss 0.25 0.851", "loss 0.25 0.862\n")
+        self.assertFalse(passes(p_, r_))
+        self.assertTrue(passes(p_, r_, {"c1": {"kind": "unlabelled_timing_number", "command_sha256": self.sha(cmd)}}))
+
+    def test_background_failure_only_reviewed(self):
+        a = {"call_id": "c1", "side_effect": "exec_background", "tool": "Bash", "args": {"command": "x"},
+             "bg_finished_before_k": True, "bg_status": "failed", "background_output_file": "/tmp/t.output",
+             "bg_exit_code": 1, "bg_output_read_later": ["r1"]}
+        rd = {"call_id": "r1", "side_effect": "exec", "tool": "Bash", "args": {"command": "cat /tmp/t.output"},
+              "orig_text": "Traceback: KeyError", "is_error": False}
+        r = {"call_id": "c1", "fidelity": "bg_rerun_foreground", "rc": 1, "background_output_file": "/tmp/t.output",
+             "background_output_sha256": "ab"}
+        good = {"call_id": "r1", "fidelity": "exact", "rc": 0, "status": "ran", "stdout_full": "Traceback: KeyError\n"}
+        self.assertFalse(passes({"actions": [a, rd]}, {"results": [r, good]}), "no inference from later reads")
+        rv = {"c1": {"kind": "background_failure", "command_sha256": self.sha("x"), "background_output_sha256": "ab"}}
+        self.assertTrue(passes({"actions": [a, rd]}, {"results": [r, good]}, rv))
+        rv["c1"]["background_output_sha256"] = "cd"
+        self.assertFalse(passes({"actions": [a, rd]}, {"results": [r, good]}, rv), "other failure output")
+
+    def test_reviewed_replay_output_binds_exact_output(self):
+        cmd = "time python3 solver.py"
+        p_, r_ = one(cmd, "real\t0m6.7s\nok", "ok\n", stderr="real\t0m6.9s\n")
+        self.assertFalse(passes(p_, r_))
+        rv = {"c1": {"kind": "reviewed_replay_output", "command_sha256": self.sha(cmd),
+                     "replay_output_sha256": gate.replay_output_sha256(r_["results"][0])}}
+        self.assertTrue(passes(p_, r_, rv))
+        r_["results"][0]["stdout_full"] = "ok2\n"
+        self.assertFalse(passes(p_, r_, rv))
 
 
 class CProfileSorted(unittest.TestCase):
@@ -308,7 +354,7 @@ class CProfileSorted(unittest.TestCase):
                 "  37345    0.300    0.000    0.890    0.000 solver.py:504(add_point)"]
         o = "\n".join([hdr.format("38.063")] + rows)
         n = "\n".join([hdr.format("38.974")] + rows[::-1]) + "\n"
-        self.assertTrue(passes(*one("python3 -m cProfile -s cumtime s.py | head", o, n)))
+        self.assertFalse(passes(*one("python3 -m cProfile -s cumtime s.py | head", o, n)))
         self.assertFalse(passes(*one("python3 -m cProfile s.py | head", o, n)), "not time-sorted")
         # program output around the table keeps its order
         o3 = "case_A 1\ncase_B 2\n" + o
@@ -350,7 +396,7 @@ class FailedBackgroundEvidence(unittest.TestCase):
         rd = {"call_id": "r1", "side_effect": "exec", "tool": "Bash", "args": {"command": "cat /tmp/t.output"},
               "orig_text": "Traceback: KeyError", "is_error": False}
         good = {"call_id": "r1", "fidelity": "exact", "rc": 0, "status": "ran", "stdout_full": "Traceback: KeyError\n"}
-        self.assertTrue(passes({"actions": [a, rd]}, {"results": [r, good]}))
+        self.assertFalse(passes({"actions": [a, rd]}, {"results": [r, good]}))
         other = dict(good, fidelity="differs", stdout_full="Traceback: ModuleNotFoundError\n")
         self.assertFalse(passes({"actions": [a, rd]}, {"results": [r, other]}), "failed for another reason")
         for probe in ("ls -la /tmp/t.output", "test -f /tmp/t.output && echo yes", "stat /tmp/t.output",
