@@ -61,10 +61,9 @@ def check_shared_snapshot(source: dict[str, Any], bundle: Path) -> None:
 
     mine = snapshot_cut_identity(bundle)
     theirs = source.get("cut_identity")
-    if theirs is None and source.get("bundle") and (Path(source["bundle"]) / "bundle.json").is_file():
-        theirs = snapshot_cut_identity(Path(source["bundle"]))
     if theirs is None:
-        raise SystemExit("snapshot state has no cut identity and its bundle is unavailable: cannot verify it matches")
+        # never reconstructed from the (mutable) bundle directory: only the identity recorded at preparation counts
+        raise SystemExit("snapshot state has no recorded cut identity (prepared by an older version): re-prepare it")
     if theirs != mine:
         diff = sorted(k for k in mine if theirs.get(k) != mine.get(k))
         raise SystemExit(f"snapshot state was prepared from a different cut (identity differs in {diff})")

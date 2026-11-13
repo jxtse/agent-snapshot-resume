@@ -205,10 +205,13 @@ rejects the first request with 400, before anything is sent upstream, unless
   recorded tool has the same name, description and input schema (only the deferred-loading placeholder may be
   added), and every message block of the rebuilt context is present in order and byte-identical; other blocks may
   only be system-role messages, the hint block, or user text that starts with a rendered-attachment marker, no
-  more of them than the prefix has attachments, and every line of them must be either a persisted attachment
-  value or a known rendering template of the agent version (`CC_RENDERED_ATTACHMENT_TEMPLATES`, collected from
-  real 2.1.280 resumes) with every slot filled by a persisted attachment value — so no instruction text, date, token
-  count or environment value can appear that the original's attachments did not carry. An agent version without
+  more of them than the prefix has attachments, and every line of them must be explained by the attachments
+  persisted at the same context position (block index, +-1 for a reminder rendered onto the neighbouring tool
+  result): a whole persisted value of one of them, a fixed rendering line, or a slot template of the agent version
+  (`CC_RENDERED_ATTACHMENT_TEMPLATES`, collected from real 2.1.280 resumes) whose every slot is filled by the named
+  field (`<attachment type>.<path>`) of one of those attachments — so no instruction text, date, token count or
+  environment value can appear that the original did not carry there, and values cannot move between fields or
+  positions. An agent version without
   templates cannot bind rendered text and fails. With `--parity-gate require` a prefix without a prompt snapshot
   (system prompt and tools unbound) fails.
 

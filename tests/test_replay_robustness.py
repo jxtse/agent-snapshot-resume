@@ -150,6 +150,22 @@ class AutomaticEquivalence(unittest.TestCase):
         n = "total 8\ndrwxr-xr-x 2 root root 4096 Oct 1 00:00 .\n-rw-r--r-- 1 root root 5 Oct 1 00:00 a0x87654321"
         self.assertFalse(passes(*one("ls -la d", o, n)))
 
+    def test_braced_shell_time_report(self):
+        cmd = "{ time python3 -B solver.py ; } 2>&1 | tail -4"
+        self.assertTrue(passes(*one(cmd, "done\nreal\t0m6.174s\nuser\t0m6.263s\nsys\t0m0.453s",
+                                    "done\nreal\t0m6.082s\nuser\t0m6.169s\nsys\t0m0.461s\n")))
+
+    def test_hex_with_stderr_move_rejected(self):
+        self.assertFalse(passes(*one("python3 sum.py", "warning\nchecksum=0xabcdef", "checksum=0x123456\n",
+                                     stderr="warning\n")))
+
+    def test_duration_valued_data_rejected(self):
+        self.assertFalse(passes(*one("time cat config.txt", "real\t0m0.1s\nretry_interval=60s",
+                                     "retry_interval=90s\n", stderr="real\t0m0.2s\n")))
+        cmd = "python3 - <<'EOF'\nimport time\nt=time.time()\nprint(open('c').read())\nEOF"
+        self.assertFalse(passes(*one(cmd, "retry_interval=60s", "retry_interval=70s\n")))
+        self.assertFalse(passes(*one(cmd, "timeout60s", "timeout70s\n")))
+
     def test_durations_in_timing_context_within_jitter(self):
         cmd = "python3 - <<'EOF'\nimport time\nt=time.time()\nprint('OK %.1fs n=49' % (time.time()-t))\nEOF"
         self.assertTrue(passes(*one(cmd, "OK 6.0s n=49", "OK 6.1s n=49\n")))

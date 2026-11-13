@@ -90,6 +90,26 @@ def _values(x, key=None) -> set[str]:
     return out
 
 
+def _fields(att: dict[str, Any]) -> dict[str, list[str]]:
+    """{"<type>.<dotted path>": [values]} for every leaf of an attachment (list elements share their path)."""
+    out: dict[str, list[str]] = {}
+
+    def walk(x, path):
+        if isinstance(x, dict):
+            for k, v in x.items():
+                walk(v, f"{path}.{k}")
+        elif isinstance(x, list):
+            for v in x:
+                walk(v, path)
+        elif isinstance(x, bool):
+            out.setdefault(path, []).append("true" if x else "false")
+        elif isinstance(x, (str, int, float)):
+            out.setdefault(path, []).append(str(x))
+
+    walk({k: v for k, v in att.items() if k != "type"}, str(att.get("type")))
+    return out
+
+
 def content_reference(session_lines: list[dict[str, Any]], templates: list[str] | None = None) -> dict[str, Any]:
     """Model-visible content the first resumed request must carry, from the truncated session prefix:
     the system prompt and tools of the agent's last persisted `prompt_snapshot` attachments (Claude Code 2.1.280
@@ -104,14 +124,19 @@ def content_reference(session_lines: list[dict[str, Any]], templates: list[str] 
             sysp = a.get("systemPrompt", sysp)
             tools = a.get("tools", tools)
     ctx = context_lines(session_lines)
-    values: set[str] = set()
+    from .equiv import blocks_from_session as _bfs
+    attachments = []
+    n_blocks = 0
     for d in ctx:
+        if d.get("type") in ("user", "assistant"):
+            n_blocks = len(_bfs(ctx[:ctx.index(d) + 1]))
         a = d.get("attachment") or {}
         if d.get("type") == "attachment" and a.get("type") != "prompt_snapshot":
-            values |= _values(a)
+            attachments.append({"pos": n_blocks, "type": a.get("type"), "values": sorted(_values(a)),
+                                "fields": _fields(a)})
     ref: dict[str, Any] = {"message_block_sha256": [block_digest(b) for b in blocks_from_session(ctx)],
                            "n_attachments": sum(1 for d in ctx if d.get("type") == "attachment"),
-                           "attachment_values": sorted(values), "rendered_templates": templates}
+                           "attachments": attachments, "rendered_templates": templates}
     if cli is not None and sysp is not None:
         ref["system_sha256"] = system_digest([cli, "\n\n".join(sysp)])
     if tools:

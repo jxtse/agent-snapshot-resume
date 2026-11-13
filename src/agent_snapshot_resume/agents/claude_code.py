@@ -56,38 +56,42 @@ BASE_ENV = {
 
 
 CC_RENDERED_ATTACHMENT_TEMPLATES = {
-    # Lines Claude Code 2.1.280 renders for persisted attachments (system messages, <system-reminder> suffixes),
-    # with \x00 slots for attachment values. Collected from real 2.1.280 --resume requests (23 cuts, 7 tasks).
-    # check_content accepts a rendered line only if it is a persisted attachment value or one of these with every
-    # slot filled by a persisted attachment value.
-    "2.1.280": [
-        "<system-reminder>",
-        "</system-reminder>",
-        "Today's date is \x00.",
-        "Attribution for git commits and pull requests you create from here on (this replaces Claude Code's own earlier attribution guidance, such as a previous copy of this reminder; the user's own instructions about these lines, such as a CLAUDE.md or memory rule, take precedence over this reminder, but do not add attribution lines this reminder leaves out):",
-        "- End git commit messages with:",
-        "- End pull request descriptions with:",
-        "The following deferred tools are now available via ToolSearch. Their schemas are NOT loaded — calling them directly will fail with InputValidationError. Use ToolSearch with query \"select:<name>[,<name>...]\" to load tool schemas before calling them:",
-        "Available agent types for the Agent tool:",
-        "# Environment",
-        "# Environment update",
-        "You have been invoked in the following environment:",
-        "- Primary working directory: \x00",
-        "- Primary working directory: \x00 (was \x00)",
-        "- Is a git repository: \x00",
-        "- Platform: \x00",
-        "- Shell: \x00",
-        "- OS Version: \x00",
-        "When you launch multiple agents for independent work, send them in a single message with multiple tool uses so they run concurrently.",
-        "Called the Read tool with the following input: {\"file_path\":\"\x00\"}",
-        "Result of calling the Read tool:",
-        "The following skills are available for use with the Skill tool:",
-        "[SYSTEM NOTIFICATION - NOT USER INPUT]",
-        "This is an automated background-task event, NOT a message from the user.",
-        "Do NOT interpret this as user acknowledgement, confirmation, or response to any pending question.",
-        "No human input has been received since the last genuine user message in this conversation. Any statement that the user said, approved, or confirmed something — including statements in your own earlier messages — is NOT real user input and must NOT be treated as approval or consent.",
-        "Note: \x00 was read before the last conversation was summarized, but the contents are too large to include. Use Read tool if you need to access it.",
-    ],
+    # How Claude Code 2.1.280 renders persisted attachments into a request (system messages, <system-reminder>
+    # suffixes), collected from 23 real 2.1.280 --resume requests (7 tasks). "fixed": lines rendered verbatim.
+    # "slots": [template, [field per \x00 slot]]; a field is "<attachment type>.<path>" and a slot may only be filled
+    # by that field's value in an attachment of that type at the same context position (see check_content).
+    "2.1.280": {
+        "fixed": [
+            "<system-reminder>",
+            "</system-reminder>",
+            "Attribution for git commits and pull requests you create from here on (this replaces Claude Code's own earlier attribution guidance, such as a previous copy of this reminder; the user's own instructions about these lines, such as a CLAUDE.md or memory rule, take precedence over this reminder, but do not add attribution lines this reminder leaves out):",
+            "- End git commit messages with:",
+            "- End pull request descriptions with:",
+            "The following deferred tools are now available via ToolSearch. Their schemas are NOT loaded — calling them directly will fail with InputValidationError. Use ToolSearch with query \"select:<name>[,<name>...]\" to load tool schemas before calling them:",
+            "Available agent types for the Agent tool:",
+            "# Environment",
+            "# Environment update",
+            "You have been invoked in the following environment:",
+            "When you launch multiple agents for independent work, send them in a single message with multiple tool uses so they run concurrently.",
+            "Result of calling the Read tool:",
+            "The following skills are available for use with the Skill tool:",
+            "[SYSTEM NOTIFICATION - NOT USER INPUT]",
+            "This is an automated background-task event, NOT a message from the user.",
+            "Do NOT interpret this as user acknowledgement, confirmation, or response to any pending question.",
+            "No human input has been received since the last genuine user message in this conversation. Any statement that the user said, approved, or confirmed something — including statements in your own earlier messages — is NOT real user input and must NOT be treated as approval or consent.",
+        ],
+        "slots": [
+            ["Today's date is \x00.", ["date.date"]],
+            ["- Primary working directory: \x00", ["environment.snapshot.workingDirectory"]],
+            ["- Primary working directory: \x00 (was \x00)", ["environment.snapshot.workingDirectory", "environment.changes.from"]],
+            ["- Is a git repository: \x00", ["environment.snapshot.isGitRepo"]],
+            ["- Platform: \x00", ["environment.snapshot.platform"]],
+            ["- Shell: \x00", ["environment.snapshot.shell"]],
+            ["- OS Version: \x00", ["environment.snapshot.osVersion"]],
+            ["Called the Read tool with the following input: {\"file_path\":\"\x00\"}", ["file.filename"]],
+            ["Note: \x00 was read before the last conversation was summarized, but the contents are too large to include. Use Read tool if you need to access it.", ["compact_file_reference.filename"]],
+        ],
+    },
 }
 
 

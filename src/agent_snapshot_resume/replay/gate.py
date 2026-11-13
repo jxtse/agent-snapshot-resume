@@ -51,15 +51,23 @@ DURATION = re.compile(r"(\d+(?:\.\d+)?)(\s?)(s|ms|sec|secs|seconds)\b")
 
 
 def _timing_context(command, result):
-    return bool(re.search(TIMING_CALL, command) or result.get("scripts_measure_time")
-                or re.search(r"(?:^|[;&|(]\s*)time\s|\bTIMEFORMAT=|/usr/bin/time\b", command, re.M))
+    """The command's own code (inline, or a script it runs) measures wall time. The shell `time` keyword is not a
+    timing context for printed lines: its report is handled separately (shell_time_report_only)."""
+    return bool(re.search(TIMING_CALL, command) or result.get("scripts_measure_time"))
 
 
 def _durations_close(a, b):
-    """Same line except durations (number + time unit) that differ by at most 50% (run-to-run jitter)."""
+    """Same line except measured durations that differ by at most 50% (run-to-run jitter). A differing duration
+    must be a measurement, not data: number + time unit not attached to a key (`retry_interval=60s`,
+    `exposure: 10 s` are data) and not part of a word/identifier."""
     if DURATION.sub("<D>", a) != DURATION.sub("<D>", b):
         return False
     for x, y in zip(DURATION.finditer(a), DURATION.finditer(b)):
+        if x.group() == y.group():
+            continue
+        before = a[:x.start()]
+        if re.search(r"=\s*$|[\w.-]$", before) and not re.search(TIMING_BEFORE, before):
+            return False
         u, v = float(x.group(1)), float(y.group(1))
         if x.group(3) != y.group(3) or abs(u - v) > max(0.5 * max(u, v), 0.05):
             return False
@@ -92,7 +100,12 @@ def _only_timing_numbers_differ(a, b):
     for x, y in zip(ma, mb):
         if x.group() == y.group():
             continue
-        if not (re.search(TIMING_BEFORE, a[:x.start()]) or re.search(TIMING_AFTER, a[x.end():])):
+        before = a[:x.start()]
+        if not (re.search(TIMING_BEFORE, before) or re.search(TIMING_AFTER, a[x.end():])):
+            return False
+        # a unit alone does not make a measurement: `retry_interval=60s`, `timeout60s` are data (assignments and
+        # identifiers); `label: 0.13s` printed by code that measures time is a measurement
+        if not re.search(TIMING_BEFORE, before) and re.search(r"=\s*$|[\w.-]$", before):
             return False
         u, v = abs(float(x.group())), abs(float(y.group()))
         if abs(u - v) > max(0.5 * max(u, v), 0.05):  # run-to-run jitter only
@@ -223,7 +236,7 @@ def automatic_equivalence(action, result):
             action, result, lambda l: diag.sub("bash: line <n>: ", l)):
         return "shell_diagnostic_prefix_only"
     # `time cmd` / TIMEFORMAT / /usr/bin/time reports go to stderr, which Claude Code interleaves differently
-    if re.search(r"(?:^|[;&|(]\s*)time\s|\bTIMEFORMAT=|/usr/bin/time\b", command, re.M):
+    if re.search(r"(?:^|[;&|({]\s*)time\s|\bTIMEFORMAT=|/usr/bin/time\b", command, re.M):
         tfmt = re.search(r"TIMEFORMAT=['\"]?([^'\";]*)", command)
         rep = [re.compile(r"^(?:real|user|sys)\s+\d+m\d+(?:\.\d+)?s$|^(?:real|user|sys)\s+\d+(?:\.\d+)?$")]
         if tfmt:
@@ -265,10 +278,7 @@ def validate_replay(plan, report, rc, reviewed_exceptions=None):
     allowed={'exact','normalized','error_reproduced','orig_error_not_applied'}
     # Line-order classes of the replayer are accepted only when the reordering is explained by stderr placement
     # (Claude Code interleaves stderr into the text differently); reordered stdout is never accepted silently.
-    import re as _re
-    order_maps = {'same_lines_reordered': None,
-                  'address_and_order_only': lambda l: _re.sub(r"0x[0-9a-fA-F]{6,}", "<ADDR>", l),
-                  'line_alignment_and_order_only': lambda l: l.strip()}
+    order_maps = {'same_lines_reordered': None, 'line_alignment_and_order_only': lambda l: l.strip()}
     for action, result in zip(plan['actions'],report['results']):
         if result.get('call_id') != action['call_id']:
             raise RuntimeError('Replay action identity mismatch')

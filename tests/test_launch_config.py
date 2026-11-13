@@ -121,7 +121,8 @@ class LaunchConfig(unittest.TestCase):
     def test_snapshot_from_other_bundle_refused(self):
         d = json.loads(self.state.read_text())
         d["run_id"] = "other"
-        d.pop("cut_identity")  # and no bundle to recompute it from
+        d.pop("cut_identity")
+        d["bundle"] = str(self.bdir)  # never reconstructed from the (mutable) bundle directory
         self.state.write_text(json.dumps(d))
         with self.assertRaises(SystemExit):
             self.cfg()

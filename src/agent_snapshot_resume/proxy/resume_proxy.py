@@ -294,41 +294,40 @@ ATTACHMENT_TEXT_PREFIXES = ("<system-reminder>", "<task-notification>")
 _LINENO_RE = re.compile(r"(?m)^\s*\d+\t")  # Read-tool rendering "N<TAB>line"
 
 
-def rendered_line_ok(line, values, templates):
-    """A line of rendered attachment text is explained iff it is a persisted attachment value, or a template with
-    every \x00 slot filled by a persisted attachment value (exact strings, no other text)."""
+def rendered_line_ok(line, attachments, templates):
+    """A line of rendered attachment text is explained iff it is a whole persisted value of one of `attachments`
+    (the attachments persisted at this context position), a fixed rendering line, or a slot template whose every
+    slot is filled by the named field of an attachment of the named type among `attachments`.
+    attachments: [{"type": ..., "values": [...], "fields": {"<type>.<path>": [...]}}]"""
     line = line.strip()
-    if not line or line in values:
+    if not line or line in (templates or {}).get("fixed", ()):
         return True
-    for t in templates:
-        parts = t.split("\x00")
-        if len(parts) == 1:
-            if line == t:
-                return True
+    if any(line in a["values"] for a in attachments):
+        return True
+    for tpl, fields in (templates or {}).get("slots", ()):
+        parts = tpl.split("\x00")
+        if len(parts) - 1 != len(fields) or not (line.startswith(parts[0]) and line.endswith(parts[-1])):
             continue
-        if not (line.startswith(parts[0]) and line.endswith(parts[-1])):
-            continue
-        if _fill(line[len(parts[0]):len(line) - len(parts[-1]) if parts[-1] else len(line)], parts[1:-1], values):
+        rest = line[len(parts[0]):len(line) - len(parts[-1]) if parts[-1] else len(line)]
+        cands = [[v for a in attachments for v in a["fields"].get(f, ())] for f in fields]
+        if _fill_slots(rest, parts[1:-1], cands):
             return True
     return False
 
 
-def _fill(rest, middles, values):
-    """rest = v1 m1 v2 m2 ... vn with every v a persisted value (backtracking over middle separators)."""
+def _fill_slots(rest, middles, cands):
+    """rest = v1 m1 v2 ... vn with v_i in cands[i] (exact strings)."""
     if not middles:
-        return rest in values
-    sep = middles[0]
-    i = rest.find(sep)
-    while i >= 0:
-        if rest[:i] in values and _fill(rest[i + len(sep):], middles[1:], values):
+        return rest in cands[0]
+    for v in cands[0]:
+        if rest.startswith(v + middles[0]) and _fill_slots(rest[len(v) + len(middles[0]):], middles[1:], cands[1:]):
             return True
-        i = rest.find(sep, i + 1)
     return False
 
 
-def rendered_text_problems(text, values, templates):
-    bad = [l.strip() for l in _LINENO_RE.sub("", text).split("\n") if not rendered_line_ok(l, values, templates)]
-    return bad
+def rendered_text_problems(text, attachments, templates):
+    return [l.strip() for l in _LINENO_RE.sub("", text).split("\n")
+            if not rendered_line_ok(l, attachments, templates)]
 
 
 def tool_digest(t):
@@ -351,8 +350,8 @@ def check_content(body, ref, hints):
                      (a tool_result may carry an appended <system-reminder> suffix); every other block must be a
                      system-role message, an exact hint block, or user text that starts with a rendered-attachment
                      marker; their number must not exceed the prefix's attachment count, and every line of
-                     them must be a persisted attachment value or a rendering template of the agent version
-                     filled with persisted values (rendered_line_ok)
+                     them must be explained by the attachments persisted at the same context position: a whole
+                     value, a fixed rendering line, or a slot template filled field by field (rendered_line_ok)
       completeness   require_complete: fail if the prefix had no prompt snapshot (system/tools unbound)
     """
     problems = []
@@ -385,14 +384,14 @@ def check_content(body, ref, hints):
             if j < len(want) and stripped is not None and block_digest(stripped) == want[j]:
                 j += 1
                 extras += 1
-                rendered.append(blk[4][len(stripped[4]):])
+                rendered.append((j, blk[4][len(stripped[4]):]))
                 continue
             if blk[1] == "text" and blk[2] in hint_blocks:
                 continue
             if blk[0] == "system" or (blk[0] == "user" and blk[1] == "text"
                                       and blk[2].lstrip().startswith(ATTACHMENT_TEXT_PREFIXES)):
                 extras += 1
-                rendered.append(blk[2] if isinstance(blk[2], str) else json.dumps(blk[2], ensure_ascii=False))
+                rendered.append((j, blk[2] if isinstance(blk[2], str) else json.dumps(blk[2], ensure_ascii=False)))
                 continue
             problems.append(f"unexplained {blk[0]} {blk[1]} block before reference block {j}")
             break
@@ -400,20 +399,22 @@ def check_content(body, ref, hints):
             problems.append(f"reference block {j} of {len(want)} missing or different")
         if extras > int(ref.get("n_attachments", 0)):
             problems.append(f"{extras} rendered-attachment blocks for {ref.get('n_attachments', 0)} attachments")
-        # Every line of rendered attachment text must be a persisted attachment value or a known rendering template
-        # of this agent version filled with persisted values (attachment_values / rendered_templates).
-        if "attachment_values" in ref:
-            values = set(ref["attachment_values"])
+        # Every line of rendered attachment text must be explained by the attachments persisted at the same context
+        # position (block index, +-1 for a reminder rendered onto the neighbouring tool result), field by field.
+        if "attachments" in ref:
             templates = ref.get("rendered_templates")
             if templates is None:
                 if rendered:
                     problems.append("rendered attachment text present but this agent version has no rendering "
                                     "templates: cannot bind it")
             else:
-                bad = [l for txt in rendered for l in rendered_text_problems(txt, values, templates)]
+                bad = []
+                for pos, txt in rendered:
+                    near = [a for a in ref["attachments"] if abs(a["pos"] - pos) <= 1]
+                    bad += rendered_text_problems(txt, near, templates)
                 if bad:
-                    problems.append(f"rendered attachment text not explained by the persisted attachments: "
-                                    f"{[b[:120] for b in bad[:3]]}")
+                    problems.append(f"rendered attachment text not explained by the attachments persisted at that "
+                                    f"position: {[b[:120] for b in bad[:3]]}")
     return problems
 
 
