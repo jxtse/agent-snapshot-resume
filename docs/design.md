@@ -104,8 +104,8 @@ call ids, and that every result has an accepted fidelity:
   output line has the same tokens), `shell_diagnostic_prefix_only` (`/bin/bash: eval: line N:` vs
   `bash: -c: line M:`), `shell_time_report_only` (`time`/`TIMEFORMAT`/`/usr/bin/time` report lines removed, rest
   identical after volatile masking), `cprofile_timings_only` (same profile rows and call counts; timing columns
-  differ), `volatile_and_stderr_placement_only` (the replayer's volatile masking plus stderr placed elsewhere;
-  stdout order kept), `timing_lines_only` (command measures time; every differing number directly follows a
+  differ), `ls_mtime_and_stderr_placement_only` (command runs `ls -l`; only the date column of ls rows differs,
+  plus stderr placement), `timing_lines_only` (command measures time; every differing number directly follows a
   duration label or precedes a time unit). Stderr placement means: the original equals the replay's stdout in
   order once the replay's stderr lines are taken out of it; nothing else is reordered;
 - pacing: an action marked `pacing_unmet` (a background job was alive and the original gap could not be kept)
@@ -205,8 +205,15 @@ rejects the first request with 400, before anything is sent upstream, unless
   dates, token counts, paths, versions) must occur in the persisted attachments. With `--parity-gate require` a
   prefix without a prompt snapshot (system prompt and tools unbound) fails.
 
-Byte length alone would accept an equal-length substitution; the content check closes that. Once the gate failed,
-every later request of that run is refused too. The report is `first_request_parity.json`.
+Byte length alone would accept an equal-length substitution; the content check closes that for the persisted
+history. Rendered attachment text and request settings that are not in the original proxy log (e.g. sampling
+parameters, the prose of a reminder) cannot be bound to the original run, so the strict mode adds a second, exact
+gate for real runs: `launch --freeze-first-request <first_request_rewritten.json>` takes the first request of a
+`--fake` run of the same bundle that passed the parity gate and requires the real run's first request to have the
+same digest (every field except `metadata`; `expected_first_request_sha256`). Fake and real runs of one bundle send
+identical first requests (checked on two real runs), so this binds everything a fake run can show. With
+`--parity-gate require` a real launch without `--freeze-first-request` is refused. Once a gate failed, every later
+request of that run is refused too. The report is `first_request_parity.json`.
 `--parity-gate auto` (default) gates whenever the bundle has the record, `require` refuses to launch without it,
 `off` disables it. `asr parity <bundle> <first_request_rewritten.json>` runs the same check offline.
 

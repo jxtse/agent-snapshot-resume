@@ -244,6 +244,9 @@ class ClaudeCodeSnapshotResumeOptions(ClaudeCodeOptions):
     parity_gate: str = Field(default="auto")
     # Stop the continuation after this many model requests, sub-agents included (the resume proxy refuses later ones).
     max_model_requests: int | None = Field(default=None)
+    # sha256 (resume_proxy.request_digest) of a fake run's parity-checked first request: the real first request must
+    # equal it in every field except metadata (binds sampling settings and rendered attachments exactly).
+    expected_first_request_sha256: str | None = Field(default=None)
 
 
 class ClaudeCodeSnapshotResume(SnapshotResumeAgentMixin, ClaudeCode):

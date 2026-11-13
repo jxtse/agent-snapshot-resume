@@ -597,11 +597,15 @@ async def handle(request):
                                          + json.dumps({"diffs": rep["diffs"], "content": rep.get("content_problems")},
                                                       ensure_ascii=False)[:600])
                     acts.append("first_request_parity_passed")
-            if spec.get('expected_first_request_sha256') and not spec.get('_first_request_validated'):
-                if request_digest(nd) != spec['expected_first_request_sha256']:
-                    raise ValueError('First model request differs from the frozen fake-resume request')
-                spec['_first_request_validated'] = True
-                acts.append('first_request_hash_gate_passed')
+            if spec.get('expected_first_request_sha256'):
+                if spec.get('_first_request_validated') is False:
+                    raise ValueError('frozen first-request gate failed earlier in this run; every request is refused')
+                if spec.get('_first_request_validated') is None:
+                    ok = request_digest(nd) == spec['expected_first_request_sha256']
+                    spec['_first_request_validated'] = ok
+                    if not ok:
+                        raise ValueError('First model request differs from the frozen fake-resume request')
+                    acts.append('first_request_hash_gate_passed')
         except ValueError as exc:
             rec.update(status=400, local_gate_error=str(exc))
             wlog(app, run_id, "requests.jsonl", rec)

@@ -222,6 +222,35 @@ class ProxyGateFailClosed(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(st, 200)
         self.assertTrue(json.loads((logs / "first_request_parity.json").read_text())["ok"])
 
+    async def test_content_failure_latched_and_never_forwarded(self):
+        from agent_snapshot_resume.proxy.resume_proxy import block_digest, blocks_from_request
+        orig = original_shape()
+        ref = {"message_block_sha256": [block_digest(b) for b, _ in blocks_from_request(orig["messages"])
+                                        if b[0] != "system"], "n_attachments": 2,
+               "attachment_tokens": ["2026-11-03", "1"]}
+        exp = dict(expected_for(orig), content=ref)
+        body = resumed_body()
+        body["messages"][3]["content"][0]["content"] = "erx"  # equal length: byte parity alone would pass
+        st, st2, logs = await self._post({"mode": "same", "sentinel": SENT, "upstream": "fake",
+                                          "first_request_parity": exp}, body)
+        self.assertEqual((st, st2), (400, 400))
+        rep = json.loads((logs / "first_request_parity.json").read_text())
+        self.assertTrue(rep["content_problems"])
+        self.assertFalse((logs / "first_request_rewritten.json").exists() and
+                         json.loads((logs / "requests.jsonl").read_text().splitlines()[0]).get("status") == 200)
+
+    async def test_frozen_first_request_binds_settings_and_latches(self):
+        good, _ = proxy.rewrite(resumed_body(), {"mode": "same", "sentinel": SENT})
+        digest = proxy.request_digest(good)
+        body = resumed_body()
+        body["temperature"] = 0.9  # not covered by byte/field parity, covered by the frozen digest
+        st, st2, _ = await self._post({"mode": "same", "sentinel": SENT, "upstream": "fake",
+                                       "expected_first_request_sha256": digest}, body)
+        self.assertEqual((st, st2), (400, 400))
+        st, st2, _ = await self._post({"mode": "same", "sentinel": SENT, "upstream": "fake",
+                                       "expected_first_request_sha256": digest}, resumed_body())
+        self.assertEqual((st, st2), (200, 200))
+
     async def test_max_model_requests(self):
         st1, st2, logs = await self._post({"mode": "same", "sentinel": SENT, "upstream": "fake",
                                            "max_model_requests": 1}, resumed_body())

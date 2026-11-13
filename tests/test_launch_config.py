@@ -33,6 +33,25 @@ class LaunchConfig(unittest.TestCase):
         args.update(kw)
         return build_job_config(**args)
 
+    def test_freeze_first_request_required_for_strict_real_runs(self):
+        from agent_snapshot_resume.proxy.resume_proxy import request_digest
+        meta = dict(json.loads((self.bdir / "bundle.json").read_text()),
+                    orig_request_at_k={"req_bytes": 1, "content": {"message_block_sha256": []}})
+        (self.bdir / "bundle.json").write_text(json.dumps(meta))
+        with patch.dict(os.environ, {"ASR_UPSTREAM_URL": "https://example.invalid"}):
+            with self.assertRaises(SystemExit):
+                self.cfg(fake=False, parity_gate="require")
+            logs = self.root / "fake-logs" / self.meta["run_id"]
+            logs.mkdir(parents=True)
+            body = {"model": "m", "messages": [], "temperature": 1}
+            (logs / "first_request_rewritten.json").write_text(json.dumps({"body": body}))
+            (logs / "first_request_parity.json").write_text(json.dumps({"ok": False}))
+            with self.assertRaises(SystemExit):
+                self.cfg(fake=False, parity_gate="require", freeze_first_request=str(logs / "first_request_rewritten.json"))
+            (logs / "first_request_parity.json").write_text(json.dumps({"ok": True}))
+            cfg = self.cfg(fake=False, parity_gate="require", freeze_first_request=str(logs / "first_request_rewritten.json"))
+            self.assertEqual(cfg["agents"][0]["kwargs"]["expected_first_request_sha256"], request_digest(body))
+
     def test_fake_config_valid_and_secret_free(self):
         secret = "test-secret-should-never-appear"
         with patch.dict(os.environ, {"ASR_UPSTREAM_KEY": secret, "ANTHROPIC_API_KEY": secret}):

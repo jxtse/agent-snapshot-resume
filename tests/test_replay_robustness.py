@@ -117,6 +117,17 @@ class AutomaticEquivalence(unittest.TestCase):
         cmd = "python3 - <<'EOF'\nimport time\nt=time.time()\nprint('samples in', n)\nEOF"
         self.assertFalse(passes(*one(cmd, "samples in 10", "samples in 11\n")))
 
+    def test_full_timestamps_with_stderr_move_rejected(self):
+        self.assertFalse(passes(*one("cat records", "warn\nevent 2020-01-01T00:00:00 a",
+                                     "event 2021-05-05T00:00:00 a\n", stderr="warn\n")))
+
+    def test_ls_mtime_only_in_ls_rows(self):
+        o = "w\n-rw-r--r-- 1 root root 5 Nov  2 20:17 a.csv"
+        n = "-rw-r--r-- 1 root root 5 Nov 13 04:47 a.csv\n"
+        self.assertTrue(passes(*one("python3 mk.py; ls -la out", o, n, stderr="w\n")))
+        self.assertFalse(passes(*one("python3 mk.py; ls -la out", o, n.replace(" 5 ", " 6 "), stderr="w\n")))
+        self.assertFalse(passes(*one("cat log", "w\nrun Nov  2 20:17 ok", "run Nov 13 04:47 ok\n", stderr="w\n")))
+
     def test_task_data_dates_reordered_are_rejected(self):
         # review counterexample: dates that are task data, changed and reordered, must not pass
         o = "event 2020-01-01 a\nevent 2020-01-02 b"

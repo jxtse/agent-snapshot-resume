@@ -153,7 +153,10 @@ checks the first rewritten request against it and refuses it and every later req
 upstream) unless, without the hint block and serialised as the original route logged it, it has exactly the
 original byte length, the same model, message count, `max_tokens`, `thinking` and tools, the system prompt the agent
 persisted, and every message block of the session prefix in order (`first_request_parity.json` in the resume-proxy
-log dir). `--parity-gate require` refuses to launch a bundle without the record; `off` disables the gate. Offline:
+log dir). `--parity-gate require` refuses to launch a bundle without the record and, for a real run, also needs
+`--freeze-first-request jobs/<fake job>/<trial>/agent/resume-proxy/<run_id>/first_request_rewritten.json`: the real
+first request must then be identical (every field but `metadata`) to the fake run's parity-checked one. `off`
+disables the gate. Offline:
 `asr parity bundles/<run_id> <first_request_rewritten.json> --passthrough-args '...'`.
 `--max-model-requests N` stops a continuation after N model requests (useful for cheap real-route probes).
 

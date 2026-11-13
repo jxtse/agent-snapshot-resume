@@ -157,6 +157,8 @@ class SnapshotResumeAgentMixin:
                                    "use parity_gate=auto/off to run without the first-request parity gate")
         if getattr(self.options, "max_model_requests", None):
             spec["max_model_requests"] = int(self.options.max_model_requests)
+        if getattr(self.options, "expected_first_request_sha256", None):
+            spec["expected_first_request_sha256"] = self.options.expected_first_request_sha256
         (logs / "proxy_spec.json").write_text(json.dumps(spec, ensure_ascii=False, indent=1))
         t0 = time.time()
         if not self.options.upstream_fake:

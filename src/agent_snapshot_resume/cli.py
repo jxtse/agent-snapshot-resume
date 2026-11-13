@@ -105,7 +105,8 @@ def cmd_launch(a):
                            upstream_url=a.upstream_url, extra_env=_kv(a.agent_env),
                            original_trial_dir=a.original_trial_dir or meta.get("trial_dir"),
                            passthrough_args=shlex.split(a.passthrough_args) if a.passthrough_args else None,
-                           parity_gate=a.parity_gate, max_model_requests=a.max_model_requests)
+                           parity_gate=a.parity_gate, max_model_requests=a.max_model_requests,
+                           freeze_first_request=a.freeze_first_request)
     validate_job_config(cfg)
     runs = Path(a.runs_dir) / job
     runs.mkdir(parents=True, exist_ok=True)
@@ -268,6 +269,10 @@ def build_parser():
     p.add_argument("--parity-gate", choices=["auto", "require", "off"], default="auto",
                    help="fail-closed first-request parity vs the original run's request at the cut (default auto: "
                    "on whenever the bundle located that request)")
+    p.add_argument("--freeze-first-request", metavar="FIRST_REQUEST_JSON",
+                   help="first_request_rewritten.json of a --fake run of this bundle that passed the parity gate: the "
+                   "real first request must equal it in every field except metadata (required with --parity-gate "
+                   "require for real runs)")
     p.add_argument("--max-model-requests", type=int,
                    help="stop the continuation after N model requests, sub-agent requests included (the proxy refuses request N+1)")
     p.set_defaults(fn=cmd_launch)

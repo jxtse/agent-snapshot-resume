@@ -136,9 +136,9 @@ def automatic_equivalence(action, result):
                             the command uses the shell `time` keyword (TIMEFORMAT) or /usr/bin/time; after removing
                             the timing report lines and blank lines the output is identical in order (after the
                             replayer's volatile masking of dates/addresses/durations).
-      volatile_and_stderr_placement_only
-                            the replayer's volatile masking (volatile_only: addresses, dates, durations) plus the
-                            stderr placement freedom above; stdout order is preserved.
+      ls_mtime_and_stderr_placement_only
+                            the command runs `ls -l`; only the date column of rows in ls -l format differs (files
+                            the replay re-created), plus the stderr placement freedom above; stdout order kept.
       cprofile_timings_only a cProfile/pstats table (possibly truncated by head) with identical rows: call counts and
                             function identities in the same order; only the four timing columns and the header's
                             total seconds differ. All non-table lines identical.
@@ -187,10 +187,14 @@ def automatic_equivalence(action, result):
         if n_rep and (drop(old) == drop(new) or
                       volatile_free("\n".join(drop(old))) == volatile_free("\n".join(drop(new)))):
             return "shell_time_report_only"
-    # addresses/dates/timings masked (the replayer's volatile_only) AND stderr placed elsewhere in the text
-    from .replay_inside import volatile_free
-    if _stderr_placement_equal(action, result, volatile_free) and not _stderr_placement_equal(action, result, None):
-        return "volatile_and_stderr_placement_only"
+    # `ls -l` rows of files the command itself (re)created carry the replay's mtime: mask only the date column of
+    # rows in ls -l format, in commands that run ls -l, combined with stderr placement
+    if re.search(r"\bls\s+-\w*l", command):
+        ls_row = re.compile(r"^([-dlcbps][-rwxsStT]{9}[.+@]?\s+\d+\s+\S+\s+\S+\s+\d+\s+)"
+                            r"[A-Z][a-z]{2}\s+\d{1,2}\s+(?:\d{2}:\d{2}|\d{4})(\s+.+)$")
+        mask = lambda l: ls_row.sub(r"\1<mtime>\2", l)
+        if (_stderr_placement_equal(action, result, mask) and not _stderr_placement_equal(action, result, None)):
+            return "ls_mtime_and_stderr_placement_only"
     if re.search(r"\bcProfile\b|\bprofile\.run\(|pstats", command) and len(old) == len(new):
         row = re.compile(r"\s*(\d+(?:/\d+)?)\s+(?:\d+\.\d+\s+){4}(.+)")
         hdr = re.compile(r"(\s*\d+ function calls(?: \(\d+ primitive calls\))? in )\d+(?:\.\d+)?( seconds)")

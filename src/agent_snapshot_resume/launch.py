@@ -72,13 +72,29 @@ def check_shared_snapshot(source: dict[str, Any], bundle: Path) -> None:
           "(identical cut identity)", file=sys.stderr)
 
 
+def frozen_first_request_digest(path: Path, meta: dict[str, Any]) -> str:
+    """Digest of a fake run's rewritten first request (every field except `metadata`), to require the real run's
+    first request to be byte-identical in content and settings. The fake run must have passed the parity gate."""
+    from .proxy.resume_proxy import request_digest
+
+    rec = json.loads(path.read_text())
+    body = rec.get("body", rec)
+    rep_path = path.with_name("first_request_parity.json")
+    if not rep_path.is_file() or not json.loads(rep_path.read_text()).get("ok"):
+        raise SystemExit(f"{rep_path} missing or not ok: freeze only a first request that passed the parity gate")
+    if path.parent.name != meta["run_id"]:
+        raise SystemExit(f"{path} belongs to run {path.parent.name}, not this bundle ({meta['run_id']})")
+    return request_digest(body)
+
+
 def build_job_config(*, adapter, bundle: Path, task_dir: Path, job_name: str, jobs_dir: Path,
                      snapshot_state: Path | None = None, snapshot_id: str | None = None, fake: bool = False,
                      verifier: bool = True, model: str | None = None, upstream_url: str | None = None,
                      extra_env: dict[str, str] | None = None, extra_kwargs: dict[str, Any] | None = None,
                      original_trial_dir: str | None = None, setup_timeout_s: float = 1200.0,
                      passthrough_args: list[str] | None = None, parity_gate: str = "auto",
-                     max_model_requests: int | None = None) -> dict[str, Any]:
+                     max_model_requests: int | None = None,
+                     freeze_first_request: str | None = None) -> dict[str, Any]:
     bundle, meta = load_bundle(bundle)
     bundle = bundle.resolve()
     task_dir = task_dir.resolve()
@@ -112,6 +128,11 @@ def build_job_config(*, adapter, bundle: Path, task_dir: Path, job_name: str, jo
     if parity_gate == "require" and not meta.get("orig_request_at_k"):
         raise SystemExit("--parity-gate require: bundle has no orig_request_at_k "
                          f"({meta.get('orig_request_locate_error')})")
+    if freeze_first_request:
+        kwargs["expected_first_request_sha256"] = frozen_first_request_digest(Path(freeze_first_request), meta)
+    elif parity_gate == "require" and not fake:
+        raise SystemExit("--parity-gate require for a real run needs --freeze-first-request <first_request_rewritten.json "
+                         "of a --fake run of this bundle that passed the parity gate>")
     if max_model_requests is not None:
         if max_model_requests < 1:
             raise SystemExit("--max-model-requests must be >= 1")
