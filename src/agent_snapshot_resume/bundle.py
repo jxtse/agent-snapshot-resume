@@ -270,6 +270,13 @@ def build(*, adapter, trial_dir: Path, atif_step: int | None, out: Path, mode: s
         orig_request["content"] = parity.content_reference(
             prefix, adapter.rendered_attachment_templates(ir.get("cc_version")))
     agent_model = model or ((result.get("config") or {}).get("agent") or {}).get("model_name") or ir.get("model")
+    roots = fingerprint_roots or default_fingerprint_roots(plan)
+    optional_roots: list[str] = []
+    if roots is None and not plan["actions"]:
+        # An empty replay plan cannot change the task files, and a task image may have no /app at all: fingerprint
+        # /app as an *optional* root, so the clone must match "all files present with these hashes" or "absent too".
+        from .replay.fingerprint import DEFAULT_ROOTS
+        roots, optional_roots = [str(r) for r in DEFAULT_ROOTS], [str(r) for r in DEFAULT_ROOTS]
     meta = {
         "run_id": run_id, "agent": adapter.name, "trial": trial, "trial_dir": str(trial_dir), "task": task,
         "task_path": str(task_dir.resolve()) if task_dir else None, "orig_reward": reward,
@@ -283,7 +290,8 @@ def build(*, adapter, trial_dir: Path, atif_step: int | None, out: Path, mode: s
         "resume_cost": rp, "n_replay_actions": len(plan["actions"]), "flags": ir["flags"],
         "n_compactions_before_cut": n_compactions, "orig_request_at_k": orig_request,
         "orig_request_locate_error": loc.get("error"),
-        "fingerprint_roots": fingerprint_roots or default_fingerprint_roots(plan),
+        "fingerprint_roots": roots,
+        "fingerprint_optional_roots": optional_roots,
         "replay_reviewed_exceptions": {},
         "built_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
         "orig_step_k_preview": [{"type": e["type"], "tool": e.get("tool"),

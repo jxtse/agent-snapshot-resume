@@ -89,7 +89,8 @@ class Batch:
                  runs_dir: Path, state_dir: Path, agent_env: dict[str, str] | None = None,
                  passthrough_args: list[str] | None = None, model: str | None = None,
                  upstream_url: str | None = None, hinted_reps: int = 2, control_reps: int = 1,
-                 midrun_snapshot_every: float = 1200.0, cut_window: int = 24, prep_concurrency: int = 6,
+                 midrun_snapshot_every: float = 1200.0, cut_window: int = 200, max_cut_candidates: int = 16,
+                 prep_concurrency: int = 6,
                  launch_concurrency: int = 20, only: list[str] | None = None, agent: str = "claude-code",
                  verifier: bool = True, log=print):
         self.name, self.work = name, Path(work_dir)
@@ -105,6 +106,7 @@ class Batch:
         self.hinted_reps, self.control_reps = hinted_reps, control_reps
         self.midrun_every = midrun_snapshot_every
         self.cut_window = cut_window
+        self.max_cut_candidates = max_cut_candidates
         self.prep_concurrency, self.launch_concurrency = prep_concurrency, launch_concurrency
         self.agent_name, self.verifier = agent, verifier
         self.state = State(self.batch_dir)
@@ -150,6 +152,9 @@ class Batch:
         if out.is_file():
             rep = json.loads(out.read_text())
             if rep.get("manifest_cut") == row["cut_line"]:
+                if rep.get("cut_line") is None:
+                    raise RuntimeError(f"every cut in the fork window blocks ({len(rep.get('candidates') or [])} "
+                                       "candidates): see screen.json")
                 return rep
         src = self.source(row)
         trial_dir = Path(src["trial_dir"])
@@ -179,7 +184,7 @@ class Batch:
         cands = [near] + sorted((s for s in pool if s != near), key=lambda s: (abs(s - near), s))
         by_cut: dict[int, dict[str, Any]] = {}
         skipped: list[dict[str, Any]] = []
-        for c in cands[:8]:
+        for c in cands[:self.max_cut_candidates]:
             try:
                 rep = screen.screen_trial(self.adapter, trial_dir, cut_lines=[c], task_dir=self.task_dir(row), ir=ir)
             except (SystemExit, ValueError) as exc:  # e.g. a step at index 0 has no prefix to replay
@@ -282,12 +287,13 @@ class Batch:
         task = row["task"]
         ud = self.unit_dir(task)
         out: dict[str, Any] = {"runs": {}}
+        cache_path = ud / "fake.json"
+        cache = json.loads(cache_path.read_text()) if cache_path.is_file() else {}
         for kind, b in bundled["bundles"].items():
             job = f"{self.job(row, 'fake-' + kind)}"
-            frozen = ud / f"freeze-{kind}.json"
-            rep = ud / f"fake-parity-{kind}.json"
-            if frozen.is_file() and rep.is_file() and json.loads(rep.read_text()).get("ok"):
-                out["runs"][kind] = {"job": job, "first_request": str(frozen), "parity_ok": True, "cached": True}
+            cached = (cache.get("runs") or {}).get(kind) or {}
+            if cached.get("parity_ok") and Path(cached.get("first_request", "")).is_file():
+                out["runs"][kind] = {**cached, "cached": True}
                 continue
             rc = launch_one(adapter=self.adapter, bundle=Path(b["dir"]), task_dir=self.task_dir(row), job_name=job,
                             jobs_dir=self.jobs_dir, runs_dir=self.runs_dir, snapshot_state=snap_path, fake=True,
@@ -306,11 +312,13 @@ class Batch:
             if not first.is_file() or not parity.is_file():
                 raise RuntimeError(f"fake run {job} missed {first.name}/{parity.name}")
             ok = bool(json.loads(parity.read_text()).get("ok"))
-            frozen.write_text(first.read_text())
-            rep.write_text(parity.read_text())
+            (ud / f"fake-parity-{kind}.json").write_text(parity.read_text())  # record for the batch, not for freezing
             if not ok:
                 raise RuntimeError(f"fake parity failed for {kind}: {parity}")
-            out["runs"][kind] = {"job": job, "first_request": str(frozen), "parity_ok": True, "trial": str(trial)}
+            # --freeze-first-request resolves the parity report and the bundle identity *next to* this file, so pass
+            # the request where the fake run wrote it (inside the trial's resume-proxy log), never a copy.
+            out["runs"][kind] = {"job": job, "first_request": str(first), "parity_ok": True, "trial": str(trial),
+                                 "parity_report": str(parity)}
         (ud / "fake.json").write_text(json.dumps(out, indent=1))
         return out
 

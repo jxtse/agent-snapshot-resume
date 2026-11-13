@@ -187,7 +187,8 @@ def cmd_batch(a):
               passthrough_args=shlex.split(a.passthrough_args) if a.passthrough_args else None,
               model=a.model, upstream_url=a.upstream_url, hinted_reps=a.hinted_reps,
               control_reps=a.control_reps, midrun_snapshot_every=a.midrun_snapshot_every,
-              cut_window=a.cut_window, prep_concurrency=a.prep_concurrency,
+              cut_window=a.cut_window, max_cut_candidates=a.max_cut_candidates,
+              prep_concurrency=a.prep_concurrency,
               launch_concurrency=a.launch_concurrency, only=a.only.split(",") if a.only else None,
               agent=a.agent, verifier=not a.no_verifier)
     if a.mode == "status":
@@ -417,8 +418,10 @@ def build_parser():
     p.add_argument("--control-reps", type=int, default=1)
     p.add_argument("--midrun-snapshot-every", type=float, default=1200.0,
                    help="mid-run snapshots for the hinted runs (0 disables; controls never snapshot)")
-    p.add_argument("--cut-window", type=int, default=24,
-                   help="when a cut blocks the replay screen, try cuts up to this many lines away")
+    p.add_argument("--cut-window", type=int, default=200,
+                   help="when a cut blocks the replay screen, try agent-step starts up to this many lines away "
+                        "(always before the fork)")
+    p.add_argument("--max-cut-candidates", type=int, default=16)
     p.add_argument("--prep-concurrency", type=int, default=6)
     p.add_argument("--launch-concurrency", type=int, default=20)
     p.add_argument("--only", help="comma-separated task names")

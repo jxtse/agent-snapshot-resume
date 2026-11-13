@@ -302,9 +302,23 @@ def validate_replay(plan, report, rc, reviewed_exceptions=None):
             # Bound to the command and to the sha256 of the replay's stdout + NUL + stderr + NUL + rc.
             exact_reviewed = (review.get('kind') == 'reviewed_replay_output' and bound and
                 review.get('replay_output_sha256') == replay_output_sha256(result))
+            # A Python `set` printed directly: the repr order follows the hash seed, so the same items can print in
+            # another order. Accept only when every line is identical after canonicalising Python set literals of
+            # quoted strings (items sorted inside the braces) and at least one line did differ.
+            def _canon_sets(lines):
+                def fix(m):
+                    inner = m.group(1)
+                    parts = [p.strip() for p in inner.split(',')]
+                    if inner and all(p[:1] in ("'", '"') and p[-1:] == p[:1] for p in parts):
+                        return '{' + ', '.join(sorted(parts)) + '}'
+                    return m.group(0)
+                return '\n'.join(re.sub(r'\{([^{}]*)\}', fix, l) for l in lines)
+            set_order = (review.get('kind') == 'python_set_repr_order' and bound and fidelity == 'differs' and
+                result.get('rc') == 0 and not result.get('stderr_full') and not action.get('is_error') and
+                len(old) == len(new) and old != new and _canon_sets(old) == _canon_sets(new))
             if not (hardware_only or memory_only or terminal_grep_only or profile_only or timed_grep or timeout_same
                     or ls_dot_only or unseeded or persisted_same or glob_order or timing_number or listing_line
-                    or agent_state or exact_reviewed):
+                    or agent_state or exact_reviewed or set_order):
                 raise RuntimeError('Unaccepted replay fidelity '+str(fidelity)+': '+action['call_id'])
             exit_reviewed = terminal_grep_only or timed_grep or timeout_same or agent_state or exact_reviewed
             result['reviewed_exception'] = ('exact replay output reviewed: ' + str(review.get('note', ''))[:200] if exact_reviewed else
@@ -320,6 +334,7 @@ def validate_replay(plan, report, rc, reviewed_exceptions=None):
                 'identical scientific stdout; command-bound terminal grep returns1 and stderr contains only shell clocks' if timed_grep else
                 'identical scientific output and profiled function identities/counts; explicitly bound aggregate profiler-count difference plus timings' if profile_only and aggregate_reviewed else
                 'identical scientific output, cProfile call counts and profiled function identities; performance timings/order only' if profile_only else
+                'python set(s) printed directly: identical items, hash-seed repr order only' if set_order else
                 'same package/version/CPU output; host-memory report only' if memory_only else
                 'same Python release/compiler, scientific package versions and CPU count; reviewed Python build timestamp and host free-memory report differences')
         if action['side_effect']=='exec' and not exit_reviewed and bool(result.get('rc')) != bool(action.get('is_error')):
