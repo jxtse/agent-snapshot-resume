@@ -166,8 +166,8 @@ class ContentParity(unittest.TestCase):
             self.assertTrue(proxy.check_content(self.rewritten(m), ref, []), m.__name__)
 
     def atts(self):
-        return [{"pos": 0, "type": "date", "values": ["2026-11-03"], "fields": {"date.date": ["2026-11-03"]}},
-                {"pos": 4, "type": "total_tokens_reminder", "values": ["<total_tokens>1 tokens left</total_tokens>"],
+        return [{"pos": 0, "type": "date", "leaves": ["2026-11-03"], "fields": {"date.date": ["2026-11-03"]}},
+                {"pos": 4, "type": "total_tokens_reminder", "leaves": ["<total_tokens>1 tokens left</total_tokens>"],
                  "fields": {"total_tokens_reminder.text": ["<total_tokens>1 tokens left</total_tokens>"]}}]
 
     def templates(self):
@@ -198,8 +198,23 @@ class ContentParity(unittest.TestCase):
         ref.update(attachments=atts, rendered_templates=self.templates())
         self.assertTrue(proxy.check_content(self.rewritten(), ref, []))
 
+    def test_file_content_bound_in_order(self):
+        att = [{"type": "file", "leaves": ["/app/c.cfg", "enabled = True\nenabled = False\nmode = 1\n"],
+                "fields": {"file.filename": ["/app/c.cfg"]}}]
+        tpl = {"fixed": ["Result of calling the Read tool:"],
+               "slots": [['Called the Read tool with the following input: {"file_path":"\x00"}', ["file.filename"]]]}
+        head = 'Called the Read tool with the following input: {"file_path":"/app/c.cfg"}\nResult of calling the Read tool:\n'
+        ok = head + "1\tenabled = True\n2\tenabled = False\n3\tmode = 1\n4\t\n"
+        self.assertEqual(proxy.rendered_text_problems(ok, att, tpl), [])
+        for bad in (head + "1\tenabled = False\n2\tenabled = True\n3\tmode = 1\n4\t\n",       # reordered
+                    head + "1\tenabled = True\n2\tenabled = False\n2\tenabled = False\n3\tmode = 1\n",  # dup
+                    head + "1\tenabled = True\n3\tmode = 1\n4\t\n",                            # omitted
+                    head + "1\tenabled = True\n2\tenabled = False\n3\tmode = 2\n4\t\n",       # altered
+                    ok + ok):                                                                     # leaf twice
+            self.assertTrue(proxy.rendered_text_problems(bad, att, tpl), bad)
+
     def test_template_slots_bound_to_fields(self):
-        env = {"type": "environment", "values": ["/app/aaa", "/app/bbb", "linux"],
+        env = {"type": "environment", "leaves": ["/app/aaa", "/app/bbb", "linux"],
                "fields": {"environment.snapshot.workingDirectory": ["/app/aaa"],
                           "environment.changes.from": ["/app/bbb"], "environment.snapshot.platform": ["linux"]}}
         tpl = {"fixed": [], "slots": [["- Platform: \x00", ["environment.snapshot.platform"]],
@@ -263,7 +278,7 @@ class ProxyGateFailClosed(unittest.IsolatedAsyncioTestCase):
         orig = original_shape()
         ref = {"message_block_sha256": [block_digest(b) for b, _ in blocks_from_request(orig["messages"])
                                         if b[0] != "system"], "n_attachments": 2,
-               "attachments": [{"pos": 0, "type": "date", "values": ["2026-11-03"], "fields": {"date.date": ["2026-11-03"]}}],
+               "attachments": [{"pos": 0, "type": "date", "leaves": ["2026-11-03"], "fields": {"date.date": ["2026-11-03"]}}],
                "rendered_templates": {"fixed": [], "slots": [["Today's date is \x00.", ["date.date"]]]}}
         exp = dict(expected_for(orig), content=ref)
         body = resumed_body()

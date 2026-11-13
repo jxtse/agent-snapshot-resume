@@ -56,22 +56,54 @@ def _timing_context(command, result):
     return bool(re.search(TIMING_CALL, command) or result.get("scripts_measure_time"))
 
 
+def _is_measurement(before, after):
+    """Context of a duration value (number[+unit]) that shows it was measured, not configured: directly after a
+    timing label (`took 0.13s`, `elapsed: 4`), in parentheses (`(0.07s)`), after `OK`, or at the end of a
+    `<several words>: <duration>` line (`niter 6 dt_g None: 0.129s`). `key: 10 s`, `key=60s`, `timeout60s` are data."""
+    return bool(re.search(TIMING_BEFORE, before)
+                or (re.search(r"\(\s*$", before) and re.match(r"\s*\)", after))
+                or re.search(r"\bOK\s+$", before)
+                or (re.search(r"\S\s+\S[^=]*:\s*$", before) and re.fullmatch(r"\s*(?:s|ms|sec|secs|seconds)?\s*", after)))
+
+
 def _durations_close(a, b):
     """Same line except measured durations that differ by at most 50% (run-to-run jitter). A differing duration
-    must be a measurement, not data: number + time unit not attached to a key (`retry_interval=60s`,
-    `exposure: 10 s` are data) and not part of a word/identifier."""
+    counts as a measurement only in a measurement form: directly after a timing label (`took 0.13s`, `time: 4 s`),
+    in parentheses (`(0.07s)`), after `OK`, or as a `<label>: <duration>` line end (`niter 6 dt_g None: 0.129s`)
+    where the label is not a key (no `=`, and the line is not `key: value` with a single identifier key).
+    Configuration-like values (`retry_interval=60s`, `exposure: 10 s`, `timeout60s`) are data."""
     if DURATION.sub("<D>", a) != DURATION.sub("<D>", b):
         return False
     for x, y in zip(DURATION.finditer(a), DURATION.finditer(b)):
         if x.group() == y.group():
             continue
-        before = a[:x.start()]
-        if re.search(r"=\s*$|[\w.-]$", before) and not re.search(TIMING_BEFORE, before):
+        if not _is_measurement(a[:x.start()], a[x.end():]):
             return False
         u, v = float(x.group(1)), float(y.group(1))
         if x.group(3) != y.group(3) or abs(u - v) > max(0.5 * max(u, v), 0.05):
             return False
     return True
+
+
+def _created_during_run(ls_date, run_start):
+    """The original `ls -l` date of a row is at or after the original run's first action (UTC; the task image's
+    clock), i.e. the agent created or modified that file during the run, so the replay necessarily re-created it at
+    a new time. Task inputs (older mtimes, or the `Mon DD YYYY` form) must keep their date. Unknown -> False."""
+    import datetime as dt
+    if not run_start:
+        return False
+    m = re.fullmatch(r"([A-Z][a-z]{2})\s+(\d{1,2})\s+(\d{2}):(\d{2})", ls_date.strip())
+    if not m:
+        return False
+    try:
+        t0 = dt.datetime.fromisoformat(run_start.replace("Z", "+00:00")).replace(tzinfo=None)
+        mon = dt.datetime.strptime(m.group(1), "%b").month
+        cand = dt.datetime(t0.year, mon, int(m.group(2)), int(m.group(3)), int(m.group(4)))
+    except ValueError:
+        return False
+    if cand > t0 + dt.timedelta(days=200):  # ls shows the year only for old files: Dec listing in a Jan run
+        cand = cand.replace(year=t0.year - 1)
+    return cand >= t0 - dt.timedelta(minutes=1)  # minute resolution
 
 
 def line_equivalent(a, b, command, result):
@@ -81,7 +113,9 @@ def line_equivalent(a, b, command, result):
         return True
     if re.search(r"\bls\s+-\w*l", command):
         ma, mb = LS_ROW.match(a), LS_ROW.match(b)
-        if ma and mb and ma.group(1).split() == mb.group(1).split() and ma.group(3) == mb.group(3):
+        if (ma and mb and ma.group(1).split() == mb.group(1).split() and ma.group(3) == mb.group(3)
+                and _created_during_run(ma.group(2), result.get("_run_start"))
+                and _created_during_run(mb.group(2), result.get("_run_start"))):
             return True
     return _timing_context(command, result) and _durations_close(a, b)
 
@@ -100,18 +134,13 @@ def _only_timing_numbers_differ(a, b):
     for x, y in zip(ma, mb):
         if x.group() == y.group():
             continue
-        before = a[:x.start()]
-        if not (re.search(TIMING_BEFORE, before) or re.search(TIMING_AFTER, a[x.end():])):
-            return False
-        # a unit alone does not make a measurement: `retry_interval=60s`, `timeout60s` are data (assignments and
-        # identifiers); `label: 0.13s` printed by code that measures time is a measurement
-        if not re.search(TIMING_BEFORE, before) and re.search(r"=\s*$|[\w.-]$", before):
+        if not _is_measurement(a[:x.start()], a[x.end():]):
             return False
         u, v = abs(float(x.group())), abs(float(y.group()))
         if abs(u - v) > max(0.5 * max(u, v), 0.05):  # run-to-run jitter only
             return False
     return True
-TIMING_CALL = r"time\.time\(|perf_counter|time\.monotonic|process_time|timeit|datetime\.now\(|\btime\s+(?:python|bash|\./)"
+TIMING_CALL = r"time\.time\(|perf_counter|time\.monotonic|process_time|timeit|datetime\.now\("
 
 
 def _replayed_text(result):
@@ -152,6 +181,25 @@ def _heredoc_part(command):
     return _heredoc_split(command)[1]
 
 
+def _final_stage_is_grep(command):
+    """The command's exit status is that of a final plain pipeline ending in grep/rg/egrep, so status 1 can only
+    mean "no match". Shell text (heredoc bodies excluded) is split at newlines and `;` (the last command always runs
+    and alone sets the status); that last command must be `a | b | grep ...` with no `&&`, `||`, `&` (a failing
+    left side could return 1 itself), no stderr redirection (a failing earlier stage must show on stderr), no
+    subshell/substitution/braces; `pipefail` anywhere disqualifies. Anything else is ambiguous."""
+    sh = _heredoc_split(command)[0]
+    if "pipefail" in sh or re.search(r"`|\$\(", sh):
+        return False
+    final = [seg.strip() for seg in re.split(r"[\n;]", sh) if seg.strip()]
+    if not final:
+        return False
+    last = final[-1]
+    if re.search(r"[(){}]|&&|\|\||&|2>", last):
+        return False
+    stages = last.split("|")
+    return len(stages) >= 2 and bool(re.match(r"(?:grep|egrep|rg)\s", stages[-1].strip()))
+
+
 def _stderr_placement_equal(action, result, f):
     """The original text equals the replay's stdout IN ORDER once the replay's stderr lines are taken out of it
     (Claude Code interleaves stderr differently from `stdout + stderr`), with every line mapped through f."""
@@ -177,16 +225,19 @@ def _stderr_placement_equal(action, result, f):
 def automatic_equivalence(action, result):
     """Generic, review-free acceptance classes for replay outputs that differ only in ways that cannot reflect a
     different task state. Returns a reason string or None. Each class is narrow and checked on the full output:
-      cc_grep_no_match      last pipeline stage is grep/rg, replay rc=1 (no match), the original was not an error (CC
-                            renders that case as success) and the full stdout is identical; no stderr.
+      cc_grep_no_match      the command's last command (after the last newline/`;`) is a plain pipeline ending in
+                            grep/rg (_final_stage_is_grep: no `&&`, `||`, `&`, stderr redirection, subshell; no
+                            pipefail), replay rc=1 (no match), the original was not an error (CC renders that case as
+                            success), the full stdout is identical; no stderr.
       ls_dot_entries_only   `ls -l*` listings whose only difference is the `.`/`..` rows and `total` block counts
                             (some sandbox filesystems omit them); every other row identical up to metadata-column
                             padding, file names exact.
       evidence_bound_volatile
                             line by line, in order, every differing line is an `ls -l` row whose date column alone
-                            differs (command runs ls -l, file name exact) or, in a timing context (the command or a
-                            script it runs measures time, or uses `time`), the same line with durations (number +
-                            time unit) within 50% of each other. No other masking (no addresses, dates, pids).
+                            differs and whose original date is at/after the original run's first action (a file the
+                            run created; command runs ls -l, file name exact), or, in a timing context (the command's
+                            code or a script it runs measures time), the same line with durations in a measurement
+                            form (_durations_close) within 50% of each other. No other masking.
       shell_diagnostic_prefix_only
                             bash's own error prefix differs (`/bin/bash: eval: line 18:` vs `bash: -c: line 9:`);
                             the original equals the replay's stdout in order once the replay's stderr lines are
@@ -196,8 +247,9 @@ def automatic_equivalence(action, result):
                             the timing report lines and blank lines the output is equal line by line in order
                             (line_equivalent, as for evidence_bound_volatile).
       ls_mtime_and_stderr_placement_only
-                            the command runs `ls -l`; only the date column of rows in ls -l format differs (files
-                            the replay re-created), plus the stderr placement freedom above; stdout order kept.
+                            the command runs `ls -l`; only the date column of rows in ls -l format differs, for rows
+                            whose original date is at/after the original run's first action (files the run created
+                            and the replay re-created), plus the stderr placement freedom above; stdout order kept.
       cprofile_timings_only a cProfile/pstats table (possibly truncated by head) with identical rows: call counts and
                             function identities in the same order; only the four timing columns and the header's
                             total seconds differ. All non-table lines identical.
@@ -212,8 +264,7 @@ def automatic_equivalence(action, result):
         return None
     command = (action.get("args") or {}).get("command", "")
     # Claude Code reports a command whose last pipeline stage is grep/rg returning 1 (no match) as a non-error.
-    last = command.rstrip().splitlines()[-1] if command.strip() else ""
-    if (result.get("rc") == 1 and not action.get("is_error") and re.search(r"\|\s*(?:grep|rg|egrep)\s", last)
+    if (result.get("rc") == 1 and not action.get("is_error") and _final_stage_is_grep(command)
             and not result.get("stderr_full")
             and norm(action.get("orig_text") or "") == norm(result.get("stdout_full", ""))):
         return "cc_grep_no_match"
@@ -252,8 +303,14 @@ def automatic_equivalence(action, result):
     # `ls -l` rows of files the command itself (re)created carry the replay's mtime: mask only the date column of
     # rows in ls -l format, in commands that run ls -l, combined with stderr placement
     if re.search(r"\bls\s+-\w*l", command):
-        mask = lambda l: LS_ROW.sub(r"\1 <MTIME> \3", l)
-        if (_stderr_placement_equal(action, result, mask) and not _stderr_placement_equal(action, result, None)):
+        def mask(l):
+            # only dates at/after the original run's start: rows of files the run created (both sides; the replay's
+            # own dates are later still). An input file whose date changed stays unmasked on the original side.
+            m = LS_ROW.match(l)
+            return (LS_ROW.sub(r"\1 <MTIME> \3", l)
+                    if m and _created_during_run(m.group(2), result.get("_run_start")) else l)
+        if (_stderr_placement_equal(action, result, mask)
+                and not _stderr_placement_equal(action, result, None)):
             return "ls_mtime_and_stderr_placement_only"
     if re.search(r"\bcProfile\b|\bprofile\.run\(|pstats", command) and len(old) == len(new):
         row = re.compile(r"\s*(\d+(?:/\d+)?)\s+(?:\d+\.\d+\s+){4}(.+)")
@@ -279,7 +336,9 @@ def validate_replay(plan, report, rc, reviewed_exceptions=None):
     # Line-order classes of the replayer are accepted only when the reordering is explained by stderr placement
     # (Claude Code interleaves stderr into the text differently); reordered stdout is never accepted silently.
     order_maps = {'same_lines_reordered': None, 'line_alignment_and_order_only': lambda l: l.strip()}
+    run_start = (plan.get('actions') or [{}])[0].get('timestamp')  # original run's first action (UTC)
     for action, result in zip(plan['actions'],report['results']):
+        result['_run_start'] = run_start
         if result.get('call_id') != action['call_id']:
             raise RuntimeError('Replay action identity mismatch')
         if result.get('pacing_unmet'):

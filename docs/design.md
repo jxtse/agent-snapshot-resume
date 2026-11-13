@@ -79,9 +79,13 @@ Harbor's `override_timeout_sec`. The sandbox also enforces it itself (`bounded_r
   `line_alignment_and_order_only`, `numbers_differ`, `differs`. The gate accepts the three order classes only when
   the reordering is explained by stderr placement (the original equals the replay's stdout in order once the
   replay's stderr lines are taken out). `volatile_only` is not accepted as such: a line may differ only as an
-  `ls -l` row whose date column alone changed (command runs `ls -l`, file name exact) or, in a timing context (the
-  command, or a script it runs, measures time — the replayer records `scripts_measure_time` inside the sandbox),
-  in durations within run-to-run jitter. Addresses, pids, timestamps and other data are never masked
+  `ls -l` row whose date column alone changed and whose original date is at/after the original run's first action
+  (a file the run created; input files keep their dates), or, in a timing context (the command's code, or a script
+  it runs, measures time — the replayer records `scripts_measure_time` inside the sandbox; the shell `time`
+  keyword only covers its own report), in durations in a measurement form (after a timing label, in parentheses,
+  after `OK`, or ending a `<words>: <duration>` line; never `key: value` / `key=value`) within run-to-run jitter.
+  The grep no-match class requires the last command to be a plain pipeline ending in grep (no `&&`/`||`/`&`,
+  stderr redirection, subshell or pipefail). Addresses, pids, timestamps and other data are never masked
   automatically. An empty successful result equals Claude Code's
   `(Bash completed with no output)`.
 - Background output files get the agent's completion trailer (`plan.json["bg_output_trailer"]`; Claude Code 2.1.280
@@ -207,7 +211,9 @@ rejects the first request with 400, before anything is sent upstream, unless
   only be system-role messages, the hint block, or user text that starts with a rendered-attachment marker, no
   more of them than the prefix has attachments, and every line of them must be explained by the attachments
   persisted at the same context position (block index, +-1 for a reminder rendered onto the neighbouring tool
-  result): a whole persisted value of one of them, a fixed rendering line, or a slot template of the agent version
+  result), parsed in order: a whole persisted leaf value of one of them as an exact contiguous block (multi-line
+  file contents verbatim or numbered as the Read tool renders them; each leaf used once, so reordered, duplicated or
+  omitted lines fail), a fixed rendering line, or a slot template of the agent version
   (`CC_RENDERED_ATTACHMENT_TEMPLATES`, collected from real 2.1.280 resumes) whose every slot is filled by the named
   field (`<attachment type>.<path>`) of one of those attachments — so no instruction text, date, token count or
   environment value can appear that the original did not carry there, and values cannot move between fields or

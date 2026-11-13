@@ -295,14 +295,9 @@ _LINENO_RE = re.compile(r"(?m)^\s*\d+\t")  # Read-tool rendering "N<TAB>line"
 
 
 def rendered_line_ok(line, attachments, templates):
-    """A line of rendered attachment text is explained iff it is a whole persisted value of one of `attachments`
-    (the attachments persisted at this context position), a fixed rendering line, or a slot template whose every
-    slot is filled by the named field of an attachment of the named type among `attachments`.
-    attachments: [{"type": ..., "values": [...], "fields": {"<type>.<path>": [...]}}]"""
-    line = line.strip()
-    if not line or line in (templates or {}).get("fixed", ()):
-        return True
-    if any(line in a["values"] for a in attachments):
+    """A single line is a fixed rendering line, or a slot template whose every slot is filled by the named field
+    (`<type>.<path>`) of one of `attachments`. attachments: [{"fields": {"<type>.<path>": [values]}, ...}]"""
+    if line in (templates or {}).get("fixed", ()):
         return True
     for tpl, fields in (templates or {}).get("slots", ()):
         parts = tpl.split("\x00")
@@ -325,9 +320,42 @@ def _fill_slots(rest, middles, cands):
     return False
 
 
+def _leaf_forms(v):
+    """How a persisted value appears as consecutive request lines: verbatim, or numbered as the Read tool renders
+    file contents ("N<TAB>line"), with or without its final empty line."""
+    lines = v.split("\n")
+    forms = [lines] + ([lines[:-1]] if len(lines) > 1 and lines[-1] == "" else [])
+    return forms + [[f"{k + 1}\t{x}" for k, x in enumerate(f)] for f in forms]
+
+
 def rendered_text_problems(text, attachments, templates):
-    return [l.strip() for l in _LINENO_RE.sub("", text).split("\n")
-            if not rendered_line_ok(l, attachments, templates)]
+    """Parse rendered attachment text in order. Each line must start a whole persisted leaf value of one of
+    `attachments` (multi-line values as one contiguous block, exactly, each leaf consumed at most once), or be a
+    fixed rendering line / filled slot template (rendered_line_ok). Reordered, duplicated, altered or foreign lines
+    fail; the longest leaf match wins. attachments: [{"leaves": [...], "fields": {...}}]."""
+    lines = text.split("\n")
+    avail = {}
+    for ai, a in enumerate(attachments):
+        for li, v in enumerate(a.get("leaves", ())):
+            avail[(ai, li)] = _leaf_forms(v)
+    bad, i = [], 0
+    while i < len(lines):
+        if lines[i] == "":
+            i += 1
+            continue
+        best = None
+        for key, forms in avail.items():
+            for f in forms:
+                if f and lines[i:i + len(f)] == f and (best is None or len(f) > best[0]):
+                    best = (len(f), key)
+        if best:
+            del avail[best[1]]
+            i += best[0]
+            continue
+        if not rendered_line_ok(lines[i], attachments, templates):
+            bad.append(lines[i])
+        i += 1
+    return bad
 
 
 def tool_digest(t):
@@ -350,8 +378,9 @@ def check_content(body, ref, hints):
                      (a tool_result may carry an appended <system-reminder> suffix); every other block must be a
                      system-role message, an exact hint block, or user text that starts with a rendered-attachment
                      marker; their number must not exceed the prefix's attachment count, and every line of
-                     them must be explained by the attachments persisted at the same context position: a whole
-                     value, a fixed rendering line, or a slot template filled field by field (rendered_line_ok)
+                     them must be explained, in order, by the attachments persisted at the same context position:
+                     whole leaf values as exact contiguous blocks (each used once), fixed rendering lines, or slot
+                     templates filled field by field (rendered_text_problems)
       completeness   require_complete: fail if the prefix had no prompt snapshot (system/tools unbound)
     """
     problems = []

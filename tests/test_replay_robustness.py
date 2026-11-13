@@ -19,7 +19,7 @@ def sha(s):
 
 def one(command, orig, stdout, stderr="", rc=0, is_error=False, fidelity=None, side_effect="exec", **extra):
     a = {"call_id": "c1", "side_effect": side_effect, "tool": "Bash", "args": {"command": command},
-         "orig_text": orig, "is_error": is_error, **extra}
+         "orig_text": orig, "is_error": is_error, "timestamp": "2026-11-02T20:00:00.000Z", **extra}
     if fidelity is None:  # classify exactly as the replayer does
         fidelity = replay.compare(orig, replay.cc_bash_text({"stdout": stdout, "stderr": stderr}), rc)
     r = {"call_id": "c1", "fidelity": fidelity, "stdout_full": stdout, "stderr_full": stderr, "rc": rc,
@@ -63,6 +63,11 @@ class AutomaticEquivalence(unittest.TestCase):
         self.assertTrue(passes(*one(cmd, "saved 22", "saved 22\n", rc=1)))
         self.assertFalse(passes(*one(cmd, "saved 22", "saved 23\n", rc=1)))
         self.assertFalse(passes(*one("python3 run.py", "saved 22", "saved 22\n", rc=1)), "not a grep pipeline")
+        for bad in ("echo done; printf x | grep x >/dev/null; test -f /app/required",
+                    "echo done; test -f /app/required && cat f | grep x",
+                    "echo done; cat f | grep x || true", "set -o pipefail; cat f | grep x",
+                    "echo done; cat f 2>/dev/null | grep x", "echo done; (cat f | grep x)"):
+            self.assertFalse(passes(*one(bad, "done", "done\n", rc=1)), bad)
 
     def test_listing_order_is_not_automatic(self):
         # token-sorted comparison would hide swapped field values (review counterexample)
@@ -122,11 +127,23 @@ class AutomaticEquivalence(unittest.TestCase):
                                      "event 2021-05-05T00:00:00 a\n", stderr="warn\n")))
 
     def test_ls_mtime_only_in_ls_rows(self):
+        # run started 2026-11-02T20:00Z (first action): a.csv dated 20:17 was created by the run
         o = "w\n-rw-r--r-- 1 root root 5 Nov  2 20:17 a.csv"
         n = "-rw-r--r-- 1 root root 5 Nov 13 04:47 a.csv\n"
         self.assertTrue(passes(*one("python3 mk.py; ls -la out", o, n, stderr="w\n")))
         self.assertFalse(passes(*one("python3 mk.py; ls -la out", o, n.replace(" 5 ", " 6 "), stderr="w\n")))
         self.assertFalse(passes(*one("cat log", "w\nrun Nov  2 20:17 ok", "run Nov 13 04:47 ok\n", stderr="w\n")))
+
+    def test_input_file_mtime_change_rejected(self):
+        # input.csv dated before the run started: its date must be identical (freshness checks depend on it)
+        o = "-rw-r--r-- 1 root root 5 Oct  1 00:00 input.csv"
+        n = "-rw-r--r-- 1 root root 5 Nov  1 00:00 input.csv\n"
+        self.assertFalse(passes(*one("ls -l input.csv", o, n)))
+        o2 = "total 8\n-rw-r--r-- 1 root root 5 Oct  1 00:00 input.csv"
+        n2 = ("total 8\ndrwxr-xr-x 2 root root 4096 Nov 13 04:47 .\n"
+              "-rw-r--r-- 1 root root 5 Nov  1 00:00 input.csv\n")
+        self.assertFalse(passes(*one("ls -la d", o2, n2)))
+        self.assertFalse(passes(*one("ls -l input.csv; make", o + "\nup to date", n + "up to date\n")))
 
     def test_task_timestamps_rejected_even_in_order_and_under_time(self):
         o, n = "event 2020-01-01T00:00:00 a", "event 2021-05-05T00:00:00 a\n"
@@ -165,6 +182,19 @@ class AutomaticEquivalence(unittest.TestCase):
         cmd = "python3 - <<'EOF'\nimport time\nt=time.time()\nprint(open('c').read())\nEOF"
         self.assertFalse(passes(*one(cmd, "retry_interval=60s", "retry_interval=70s\n")))
         self.assertFalse(passes(*one(cmd, "timeout60s", "timeout70s\n")))
+        self.assertFalse(passes(*one(cmd, "exposure: 10 s", "exposure: 15 s\n")), "key: value config")
+        self.assertFalse(passes(*one("time python3 show_config.py", "exposure: 10 s", "exposure: 15 s\n")))
+        p_, r_ = one("python3 show_config.py", "exposure: 10 s", "exposure: 15 s\n")
+        r_["results"][0]["scripts_measure_time"] = True
+        self.assertFalse(passes(p_, r_), "a script that measures time can still print config durations")
+
+    def test_measurement_forms_accepted(self):
+        cmd = "python3 - <<'EOF'\nimport time\nt=time.time()\nEOF"
+        for o, n in (("tau 20->21.55 (0.07s)", "tau 20->21.55 (0.08s)\n"),
+                     ("niter 6 dt_g None: 0.129s", "niter 6 dt_g None: 0.130s\n"),
+                     ("short40   OK 4.3s nout=10", "short40   OK 4.2s nout=10\n"),
+                     ("fit took 3.2 s", "fit took 3.4 s\n")):
+            self.assertTrue(passes(*one(cmd, o, n)), o)
 
     def test_durations_in_timing_context_within_jitter(self):
         cmd = "python3 - <<'EOF'\nimport time\nt=time.time()\nprint('OK %.1fs n=49' % (time.time()-t))\nEOF"

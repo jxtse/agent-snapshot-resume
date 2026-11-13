@@ -70,23 +70,26 @@ def locate_request(ir: dict[str, Any], k_index: int, requests: list[dict[str, An
     return {"error": "original request for step k not identifiable (no unique usage match, failed attempts logged)"}
 
 
-def _values(x, key=None) -> set[str]:
-    """Every leaf value of a persisted attachment, as whole strings and as their stripped lines (numbers as str)."""
-    out: set[str] = set()
-    if isinstance(x, str):
-        if key != "type":
-            out.add(x.strip())
-            out |= {l.strip() for l in x.split("\n") if l.strip()}
-    elif isinstance(x, dict):
-        for k, v in x.items():
-            out |= _values(v, k)
-    elif isinstance(x, list):
-        for v in x:
-            out |= _values(v, key)
-    elif isinstance(x, bool):
-        out.add("true" if x else "false")
-    elif isinstance(x, (int, float)):
-        out.add(str(x))
+def _leaves(att: dict[str, Any]) -> list[str]:
+    """Every leaf value of an attachment, whole and in order (multi-line file contents stay one leaf)."""
+    out: list[str] = []
+
+    def walk(x, key=None):
+        if isinstance(x, str):
+            if key != "type":
+                out.append(x)
+        elif isinstance(x, dict):
+            for k, v in x.items():
+                walk(v, k)
+        elif isinstance(x, list):
+            for v in x:
+                walk(v, key)
+        elif isinstance(x, bool):
+            out.append("true" if x else "false")
+        elif isinstance(x, (int, float)):
+            out.append(str(x))
+
+    walk({k: v for k, v in att.items() if k != "type"})
     return out
 
 
@@ -132,7 +135,7 @@ def content_reference(session_lines: list[dict[str, Any]], templates: list[str] 
             n_blocks = len(_bfs(ctx[:ctx.index(d) + 1]))
         a = d.get("attachment") or {}
         if d.get("type") == "attachment" and a.get("type") != "prompt_snapshot":
-            attachments.append({"pos": n_blocks, "type": a.get("type"), "values": sorted(_values(a)),
+            attachments.append({"pos": n_blocks, "type": a.get("type"), "leaves": _leaves(a),
                                 "fields": _fields(a)})
     ref: dict[str, Any] = {"message_block_sha256": [block_digest(b) for b in blocks_from_session(ctx)],
                            "n_attachments": sum(1 for d in ctx if d.get("type") == "attachment"),
