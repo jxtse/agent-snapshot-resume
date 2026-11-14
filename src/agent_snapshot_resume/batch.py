@@ -264,6 +264,15 @@ class Batch:
                                              task_dir=self.task_dir(row), mode=spec["mode"], hint=spec["hint"],
                                              run_id=spec["run_id"], persist_hint=(spec["mode"] == "hint"),
                                              force=True)
+            # Reviewed replay exceptions are an *input* to the bundle, not something to be produced by hand after
+            # every rebuild: `replay_exceptions.json` next to the unit is merged into bundle.json (and is part of the
+            # cut identity, so a changed review set can never reuse a snapshot prepared under the old one).
+            side = ud / "replay_exceptions.json"
+            if side.is_file():
+                review = json.loads(side.read_text())
+                if (meta.get("replay_reviewed_exceptions") or {}) != review:
+                    meta["replay_reviewed_exceptions"] = review
+                    (bdir / "bundle.json").write_text(json.dumps(meta, ensure_ascii=False, indent=1))
             out["bundles"][kind] = {"dir": str(bdir), "run_id": spec["run_id"], "cut_line": meta.get("cut_line"),
                                     "agent_budget_s": meta.get("agent_budget_s"),
                                     "n_replay_actions": meta.get("n_replay_actions"),
@@ -332,8 +341,18 @@ class Batch:
             job = f"{self.job(row, 'fake-' + kind)}"
             cached = (cache.get("runs") or {}).get(kind) or {}
             if cached.get("parity_ok") and Path(cached.get("first_request", "")).is_file():
-                out["runs"][kind] = {**cached, "cached": True}
-                continue
+                # the proof is only reusable while it was made against this exact bundle: a changed review set or cut
+                # changes the bundle identity, and the real launch checks identity equality against the fake run
+                from .bundle import cut_identity_diff, snapshot_cut_identity
+                ident = Path(cached["first_request"]).parent.parent.parent / "resume" / "bundle_identity.json"
+                theirs = (json.loads(ident.read_text()).get("cut") if ident.is_file() else None) or {}
+                if not cut_identity_diff(snapshot_cut_identity(Path(b["dir"])), theirs):
+                    out["runs"][kind] = {**cached, "cached": True}
+                    continue
+                n = 2
+                while (self.runs_dir / f"{job}-v{n}" / "job.json").is_file():
+                    n += 1
+                job = f"{job}-v{n}"  # a rebuilt bundle needs a fresh parity proof, under a fresh job name
             rc = launch_one(adapter=self.adapter, bundle=Path(b["dir"]), task_dir=self.task_dir(row), job_name=job,
                             jobs_dir=self.jobs_dir, runs_dir=self.runs_dir, snapshot_state=snap_path, fake=True,
                             verifier=False, model=self.model, extra_env=self.agent_env,
@@ -445,10 +464,15 @@ class Batch:
         rows = {r["task"]: r for r in self.rows}
         prep_q: queue.Queue = queue.Queue()
         launch_q: queue.Queue = queue.Queue()
-        results: dict[str, Any] = {"prepared": [], "failed": [], "launched": [], "launch_failed": []}
+        results: dict[str, Any] = {"prepared": [], "failed": [], "launched": [], "launch_failed": [],
+                                   "not_resumable": []}
         lock = threading.Lock()
         for r in self.rows:
             st = self.state.unit(r["task"])
+            if st.get("stage") == "not_resumable":
+                # decided by hand after reviewing the replay divergences: never re-prepared, never launched
+                results.setdefault("not_resumable", []).append(r["task"])
+                continue
             if st.get("stage") == "failed":
                 retry = (self.retry_failed == "all" or
                          (self.retry_failed == "infra" and "Unaccepted replay fidelity" not in (st.get("error") or "")))

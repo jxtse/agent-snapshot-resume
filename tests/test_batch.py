@@ -99,8 +99,12 @@ def fake_build(*, adapter, trial_dir, atif_step, cut_line, out, task_dir, mode, 
     bdir = Path(out) / run_id
     bdir.mkdir(parents=True, exist_ok=True)
     meta = {"run_id": run_id, "cut_line": cut_line, "agent_budget_s": 1000.0, "n_replay_actions": 3,
-            "orig_request_at_k": {"req_bytes": 10}, "mode": mode, "hint": hint}
+            "orig_request_at_k": {"req_bytes": 10}, "mode": mode, "hint": hint,
+            # fields of the cut identity: the driver compares a cached fake run's recorded identity with the bundle
+            "trial": TASK, "session_sha256": "0" * 64, "resume_atif_step": 3,
+            "fingerprint_roots": ["/app"], "fingerprint_optional_roots": []}
     (bdir / "bundle.json").write_text(json.dumps(meta))
+    (bdir / "plan.json").write_text(json.dumps({"actions": [], "initial_cwd": "/app"}))
     return bdir, meta
 
 
@@ -152,6 +156,41 @@ class Prep(unittest.TestCase):
         res2 = self.run_prep(b, scr2, [])
         self.assertEqual(res2["prepared"], [TASK])
         self.assertEqual(scr2.calls, [])
+
+
+    def test_not_resumable_unit_is_never_prepared_or_launched(self):
+        b = make_batch(self.root)
+        b.state.update(TASK, stage="not_resumable", not_resumable_reason="reviewed: replay diverges")
+        scr, launches = Screen({}), []
+        res = self.run_prep(b, scr, launches)
+        self.assertEqual(res["prepared"], [])
+        self.assertEqual(res["not_resumable"], [TASK])
+        self.assertEqual(launches, [])
+        self.assertEqual(scr.calls, [])
+        self.assertEqual(b.state.unit(TASK)["stage"], "not_resumable")
+
+    def test_reviewed_exceptions_sidecar_is_merged_into_every_bundle(self):
+        side = self.root / "batch" / "r1" / "units" / TASK / "replay_exceptions.json"
+        side.parent.mkdir(parents=True, exist_ok=True)
+        review = {"call_00_a": {"kind": "reviewed_masked_output", "mask_version": 1, "order": "ordered",
+                                "command_sha256": "1" * 64, "changed_numbers_reused_later": False, "note": "timings"}}
+        side.write_text(json.dumps(review))
+        b = make_batch(self.root)
+        self.run_prep(b, Screen({}), [])
+        for kind in ("hint", "control"):
+            meta = json.loads((b.unit_dir(TASK) / "bundles" / f"{TASK}-s100-{kind}" / "bundle.json").read_text())
+            self.assertEqual(meta["replay_reviewed_exceptions"], review)
+        # a changed review set invalidates the fake parity proof: the cached fake was made against another identity
+        review["call_00_b"] = dict(review["call_00_a"], command_sha256="2" * 64)
+        side.write_text(json.dumps(review))
+        launches = []
+        self.run_prep(b, Screen({}), launches)
+        fakes = [x["job_name"] for x in launches if "fake-" in x["job_name"]]
+        self.assertTrue(fakes, launches)
+        self.assertTrue(all("-v2" in name for name in fakes), fakes)
+        for kind in ("hint", "control"):
+            meta = json.loads((b.unit_dir(TASK) / "bundles" / f"{TASK}-s100-{kind}" / "bundle.json").read_text())
+            self.assertEqual(meta["replay_reviewed_exceptions"], review)
 
     def test_blocked_cut_moves_inside_the_fork_window(self):
         b = make_batch(self.root)

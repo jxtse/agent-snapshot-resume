@@ -12,10 +12,12 @@ The remaining agent budget is  agent_timeout - elapsed(k),  where agent_timeout 
 """
 from __future__ import annotations
 
+import ast
 import datetime as dt
 import hashlib
 import json
 import re
+import shlex
 import shutil
 import tomllib
 from pathlib import Path
@@ -67,6 +69,51 @@ def snapshot_cut_identity(bundle_dir: Path) -> dict[str, Any]:
             "fingerprint_optional_roots": meta.get("fingerprint_optional_roots"),
             "plan_sha256": hashlib.sha256((bundle_dir / "plan.json").read_bytes()).hexdigest(),
             "replay_reviewed_exceptions": meta.get("replay_reviewed_exceptions") or {}}
+
+
+def fingerprint_command_optional_roots(command: str | None) -> list[str] | None:
+    """Optional fingerprint roots baked into a recorded fingerprint command (`optional=json.loads('<json>')`).
+    [] when the command predates optional roots (it could not have tolerated a missing root, so nothing was
+    optional), None when the command cannot be read at all."""
+    if not command:
+        return None
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return None
+    code = parts[-1] if parts else ""
+    marker = "optional=json.loads("
+    i = code.find(marker)
+    if i < 0:
+        return []
+    j = code.find(")", i + len(marker))
+    if j < 0:
+        return None
+    try:
+        return list(json.loads(ast.literal_eval(code[i + len(marker):j])))
+    except (ValueError, SyntaxError, TypeError):
+        return None
+
+
+def cut_identity_diff(mine: dict[str, Any], theirs: dict[str, Any],
+                      recorded_fingerprint_command: str | None = None) -> list[str]:
+    """Fields in which a prepared snapshot's recorded cut identity differs from `mine`.
+
+    `fingerprint_optional_roots` is compared with the absent-optional-field compatibility rule: a state written
+    before that field existed (key missing, or null) is identical to a bundle that names no optional roots, and a
+    state that records its fingerprint command must show that the command used no optional roots. A snapshot that
+    tolerated a missing root is a *weaker* fingerprint than one that requires every root, so this widening never
+    hides a file difference; a bundle that *adds* optional roots is still refused."""
+    diff = []
+    for k in mine:
+        if theirs.get(k) == mine.get(k):
+            continue
+        if k == "fingerprint_optional_roots" and not (mine.get(k) or []) and not (theirs.get(k) or []):
+            if recorded_fingerprint_command is None or fingerprint_command_optional_roots(
+                    recorded_fingerprint_command) == []:
+                continue
+        diff.append(k)
+    return sorted(diff)
 
 
 def bundle_identity(bundle_dir: Path) -> dict[str, Any]:
