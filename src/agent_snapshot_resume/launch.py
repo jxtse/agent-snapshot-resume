@@ -5,6 +5,7 @@ process environment at run time and passed into the sandbox over a pipe (see pro
 """
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
 import json
 import os
@@ -57,15 +58,15 @@ def original_agent_settings(trial_dir: str | None) -> tuple[dict[str, str], dict
 def check_shared_snapshot(source: dict[str, Any], bundle: Path) -> None:
     """Allow a snapshot prepared from another bundle only if both bundles cut the same trial at the same point with
     the same replay plan (snapshot_cut_identity); otherwise refuse."""
-    from .bundle import snapshot_cut_identity
+    from .bundle import cut_identity_diff, snapshot_cut_identity
 
     mine = snapshot_cut_identity(bundle)
     theirs = source.get("cut_identity")
     if theirs is None:
         # never reconstructed from the (mutable) bundle directory: only the identity recorded at preparation counts
         raise SystemExit("snapshot state has no recorded cut identity (prepared by an older version): re-prepare it")
-    if theirs != mine:
-        diff = sorted(k for k in mine if theirs.get(k) != mine.get(k))
+    diff = cut_identity_diff(mine, theirs, recorded_fingerprint_command=source.get("fingerprint_command"))
+    if diff:
         raise SystemExit(f"snapshot state was prepared from a different cut (identity differs in {diff})")
     if source.get("agent_version") and mine.get("agent_version_orig") and \
             source["agent_version"] != mine["agent_version_orig"]:
@@ -73,6 +74,29 @@ def check_shared_snapshot(source: dict[str, Any], bundle: Path) -> None:
     if source.get("run_id") != json.loads((bundle / "bundle.json").read_text()).get("run_id"):
         print(f"note: sharing snapshot {source.get('snapshot_id')} prepared from bundle {source['run_id']} "
               "(identical cut identity)", file=sys.stderr)
+
+
+def rebind_cut_identity(state_path: Path, source: dict[str, Any], bundle: Path) -> None:
+    """Rewrite a state file prepared by an older version to the current normalised identity.
+
+    Only called after check_shared_snapshot passed, i.e. after the recorded fingerprint command proved that the
+    snapshot was fingerprinted with the same roots; the previous identity is kept under `cut_identity_rebound`
+    so the migration stays auditable. Never touches a state whose identity changed on disk in the meantime."""
+    from .bundle import snapshot_cut_identity
+
+    mine = snapshot_cut_identity(bundle)
+    if source.get("cut_identity") == mine:
+        return
+    rec = json.loads(state_path.read_text())
+    if rec.get("cut_identity") != source.get("cut_identity"):
+        return
+    rec["cut_identity_rebound"] = {"from": rec.get("cut_identity"), "to": mine,
+                                   "reason": "absent optional fingerprint roots treated as none",
+                                   "at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")}
+    rec["cut_identity"] = mine
+    tmp = state_path.with_name(state_path.name + ".tmp")
+    tmp.write_text(json.dumps(rec, indent=1, ensure_ascii=False) + "\n")
+    os.replace(tmp, state_path)
 
 
 def frozen_first_request_digest(path: Path, bundle: Path, passthrough_args: list[str] | None) -> str:
@@ -102,9 +126,17 @@ def frozen_first_request_digest(path: Path, bundle: Path, passthrough_args: list
     ident_path = path.parent.parent.parent / "resume" / "bundle_identity.json"  # <trial>/agent/resume/
     theirs = json.loads(ident_path.read_text()) if ident_path.is_file() else None
     mine = bundle_identity(Path(bundle))
-    if theirs != mine:
-        diff = sorted(k for k in mine if (theirs or {}).get(k) != mine.get(k)) if theirs else ["<missing>"]
-        problems.append(f"fake run's bundle identity differs from this bundle in {diff}")
+    if theirs is None:
+        problems.append("fake run's bundle identity differs from this bundle in ['<missing>']")
+    else:
+        # top-level fields must match exactly; the cut is compared with the absent-optional-fingerprint-roots rule
+        # (a fake run recorded before that field existed is identical to a bundle that names no optional roots)
+        from .bundle import cut_identity_diff
+        diff = sorted(k for k in mine if theirs.get(k) != mine.get(k))
+        if diff == ["cut"] and not cut_identity_diff(mine["cut"], theirs.get("cut") or {}):
+            diff = []
+        if diff:
+            problems.append(f"fake run's bundle identity differs from this bundle in {diff}")
     if problems:
         raise SystemExit(f"--freeze-first-request {path}: " + "; ".join(problems))
     return digest
@@ -131,6 +163,7 @@ def build_job_config(*, adapter, bundle: Path, task_dir: Path, job_name: str, jo
         if not source.get("snapshot_id") or not source.get("replay_gate_passed"):
             raise SystemExit("snapshot source has not passed the replay gates")
         check_shared_snapshot(source, bundle)  # always: a rebuilt bundle with the same run id must match too
+        rebind_cut_identity(Path(snapshot_state), source, bundle)
         hashes = verifier_hashes(task_dir)
         env_kwargs.update(snapshot_id=source["snapshot_id"], expected_fingerprint=source["fingerprint_source"],
                           fingerprint_command=source.get("fingerprint_command"),

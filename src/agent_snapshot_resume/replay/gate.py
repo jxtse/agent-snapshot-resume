@@ -139,6 +139,70 @@ def automatic_equivalence(action, result):
     return None
 
 
+MASK_VERSION = 1
+# numbers only as standalone tokens: `netCDF4` / `python3.11` stay readable, `0.1951` / `1.2e-05` are masked
+_NUM = re.compile(r"(?<![\w.])[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?(?![\w.])")
+_UUID = re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b")
+_DATE = re.compile(r"(?i)(?:\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}\s+(?:\d{2}:\d{2}|\d{4})\b|"
+                   r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?Z?\b|"
+                   r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{1,2} \w{3} \d{4}\b)")
+_ADDR = re.compile(r"0x[0-9a-fA-F]{6,}")
+_CLOCK = re.compile(r"^(?:real|user|sys)\s+(?:\d+m\d+(?:\.\d+)?s|\d+(?:\.\d+)?)$")
+_DOT_ROW = re.compile(r"^d\S+\s+\d+\s+\S+\s+\S+\s+\d+\s+\S+\s+\d+\s+\S+\s+\.{1,2}$")
+_MEM_ROW = re.compile(r"^Mem:\s+(?:\d+\s*)+\S*$")
+_CPU_ROW = re.compile(r"^(?:CPU\(s\):|Model name:\s+).*$")
+_FS_ROW = re.compile(r"^\S+\s+\d+(?:\.\d+)?[A-Za-z]?\s+\d+(?:\.\d+)?[A-Za-z]?\s+\d+(?:\.\d+)?[A-Za-z]?\s+\d+%\s+/\S*$")
+
+
+def mask_volatile(text):
+    """Normalise one replay output down to its information content (MASK_VERSION 1).
+
+    Removed/neutralised: shell timing lines, `total N` block counts, `./..` listing rows, dates and timestamps,
+    hex object addresses, machine-spec rows (`Mem:`, `df` mounts, `CPU(s)`, host CPU model), every number.
+    Nothing about file names, paths, sizes-as-names, module names, exception types or any other text is touched, so
+    two outputs that mask equal carry the same readable information; the numbers still have to be justified by the
+    reviewed exception (changed_numbers_reused_later)."""
+    from .replay_inside import norm
+    out = []
+    for line in norm(text).splitlines():
+        line = line.rstrip()
+        if not line.strip() or _CLOCK.fullmatch(line.strip()) or _DOT_ROW.fullmatch(line.strip()):
+            continue
+        s = line.strip()
+        if re.fullmatch(r"total \d+", s):
+            continue
+        if _MEM_ROW.fullmatch(s):
+            out.append("<mem>")
+            continue
+        if _CPU_ROW.fullmatch(s):
+            out.append("<cpu>")
+            continue
+        if _FS_ROW.fullmatch(s):
+            out.append("<fs>")
+            continue
+        line = re.sub(r"(?:^|(?<= ))(?:/bin/)?bash: (?:-c: line|eval: line|line) \d+:", "bash: <line>:", line)
+        line = _UUID.sub("<uuid>", line)
+        line = re.sub(r"\b(?:tbs|asr)-proxy\b", "<proxy-dir>", line)  # this harness's own proxy shim, renamed per campaign
+        line = re.sub(r"[ \t]+", " ", _NUM.sub("<n>", _DATE.sub("<date>", _ADDR.sub("<addr>", line)))).strip()
+        out.append(line)
+    return out
+
+
+def masked_equal(orig_text, replayed_text, order="ordered"):
+    """Masked outputs are equal: in order (`ordered`), as a multiset (`sorted`, filesystem listing order), or with
+    one side a prefix-subsequence of the other (`subsequence`, a listing cut short by `head` after extra `./..`
+    rows)."""
+    a, b = mask_volatile(orig_text), mask_volatile(replayed_text)
+    if not a and not b:
+        return False
+    if order == "sorted":
+        return sorted(a) == sorted(b)
+    if order == "subsequence":
+        it = iter(b)  # a must appear in b in the same relative order
+        return all(x in it for x in a) or (lambda it2: all(x in it2 for x in b))(iter(a))
+    return a == b
+
+
 def replay_output_sha256(result):
     """Identity of one replayed command's observable outcome (for reviewed_replay_output exceptions)."""
     import hashlib
@@ -194,9 +258,10 @@ def validate_replay(plan, report, rc, reviewed_exceptions=None):
         elif fidelity not in allowed and action['side_effect'] == 'exec' and automatic_equivalence(action, result):
             result['automatic_equivalence'] = automatic_equivalence(action, result)
         elif fidelity not in allowed:
-            import hashlib, re
+            import hashlib, json, re
             review = reviewed_exceptions.get(action['call_id'], {})
             command = action.get('args', {}).get('command', '')
+            last_line = (command.rstrip().splitlines() or [''])[-1]
             old = action.get('orig_text', '').strip().splitlines()
             new = result.get('stdout_full', '').strip().splitlines()
             version_line = lambda s: re.sub(r'\(main, [^)]+\)', '(main, <build-stamp>)', s)
@@ -216,7 +281,7 @@ def validate_replay(plan, report, rc, reviewed_exceptions=None):
                            not result.get('stderr_full') and result.get('rc') == 0)
             terminal_grep_only = (review.get('kind') == 'terminal_grep_no_match' and
                 review.get('command_sha256') == hashlib.sha256(command.encode()).hexdigest() and
-                bool(re.search(r'\|\s*grep\s', command.rstrip().splitlines()[-1])) and
+                bool(re.search(r'\|\s*grep\s', last_line)) and
                 result.get('rc') == 1 and not action.get('is_error') and not result.get('stderr_full') and
                 action.get('orig_text', '').strip() == result.get('stdout_full', '').strip())
             from .replay_inside import norm, original_timeout
@@ -224,7 +289,7 @@ def validate_replay(plan, report, rc, reviewed_exceptions=None):
             no_clock = lambda text: '\n'.join(line for line in norm(text).splitlines() if not clock.fullmatch(line)).strip()
             bound = review.get('command_sha256') == hashlib.sha256(command.encode()).hexdigest()
             timed_grep = (review.get('kind') == 'terminal_grep_with_shell_time' and bound and
-                bool(re.search(r'\|\s*grep\s', command.rstrip().splitlines()[-1])) and
+                bool(re.search(r'\|\s*grep\s', last_line)) and
                 result.get('rc') == 1 and not action.get('is_error') and
                 all(clock.fullmatch(line) for line in result.get('stderr_full','').splitlines() if line.strip()) and
                 no_clock(action.get('orig_text','')) == norm(result.get('stdout_full','')))
@@ -298,6 +363,26 @@ def validate_replay(plan, report, rc, reviewed_exceptions=None):
                 and not result.get('stdout_full', '').strip()
                 and re.search(r"No such file or directory:? '?(?:/logs/agent/|\S*\.claude/)", result.get('stderr_full', ''))
                 is not None)
+            # A WebFetch/WebSearch in the prefix: an external read the gate cannot (and must not) re-issue. Reviewed
+            # as read-only: the tool input is unchanged (bound by sha256) and no local file is written by the action,
+            # so the resumed agent's history keeps the original observation while the environment is untouched.
+            web_readonly = (review.get('kind') == 'web_readonly_not_replayed' and
+                fidelity == 'web_not_replayed' and
+                review.get('args_sha256') == hashlib.sha256(
+                    json.dumps(action.get('args') or {}, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+                and action.get('side_effect') == 'web')
+            # The reviewer compared the two outputs line by line: they carry the same information once machine-
+            # specific and volatile tokens are masked (see mask_volatile) and the command's exit outcome is
+            # unchanged. Permitted only when the exception records that none of the changed numbers reappears in
+            # the agent's later reasoning or tool arguments (changed_numbers_reused_later is False), the action ran
+            # (not a timeout), and filesystem order is ignored only for a listing command.
+            masked_only = (review.get('kind') == 'reviewed_masked_output' and bound and
+                review.get('mask_version') == MASK_VERSION and review.get('order') in ('ordered', 'sorted', 'subsequence') and
+                fidelity != 'timeout' and result.get('status') == 'ran' and
+                bool(result.get('rc')) == bool(action.get('is_error')) and
+                review.get('changed_numbers_reused_later') is False and
+                (review.get('order') == 'ordered' or re.search(r"\b(?:ls|find|du|tree|stat|wc)\b", command)) and
+                masked_equal(action.get('orig_text', ''), _replayed_text(result), review.get('order')))
             # Pattern-free review: a human compared this exact replay output with the original and approved it.
             # Bound to the command and to the sha256 of the replay's stdout + NUL + stderr + NUL + rc.
             exact_reviewed = (review.get('kind') == 'reviewed_replay_output' and bound and
@@ -364,7 +449,7 @@ def validate_replay(plan, report, rc, reviewed_exceptions=None):
                 len(old) == len(new) and old != new and _canon_sets(old) == _canon_sets(new))
             if not (hardware_only or memory_only or terminal_grep_only or profile_only or timed_grep or timeout_same
                     or ls_dot_only or unseeded or persisted_same or glob_order or timing_number or listing_line
-                    or agent_state or exact_reviewed or set_order):
+                    or agent_state or exact_reviewed or set_order or masked_only or web_readonly):
                 raise RuntimeError('Unaccepted replay fidelity '+str(fidelity)+': '+action['call_id'])
             exit_reviewed = terminal_grep_only or timed_grep or timeout_same or agent_state or exact_reviewed
             result['reviewed_exception'] = ('exact replay output reviewed: ' + str(review.get('note', ''))[:200] if exact_reviewed else
@@ -381,6 +466,8 @@ def validate_replay(plan, report, rc, reviewed_exceptions=None):
                 'identical scientific output and profiled function identities/counts; explicitly bound aggregate profiler-count difference plus timings' if profile_only and aggregate_reviewed else
                 'identical scientific output, cProfile call counts and profiled function identities; performance timings/order only' if profile_only else
                 'python set(s) printed directly: identical items, hash-seed repr order only' if set_order else
+                'external read not re-issued (WebFetch/WebSearch); read-only, no local state' if web_readonly else
+                'reviewed: same output modulo machine spec, dates, addresses and numbers; no changed number reused later' if masked_only else
                 'same package/version/CPU output; host-memory report only' if memory_only else
                 'same Python release/compiler, scientific package versions and CPU count; reviewed Python build timestamp and host free-memory report differences')
         if action['side_effect']=='exec' and not exit_reviewed and bool(result.get('rc')) != bool(action.get('is_error')):

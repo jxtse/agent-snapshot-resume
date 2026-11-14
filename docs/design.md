@@ -128,7 +128,15 @@ call ids, and that every result has an accepted fidelity:
   `unlabelled_timing_number` (command measures time; exactly one number differs), `listing_order_line` (same
   items listed in another order; the reviewer checks nothing depends on that order), `agent_state_read` (the
   original read the agent's own session/log files, which exist only from launch on; the replay must fail with
-  "No such file" on such a path and print nothing; the reviewer checks the command writes nothing). Each kind checks that only that specific benign difference exists. Record a `note` next to
+  "No such file" on such a path and print nothing; the reviewer checks the command writes nothing),
+  `reviewed_masked_output` (the reviewer compared both outputs and they carry the same information once
+  `gate.mask_volatile` removed machine spec — `Mem:`/`df`/`CPU(s)`/host model — dates, UUIDs, hex object
+  addresses, `ls` block counts and `./..` rows, and numbers; `order` is `ordered`, `sorted` or `subsequence`
+  (a listing cut short by `head`), the last two only for `ls/find/du/tree/stat/wc`, and the exception must
+  record `changed_numbers_reused_later: false` — i.e. no changed number reappears in the agent's later
+  reasoning or tool arguments; a timeout or a changed exit outcome is never masked away) and
+  `web_readonly_not_replayed` (a `WebFetch`/`WebSearch` in the prefix, an external read the gate cannot re-issue;
+  bound to `sha256` of the tool input, read-only, no local state). Each kind checks that only that specific benign difference exists. Record a `note` next to
   each exception.
 
 ### Screening cuts offline (`asr screen`)
