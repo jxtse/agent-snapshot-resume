@@ -149,7 +149,11 @@ def default_fingerprint_roots(plan: dict[str, Any]) -> list[str] | None:
         first = x[len(home.rstrip("/")) + 1:].split("/")[0]
         if first and not first.startswith("."):
             roots.add(home.rstrip("/") + "/" + first)
-    return sorted(roots) or None
+    if roots:
+        return sorted(roots)
+    # A task that works outside /app (e.g. a /task workdir) with no file writes in the plan: bind its own work
+    # directory -- fingerprinting /app would fail on an image that has no /app at all.
+    return [cwd] if cwd != "/root" else None
 
 
 def plan_with_observations(ir: dict[str, Any], k: int) -> dict[str, Any]:
