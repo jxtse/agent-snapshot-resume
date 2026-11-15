@@ -242,6 +242,20 @@ system/tools fingerprints, and the first request after each compaction is saved 
 `post_compaction_request_<i>.json`, so persistence can be audited per request. In a chained run (`--prior-hint-file`)
 *every* hint is re-applied, once each, in injection order.
 
+## Chained rounds: the hint lives on the wire, never in the session
+
+A resumed trial's history contains no copy of the hint its proxy injected: Claude Code rebuilds every request from
+the session, and `--resume` drops a text block appended to a tool_result record, a separate user turn, and an edited
+compact summary alike (measured on 2.1.280). So a chained bundle does not seed hints into the session either. It
+records where the parent's proxy had each carried hint (`prior_hint_positions` in `proxy_spec.json`: the tool result
+it followed, or the compaction summary once a compaction pushed it there) and the proxy re-injects it on every
+request, exactly as the parent's own proxy did. Parity is judged against the **parent's effective request at the
+cut**: the previous run's own passthrough log (`agent/model-proxy/requests-*.jsonl`, located by the step's token
+usage) already holds that context with its hint. The chained first request, minus only the new hint, must match its
+bytes, message count, model/tools and model-visible content; both hints must appear once each, in chain order.
+`bundle.json` names that reference in `orig_request_at_k`, so the gate is auditable per unit. A cut is refused when
+the parent's own proxy lost the hint (e.g. it only quoted it) or when its injection point is not reproducible.
+
 ## Mid-run snapshots (`launch --midrun-snapshot-every`)
 
 A resumed run can be resumed again. `asr launch` snapshots its live clone every 20 minutes (and after each context
@@ -360,9 +374,9 @@ less memory than the trial it reproduces.
   longer the same.
 - **Chained resumes inherit what the previous run left.** A mid-run snapshot contains that run's filesystem plus its
   live processes; the tail is replayed after stopping them. Two chained limits are deliberate and fail closed:
-  a hint the proxy had to inject as a *new* message (never a block appended to a tool-result turn) cannot be seeded,
-  and a bundle may only chain from a trial that recorded its own `agent/resume/proxy_spec.json` +
-  `first_request_rewritten.json`. Large tool outputs the parent run persisted (`tool-results/`) are copied from the
+  a hint the proxy had to inject as a *new* message (never a block appended to a tool-result turn) cannot be placed
+  by the next run either, and a bundle may only chain from a trial that recorded its own
+  `agent/resume/proxy_spec.json` + `first_request_rewritten.json`. Large tool outputs the parent run persisted (`tool-results/`) are copied from the
   chained run's own session directory only, so a fork that depends on an earlier round's persisted output fails the
   parity gate instead of silently reading a truncated result.
 - **Snapshots need a provider that supports them.** Tested on Alibaba Cloud FC sandbox. `build-template` uses FC's

@@ -282,6 +282,7 @@ def build(*, adapter, trial_dir: Path, atif_step: int | None, out: Path, mode: s
         raise SystemExit("resume step must be an agent step")
     prev = ir["steps"][k - 1]
     cut = adapter.cut_line(raw_lines, ir, k)
+    cut_orig = cut  # the plan and the base snapshot speak about the parent's own session, before any seed normalisation
     plan = plan_with_observations(ir, k)
     # what the agent will read after the cut: the lenient replay gate requires these to survive the replay
     plan["post_cut_paths"] = post_cut_referenced_files(ir, k)
@@ -294,6 +295,7 @@ def build(*, adapter, trial_dir: Path, atif_step: int | None, out: Path, mode: s
     carried: list[str] = []
     wanted: list[str] = []
     hint_anchors: list[dict[str, Any]] = []
+    positions: list[dict[str, Any]] = []
     base = None
     if evidence:
         carried = chain.hints_of(evidence["spec"])
@@ -314,19 +316,24 @@ def build(*, adapter, trial_dir: Path, atif_step: int | None, out: Path, mode: s
             if base_snapshot:
                 chain.check_base_snapshot(base_snapshot, trial=trial, raw_lines=raw_lines)
             stripped, strip_audit = chain.strip_scaffolding(recs, evidence["spec"]["sentinel"],
-                                                            art.get("continue_text", chain.CONTINUE_TXT),
-                                                            art.get("synthetic_assistant_text", chain.SYNTH_TXT))
+                                                           art.get("continue_text", chain.CONTINUE_TXT),
+                                                           art.get("synthetic_assistant_text", chain.SYNTH_TXT))
             cut = chain.cut_after_strip(recs, stripped, cut)
-            # Only the hints this run already carried are in its session; the new hint is injected by the proxy at
-            # the cut, exactly like a first-round hint bundle, so it must NOT be seeded into the history.
-            anchors = chain.first_request_hints(evidence["first_request"]["body"], carried)
-            seeded, hint_audit, cut = chain.materialize_hints(stripped, carried, anchors, cut,
-                                                             persistent=bool(evidence["spec"].get("persist_hint")))
+            # The hints this run already carried are NOT seeded into its session. Claude Code drops every copy a
+            # seed can carry -- a text block appended to a tool_result record, a user turn of its own, and an edited
+            # compact summary all disappear when it rebuilds the request on --resume (measured on 2.1.280). The
+            # parent's proxy re-injected them on every request instead, so this run's proxy does the same, at the
+            # place the parent had them (chain.carried_hint_positions). The new hint is injected at the cut as for a
+            # first-round bundle.
+            positions = chain.carried_hint_positions(evidence, stripped, cut, carried)
+            seeded, hint_audit = stripped, [{"hint": i, "where": "proxy reinjection", **p}
+                                            for i, p in enumerate(positions)]
         except ValueError as exc:  # every chained-build refusal is a user-facing error, never a traceback
             raise SystemExit(f"{trial}: cannot seed a chained resume: {exc}") from exc
-        # anchors only exist when the hint sits inside the tool-result message; a hint that needed a record of its
-        # own has none (the chain gate then requires only the ordered single occurrence)
-        hint_anchors = chain.anchors_for(seeded, carried, cut)
+        # only a hint the parent held on a tool result has an anchor; one re-injected on the summary does not (the
+        # chain gate then requires only the ordered single occurrence)
+        hint_anchors = [{"block": p["block"], "tool_use_id": p["tool_use_id"]} for p in positions
+                        if not p.get("on_summary")]
         seed_lines = [json.dumps(r, ensure_ascii=False, separators=(",", ":")) for r in seeded]
         chain_audit = {"parent_run_id": (evidence.get("parent_bundle") or {}).get("run_id"),
                        "parent_trial_dir": str(trial_dir), "carried_hints": len(carried),
@@ -341,8 +348,8 @@ def build(*, adapter, trial_dir: Path, atif_step: int | None, out: Path, mode: s
                                 for l in raw_lines if '\"cwd\"' in l), None)
     if base_snapshot:
         line = int(base_snapshot["session_line"])
-        if line >= cut:
-            raise SystemExit(f"--base-snapshot session line {line} is not before the cut {cut}")
+        if line >= cut_orig:
+            raise SystemExit(f"--base-snapshot session line {line} is not before the cut {cut_orig}")
         full = len(plan["actions"])
         plan["actions"] = chain.tail_actions(plan["actions"], line)
         if not plan["actions"] and full:
@@ -437,6 +444,10 @@ def build(*, adapter, trial_dir: Path, atif_step: int | None, out: Path, mode: s
         # Every hint the run carries must be in the request exactly once, in this order, and (anchor entries) right
         # after the tool result it originally followed: a lost, duplicated or moved hint fails closed.
         spec["required_hint_blocks"] = [chain.hint_block(h) for h in wanted]
+        if positions:
+            # Where the previous run's proxy held the hints it carried: this run's proxy re-injects them there on
+            # every request (the resumed history itself cannot carry them, see bundle.build).
+            spec["prior_hint_positions"] = [dict(p) for p in positions]
         if hint_anchors:
             spec["hint_anchors"] = hint_anchors
         if evidence:

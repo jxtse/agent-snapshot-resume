@@ -168,37 +168,11 @@ def strip_scaffolding(records: list[dict[str, Any]], sentinel: str, continue_txt
     return out, audit
 
 
-# ------------------------------------------------------------ hint materialisation
-def _hint_block(hint: str) -> dict[str, Any]:
-    from .proxy.resume_proxy import hint_block_text
-    return {"type": "text", "text": hint_block_text(hint)}
-
-
+# ------------------------------------------------------------ carried hints (where the parent's proxy had them)
 def hint_block(hint: str) -> str:
-    """The exact text block the proxy injects for a hint (also what the session seed must carry)."""
+    """The exact text block the proxy injects for a hint (also what a request must carry)."""
     from .proxy.resume_proxy import hint_block_text
     return hint_block_text(hint)
-
-
-def _content(rec: dict[str, Any]) -> list[dict[str, Any]]:
-    c = (rec.get("message") or {}).get("content")
-    if isinstance(c, list):
-        return c
-    return [{"type": "text", "text": c}] if isinstance(c, str) else []
-
-
-def _occurrences(ctx: list[dict[str, Any]], hint: str) -> list[tuple[int, int]]:
-    want = _hint_block(hint)["text"]
-    return [(i, j) for i, r in enumerate(ctx) for j, b in enumerate(_content(r))
-            if isinstance(b, dict) and b.get("type") == "text" and b.get("text") == want]
-
-
-def _find_tool_result(records: list[dict[str, Any]], tool_use_id: str, cut: int) -> int | None:
-    for i in range(min(cut, len(records))):
-        for b in _content(records[i]):
-            if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("tool_use_id") == tool_use_id:
-                return i
-    return None
 
 
 def _summary_index(records: list[dict[str, Any]], cut: int) -> int | None:
@@ -215,124 +189,39 @@ def _summary_index(records: list[dict[str, Any]], cut: int) -> int | None:
     return None
 
 
-def hint_record(anchor: dict[str, Any], hint: str, pos: int) -> dict[str, Any]:
-    """A standalone user record carrying the hint block, placed right after the record it was injected on.
+def carried_hint_positions(evidence: dict[str, Any], stripped: list[dict[str, Any]], cut: int,
+                           carried: list[str]) -> list[dict[str, Any]]:
+    """Where the previous run's proxy held each hint it carried, at this cut.
 
-    Claude Code drops a text block that rides on a record carrying tool results when it rebuilds the context on
-    ``--resume`` (verified on a live chained resume: the request kept the tool_result and lost the appended hint), so
-    the hint needs a user turn of its own to survive into the resumed context."""
-    import uuid
+    A resumed run has no copy of its hints in its session: Claude Code rebuilds every request from the session and
+    the proxy re-inj*ects* them each time (``inject_hint`` while the sentinel region is in the request,
+    ``reinject_hint_after_compaction`` on the summary after a compaction). So a chained seed cannot carry them in the
+    session either (a text block riding a tool_result record, a separate user turn and a modified compact summary are
+    all dropped by ``--resume``); the chained run re-injects them at the same place instead:
 
-    rec = {k: v for k, v in anchor.items() if k not in ("uuid", "parentUuid", "message", "toolUseResult", "promptId")}
-    rec.update({"parentUuid": anchor.get("uuid"), "uuid": f"hint-{pos}-{uuid.uuid4().hex[:12]}", "type": "user",
-                "isSidechain": False, "userType": "external",
-                "message": {"role": "user", "content": [_hint_block(hint)]}})
-    return rec
+    * pre-compaction: the message carrying the anchor tool result of the parent's own injection (the proxy appends
+      the block to that message, and the hint stays there while the message stays in the context);
+    * post-compaction: the compaction summary that is in this cut's context (``persist_hint``).
 
-
-def materialize_hints(records: list[dict[str, Any]], hints: list[str], anchors: list[dict[str, Any]],
-                      cut: int, *, persistent: bool = True
-                      ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
-    """Put each hint exactly once into the model context of ``records[:cut]``; returns the seed, the audit and the
-    cut line shifted by the records it inserted.
-
-    The hint is appended to the record it was injected on (the message carrying the anchor tool result). When that
-    record is no longer in the model context (a compaction happened after the injection) the hint is appended to
-    the compaction summary instead — but only if the previous run actually re-injected it after its compactions
-    (``persistent``, i.e. its spec had ``persist_hint``); otherwise the hint was *gone* from that run's requests and
-    seeding it would invent an instruction the model never saw.
+    ``first_request_hints`` refuses when the parent's first request has no tool result before the hint, so a hint that
+    was injected as a new message cannot be placed and the build fails closed.
     """
-    out = list(records)
-    audit: list[dict[str, Any]] = []
-    inserted = 0
-    for pos, hint in enumerate(hints):
-        eff_cut = cut + inserted
-        ctx = context_lines(out[:eff_cut])
-        occ = _occurrences(ctx, hint)
-        if len(occ) > 1:
-            raise ValueError(f"hint {pos} is in the model context {len(occ)} times; refusing to seed a duplicate")
-        if len(occ) == 1:
-            audit.append({"hint": pos, "where": "already_present", "context_message": occ[0][0]})
-            continue
-        anchor = anchors[pos] if pos < len(anchors) else {}
-        tid = anchor.get("tool_use_id")
-        idx = _find_tool_result(out, tid, eff_cut) if tid else None
-        ctx_ids = {id(r) for r in ctx}
-        if idx is None or id(out[idx]) not in ctx_ids:
-            if not persistent:
-                raise ValueError(f"hint {pos} is no longer in the model context (compacted away) and the previous run "
-                                 "did not persist hints: it cannot be re-seeded without inventing a turn the model "
-                                 "never saw")
-            sidx = _summary_index(out, eff_cut)
-            if sidx is None:
-                raise ValueError(f"hint {pos}: anchor tool result {tid} is not in the model context and there is no "
-                                 "compaction summary to carry the hint")
-            idx = sidx
-            where = "compaction_summary"
-        else:
-            where = "anchor_tool_result"
-        body = list(_content(out[idx]))
-        if where == "anchor_tool_result" and any(
-                isinstance(b, dict) and b.get("type") == "tool_result" for b in body):
-            # A hint that rode on a tool-result record does not survive a --resume rebuild in that position, and a
-            # standalone user turn between a tool result and the next assistant turn is dropped too. The place the
-            # original run itself kept it after a compaction is the summary message (persist_hint), so use that.
-            sidx = _summary_index(out, eff_cut)
-            if sidx is not None:
-                idx, where = sidx, "compaction_summary"
-                body = list(_content(out[idx]))
-                body = body + [_hint_block(hint)]
-                msg = dict(out[idx].get("message") or {})
-                msg["content"] = body
-                out[idx] = {**out[idx], "message": msg}
-                audit.append({"hint": pos, "where": where, "line": idx, "tool_use_id": tid,
-                              "block_index": len(body) - 1})
-                continue
-            rec = hint_record(out[idx], hint, pos)
-            out.insert(idx + 1, rec)
-            # Claude Code rebuilds the context by following parentUuid links from the last record: the record that
-            # pointed at the anchor must point at the new hint turn instead, or the hint is not in the rebuilt chain.
-            for j in range(idx + 2, len(out)):
-                if out[j].get("parentUuid") == out[idx].get("uuid"):
-                    out[j] = {**out[j], "parentUuid": rec["uuid"]}
-                    break
-            inserted += 1
-            audit.append({"hint": pos, "where": "own_message_after_anchor", "line": idx + 1, "tool_use_id": tid})
-            continue
-        body = body + [_hint_block(hint)]
-        msg = dict(out[idx].get("message") or {})
-        msg["content"] = body
-        out[idx] = {**out[idx], "message": msg}
-        audit.append({"hint": pos, "where": where, "line": idx, "tool_use_id": tid,
-                      "block_index": len(body) - 1})
-    cut = cut + inserted
-    ctx = context_lines(out[:cut])
-    for pos, hint in enumerate(hints):
-        if len(_occurrences(ctx, hint)) != 1:
-            raise ValueError(f"hint {pos} is not in the model context exactly once after materialisation")
-    ordered = []
-    for hint in hints:
-        (mi, bi), = _occurrences(ctx, hint)
-        ordered.append((mi, bi))
-    if ordered != sorted(ordered):
-        raise ValueError("materialised hints are not in injection order (older hints must come first)")
-    return out, audit, cut
-
-
-def anchors_for(records: list[dict[str, Any]], hints: list[str], cut: int) -> list[dict[str, Any]]:
-    """`hint_anchors` spec entries: each hint block bound to the tool result it follows in the same message."""
-    ctx = context_lines(records[:cut])
-    out = []
-    for hint in hints:
-        (mi, bi), = _occurrences(ctx, hint)
-        ids = [b.get("tool_use_id") for b in _content(ctx[mi])[:bi]
-               if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("tool_use_id")]
-        if ids:
-            out.append({"block": _hint_block(hint)["text"], "tool_use_id": ids[-1]})
+    anchors = first_request_hints(evidence["first_request"]["body"], carried)
+    on_summary = _summary_index(stripped, cut) is not None
+    if on_summary and not (evidence.get("spec") or {}).get("persist_hint"):
+        # Its own proxy dropped the hint at the first compaction, so every later request of that run carried no
+        # hint: re-injecting one here would give the model an instruction it never saw.
+        raise ValueError("the previous run's hint was compacted away and it did not persist hints (persist_hint off), "
+                         "so its own requests after that compaction carried no hint; this cut cannot be made faithful")
+    out: list[dict[str, Any]] = []
+    for a in anchors:
+        entry = {"hint": a["hint"], "block": a["block"], "tool_use_id": a["tool_use_id"]}
+        if on_summary:
+            entry["on_summary"] = True
+        out.append(entry)
     return out
 
 
-# ------------------------------------------------------------------- budget
 def ts_seconds(ts: str) -> float:
     """Epoch seconds of a session/request timestamp (CC writes UTC ISO8601 with milliseconds)."""
     import datetime as dt

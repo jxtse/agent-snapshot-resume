@@ -279,17 +279,29 @@ for _ in range(12):
     time.sleep(0.5)
 print(json.dumps({"killed": killed}))
 """
-            r = run(sbx, "echo " + __import__("base64").b64encode(kill.encode()).decode() +
-                    " | base64 -d | python3 -", timeout=180)
-            killed = json.loads((r.stdout or "{}").strip().splitlines()[-1] or "{}").get("killed", [])
+            kill_cmd = "echo " + __import__("base64").b64encode(kill.encode()).decode() + " | base64 -d | python3 -"
+
+            def survivors(tag: str) -> list[str]:
+                ps = run(sbx, "ps -eo pid=,ppid=,args=").stdout.splitlines()
+                return [l for l in ps if any(k in l for k in ("/claude", ".asr-proxy", "asr_proxy_runtime",
+                                                              "resume_proxy", "passthrough_proxy"))
+                        and "/bin/ps" not in l and "ps -eo" not in l]
+
+            killed: list[int] = []
+            left: list[str] = []
+            for attempt in range(3):
+                r = run(sbx, kill_cmd, timeout=180)
+                killed += json.loads((r.stdout or "{}").strip().splitlines()[-1] or "{}").get("killed", [])
+                # A restored clone can show the previous run's processes only after the guest settles, and a proxy
+                # wrapper restarts its child when it dies: stop again instead of failing on the first survivor.
+                run(sbx, "sleep 3; rm -rf /logs/agent /logs/verifier /logs/artifacts /tmp/.asr-resume", timeout=120)
+                left = survivors("cleanup")
+                if not left:
+                    break
             rec["base_snapshot_killed"] = killed
-            run(sbx, "sleep 3; rm -rf /logs/agent /logs/verifier /logs/artifacts /tmp/.asr-resume", timeout=120)
-            left = run(sbx, "ps -eo pid=,args=").stdout.splitlines()
-            left = [l for l in left if any(k in l for k in ("/claude", ".asr-proxy", "asr_proxy_runtime",
-                                                            "resume_proxy", "passthrough_proxy"))
-                    and "/bin/ps" not in l]
             if left:
-                raise RuntimeError("live clone processes survived the base-snapshot cleanup: " + "\n".join(left[-6:]))
+                raise RuntimeError("live clone processes survived the base-snapshot cleanup (3 passes): "
+                                   + "\n".join(left[-6:]))
             step("base_snapshot_cleanup", t, base_snapshot=base_snapshot, killed=len(killed))
         t = time.time()
         run(sbx, (healthcheck + " && " if healthcheck else "") + "chmod 1777 /tmp")
