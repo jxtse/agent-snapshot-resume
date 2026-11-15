@@ -19,3 +19,12 @@ def test_a_home_cwd_never_binds_the_whole_home():
 def test_directories_an_action_used_are_preferred():
     plan = {"initial_cwd": "/task", "actions": [{"cwd": "/task/sub"}, {"args": {"file_path": "/task/sub/x.npy"}}]}
     assert default_fingerprint_roots(plan) == ["/task/sub"]
+
+
+
+def test_the_command_runs_on_an_old_task_python():
+    """Onsager's task python is 3.9: hashlib.file_digest (3.11+) must not appear in the guest command."""
+    from agent_snapshot_resume.replay.fingerprint import build_fingerprint_command
+    code = build_fingerprint_command(["/task"])
+    assert "file_digest" not in code
+    assert "sha256()" in code

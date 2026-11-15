@@ -30,8 +30,11 @@ for root in roots:
     files.extend([p] if p.is_file() else [f for f in p.rglob('*') if f.is_file()])
 rows=[]
 for p in sorted(set(files)):
-    with p.open('rb') as f: h=hashlib.file_digest(f,'sha256').hexdigest()
-    rows.append([str(p),p.stat().st_size,h])
+    h=hashlib.sha256()
+    with p.open('rb') as f:
+        for chunk in iter(lambda: f.read(1048576), b''):
+            h.update(chunk)
+    rows.append([str(p),p.stat().st_size,h.hexdigest()])
 payload=json.dumps(sorted(rows+missing,key=lambda row:row[0]),separators=(',',':')).encode()
 print('files='+str(len(rows)))
 print(hashlib.sha256(payload).hexdigest())
