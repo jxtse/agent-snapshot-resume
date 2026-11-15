@@ -202,9 +202,15 @@ def _find_tool_result(records: list[dict[str, Any]], tool_use_id: str, cut: int)
 
 
 def _summary_index(records: list[dict[str, Any]], cut: int) -> int | None:
-    for i in range(min(cut, len(records))):
+    """Index of the compaction summary that is *in the model context* of records[:cut].
+
+    A resumed run that compacted several times has one summary per boundary, and only the last one is part of the
+    context Claude Code rebuilds on --resume. Appending the carried hint to an earlier summary would put it into a
+    session line the model never sees, so the seeded history would silently lose the hint."""
+    ctx_ids = {id(r) for r in context_lines(records[:cut])}
+    for i in range(min(cut, len(records)) - 1, -1, -1):
         r = records[i]
-        if r.get("type") == "user" and r.get("isCompactSummary"):
+        if r.get("type") == "user" and r.get("isCompactSummary") and id(r) in ctx_ids:
             return i
     return None
 

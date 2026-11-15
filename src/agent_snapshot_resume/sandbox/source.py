@@ -229,28 +229,37 @@ def prepare_source(*, adapter, task_dir: Path, bundle: Path, template: str, tag:
             # runs it (its own command line contains the pattern) and could abort the cleanup half way.
             t = time.time()
             kill = """
-import json, os, subprocess
+import json, os, subprocess, time
 me = os.getpid()
-out = subprocess.run(["ps", "-eo", "pid=,ppid=,args="], capture_output=True, text=True).stdout
-targets = []
-for line in out.splitlines():
-    parts = line.strip().split(None, 2)
-    if len(parts) < 3:
-        continue
-    pid, ppid, args = parts
-    if int(pid) in (me, os.getppid()) or "/bin/ps" in args or "ps -eo" in args:
-        continue
-    if "pkill" in args or "asr-base-cleanup" in args:
-        continue
-    if any(k in args for k in ("/claude", "claude-code", "claude --", "asr_proxy_runtime", "resume_proxy",
-                               "passthrough_proxy")):
-        targets.append(int(pid))
-for pid in targets:
-    try:
-        os.kill(pid, 9)
-    except OSError:
-        pass
-print(json.dumps({"killed": targets}))
+killed = []
+# A live clone carries the previous run's agent and its proxy runtime. The proxy runtime respawns its children when
+# they die, so a single pass can leave a fresh proxy behind (and it holds the proxy ports the replay needs): repeat
+# until nothing matches, which only terminates once the respawning supervisor itself has been killed.
+for _ in range(6):
+    out = subprocess.run(["ps", "-eo", "pid=,ppid=,args="], capture_output=True, text=True).stdout
+    targets = []
+    for line in out.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) < 3:
+            continue
+        pid, ppid, args = parts
+        if int(pid) in (me, os.getppid()) or "/bin/ps" in args or "ps -eo" in args:
+            continue
+        if "pkill" in args or "asr-base-cleanup" in args:
+            continue
+        if any(k in args for k in ("/claude", "claude-code", "claude --", "/opt/asr-proxy", "asr_proxy_runtime",
+                                   "resume_proxy", "passthrough_proxy")):
+            targets.append(int(pid))
+    if not targets:
+        break
+    for pid in targets:
+        try:
+            os.kill(pid, 9)
+            killed.append(pid)
+        except OSError:
+            pass
+    time.sleep(0.5)
+print(json.dumps({"killed": killed}))
 """
             r = run(sbx, "echo " + __import__("base64").b64encode(kill.encode()).decode() +
                     " | base64 -d | python3 -", timeout=120)
@@ -258,8 +267,9 @@ print(json.dumps({"killed": targets}))
             rec["base_snapshot_killed"] = killed
             run(sbx, "sleep 2; rm -rf /logs/agent /logs/verifier /logs/artifacts /tmp/.asr-resume", timeout=120)
             left = run(sbx, "ps -eo pid=,args=").stdout.splitlines()
-            left = [l for l in left if any(k in l for k in ("/claude", "asr_proxy_runtime", "resume_proxy",
-                                                            "passthrough_proxy")) and "/bin/ps" not in l]
+            left = [l for l in left if any(k in l for k in ("/claude", "/opt/asr-proxy", "asr_proxy_runtime",
+                                                            "resume_proxy", "passthrough_proxy"))
+                    and "/bin/ps" not in l]
             if left:
                 raise RuntimeError("live clone processes survived the base-snapshot cleanup: " + "\n".join(left[-6:]))
             step("base_snapshot_cleanup", t, base_snapshot=base_snapshot, killed=len(killed))
