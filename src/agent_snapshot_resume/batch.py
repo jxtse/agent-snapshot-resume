@@ -243,13 +243,25 @@ class Batch:
         ud = self.unit_dir(task)
         hint = Path(row["hint_path"]).read_text().strip()
         src = self.source(row)
+        # Chained round-N unit: `chain.json` names the resumed trial this cut belongs to, the mid-run snapshot the
+        # replay continues from, and the hints that run already carried. The new hint is injected at the new cut on
+        # top of those, so the resumed history stays exactly what the agent had (round-1 hint included).
+        chain_spec = None
+        if (ud / "chain.json").is_file():
+            chain_spec = json.loads((ud / "chain.json").read_text())
+            if not (chain_spec.get("trial_dir") and chain_spec.get("base_snapshot")):
+                raise RuntimeError(f"{ud}/chain.json needs trial_dir and base_snapshot")
+        trial_dir = Path(chain_spec["trial_dir"]) if chain_spec else Path(src["trial_dir"])
         specs = {"hinted": {"mode": "hint", "hint": hint, "run_id": f"{task}-s{cut}-hint"},
                  "control": {"mode": "same", "hint": None, "run_id": f"{task}-s{cut}-control"}}
         # A cached bundle is only reusable if it was built from the same inputs; a changed hint file, cut or source
         # session must rebuild it, and a downstream fake/parity proof must never legitimise the stale one.
-        inputs = {"cut_line": cut, "source_trial_dir": str(Path(src["trial_dir"]).resolve()),
+        inputs = {"cut_line": cut, "source_trial_dir": str(trial_dir.resolve()),
                   "hint_sha256": hashlib.sha256(hint.encode()).hexdigest() if hint else None,
-                  "session_sha256": self.source_session_sha(row)}
+                  "session_sha256": self.source_session_sha(row),
+                  "chain": {"base_snapshot": (chain_spec.get("base_snapshot") or {}).get("snapshot_id"),
+                            "prior_hints_sha256": hashlib.sha256("\n\n".join(
+                                chain_spec.get("prior_hints") or []).encode()).hexdigest()} if chain_spec else None}
         cached = {}
         if (ud / "bundles.json").is_file():
             try:
@@ -264,11 +276,17 @@ class Batch:
             if bdir.is_dir() and (bdir / "bundle.json").is_file() and not rebuild:
                 meta = json.loads((bdir / "bundle.json").read_text())
             else:
-                bdir, meta = bundle_mod.build(adapter=self.adapter, trial_dir=Path(src["trial_dir"]),
+                bdir, meta = bundle_mod.build(adapter=self.adapter, trial_dir=trial_dir,
                                              atif_step=None, cut_line=cut, out=ud / "bundles",
                                              task_dir=self.task_dir(row), mode=spec["mode"], hint=spec["hint"],
                                              run_id=spec["run_id"], persist_hint=(spec["mode"] == "hint"),
-                                             force=True)
+                                             force=True,
+                                             # only the hinted bundle names the carried hints explicitly; the
+                                             # control bundle inherits them from the resumed session's own proxy spec
+                                             prior_hints=(chain_spec.get("prior_hints") or None)
+                                             if (chain_spec and spec["mode"] == "hint") else None,
+                                             base_snapshot=(chain_spec.get("base_snapshot") or None)
+                                             if chain_spec else None)
             # Reviewed replay exceptions are an *input* to the bundle, not something to be produced by hand after
             # every rebuild: `replay_exceptions.json` next to the unit is merged into bundle.json (and is part of the
             # cut identity, so a changed review set can never reuse a snapshot prepared under the old one).
@@ -343,7 +361,12 @@ class Batch:
         rec = source.prepare_source(adapter=self.adapter, task_dir=self.task_dir(row),
                                     bundle=Path(bundled["bundles"]["hinted"]["dir"]),
                                     template=str(tmpl_id), tag=tag, state_dir=self.state_dir,
-                                    replay_policy=self.replay_policy)
+                                    replay_policy=self.replay_policy,
+                                    # a chained bundle's plan holds only the tail after its mid-run snapshot: the
+                                    # replay must start from that snapshot, not from a fresh container
+                                    base_snapshot=(json.loads((Path(bundled["bundles"]["hinted"]["dir"])
+                                                               / "bundle.json").read_text()).get("base_snapshot")
+                                                   or {}).get("snapshot_id"))
         if not rec.get("snapshot_id"):
             raise RuntimeError("prepare-snapshot produced no snapshot id")
         return rec
