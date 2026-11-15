@@ -232,12 +232,20 @@ _VERSION = re.compile(r"\b\d+(?:\.\d+){2,}\b")
 _NUMTOK = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
 
 
-def _violently_killed(result):
-    """A replay result whose process was killed by the kernel/scheduler (OOM, signal) rather than exiting."""
+def _violently_killed(action, result):
+    """A replay result whose process was killed by the kernel/scheduler (OOM, signal) rather than exiting.
+
+    A kill mark in the output only counts when the original output did not already contain it: a command that
+    legitimately prints or reproduces such a line (a test of the error path, a reproduced traceback) must not be
+    mistaken for a killed process."""
     if result.get("rc") in KILL_RCS:
         return True
+    if result.get("rc") == 0 and result.get("fidelity") in ("exact", "normalized"):
+        return False
     text = (result.get("stdout_full") or "") + "\n" + (result.get("stderr_full") or "")
-    return bool(KILL_MARKS.search(text))
+    orig = action.get("orig_text") or ""
+    marks = {m.group(0).lower() for m in KILL_MARKS.finditer(text)}
+    return bool(marks - {m.group(0).lower() for m in KILL_MARKS.finditer(orig)})
 
 
 def _version_pairs(action, result):
@@ -309,11 +317,14 @@ def lenient_blocks(plan, report, rc, post_cut=None):
             if result.get("rc") not in (None, 0) and not result.get("orig_timed_out"):
                 blocks.append({"rule": "exit_code_changed", "call_id": cid, "rc": result.get("rc"),
                                "detail": "non-zero exit where the original succeeded"})
-            if _violently_killed(result):
+            if _violently_killed(action, result):
                 blocks.append({"rule": "killed_or_oom", "call_id": cid, "rc": result.get("rc"),
                                "detail": "process killed (OOM/signal) where the original completed"})
-        if se == "file_write" and orig_ok and result.get("status") in ("edit_failed", "edit_failed_ambiguous"):
+        if se == "file_write" and orig_ok and result.get("status") not in ("applied", "skipped_orig_error"):
+            # includes an unsupported write tool (status "skipped"): the original applied a change the replay did
+            # not, so the file the agent works on afterwards differs
             blocks.append({"rule": "edit_not_applied", "call_id": cid, "status": result.get("status"),
+                           "fidelity": result.get("fidelity"),
                            "detail": "the original edit applied; the replay could not apply it"})
         if se == "exec_background":
             if not action.get("bg_finished_before_k", True):

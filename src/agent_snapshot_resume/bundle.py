@@ -174,8 +174,11 @@ def plan_with_observations(ir: dict[str, Any], k: int) -> dict[str, Any]:
 # A file the agent *uses* after the cut: a `Read` call, or a shell command that prints one file's content. Only
 # absolute paths are taken (a relative path's meaning depends on a cwd the probe cannot reconstruct reliably), and the
 # harness's own scaffolding plus device/pseudo files are skipped.
-_POST_CUT_READ = re.compile(r"(?:^|[\s;&|(])(?:cat|head|tail|less|more|wc|zcat|grep|awk|sed|md5sum|sha256sum|file|"
-                            r"stat|jq|cut|sort|uniq|diff|python3?)\s+(?:-\S+\s+)*(?P<path>/[^\s'\"<>|;&()]+)")
+_POST_CUT_READ = re.compile(r"(?:^|[\s;&|(])(?:cat|head|tail|less|more|tac|nl|wc|zcat|md5sum|sha256sum|stat|file|"
+                            r"jq|cut|sort|uniq|diff|od|base64|strings)"
+                            r"\s+(?:-\S+(?:\s+\d+)?\s+)*[\"']?(?P<path>/[^\s'\"<>|;&()]+)")
+# a glob, a shell variable or a substitution cannot be probed as one file: they are not "the file the agent reads"
+_POST_CUT_UNPROBEABLE = ("*", "?", "[", "$", "%")
 _POST_CUT_SKIP = ("/tmp/", "/dev/", "/proc/", "/sys/", "/logs/agent", "/var/log/", "/.asr-", "/root/.claude/",
                   "CLAUDE_CONFIG_DIR")
 
@@ -203,6 +206,9 @@ def post_cut_referenced_files(ir: dict[str, Any], k: int, max_paths: int = 120) 
             for path, how in found:
                 if not path.startswith("/") or any(s in path for s in _POST_CUT_SKIP):
                     continue
+                if any(ch in path for ch in _POST_CUT_UNPROBEABLE):
+                    continue
+                path = path.rstrip(",;:)]")  # trailing punctuation from a shell one-liner
                 seen.setdefault(path, {"path": path, "how": how, "atif_step_id": step.get("atif_step_id")})
                 if len(seen) >= max_paths:
                     return list(seen.values())

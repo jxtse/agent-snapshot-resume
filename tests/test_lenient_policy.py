@@ -127,6 +127,38 @@ def test_lenient_accepts_exit_outcome_change_from_error_to_success_but_records_i
     assert rep["n_divergent"] == 1 and rep["blocks"] == []
 
 
+def test_kill_mark_in_reproduced_output_is_not_a_block():
+    # a command that legitimately prints "MemoryError" (its original output already had it) is not a killed process
+    a = action(orig="Traceback (most recent call last):\nMemoryError\n")
+    r = result(fidelity="exact", rc=0, stdout="Traceback (most recent call last):\nMemoryError\n")
+    assert gate.lenient_blocks(plan_of(a), report_of(r), "0") == []
+    # ... and a *new* mark with a non-zero exit is
+    r2_ = result(fidelity="differs", rc=None, stderr="Killed")
+    assert gate.lenient_blocks(plan_of(action(orig="ok")), report_of(r2_), "0")[0]["rule"] == "killed_or_oom"
+
+
+def test_lenient_blocks_unsupported_write_tool():
+    # NotebookEdit is not replayable: the original applied a change the replay skipped
+    a = action(side_effect="file_write", tool="NotebookEdit", orig="edited")
+    r = result(fidelity="unsupported_tool", status="skipped", rc=None)
+    with pytest.raises(RuntimeError, match="edit_not_applied"):
+        gate.validate_replay(plan_of(a), report_of(r), "0", policy="lenient")
+    # an edit the original applied that the replay applied is fine
+    ok = result(fidelity="exact", status="applied", rc=None)
+    assert gate.lenient_blocks(plan_of(a), report_of(ok), "0") == []
+
+
+def test_stage_snapshot_refuses_a_snapshot_gated_under_another_policy(tmp_path, monkeypatch):
+    from agent_snapshot_resume.batch import Batch
+
+    state = tmp_path / "snapshot-t-s7.json"
+    state.write_text(json.dumps({"replay_gate_passed": True, "snapshot_id": "s1", "replay_policy": "lenient"}))
+    b = object.__new__(Batch)
+    b.state_dir, b.replay_policy = tmp_path, "strict"
+    with pytest.raises(RuntimeError, match="prepared under replay policy"):
+        b.stage_snapshot({"task": "t"}, 7, {}, "tmpl")
+
+
 def test_lenient_blocks_edit_not_applied():
     a = action(side_effect="file_write", tool="Edit", orig="edited")
     r = result(status="edit_failed_ambiguous", rc=None)
@@ -157,6 +189,21 @@ def test_post_cut_paths_ignore_relative_and_agent_state():
     ir = ir_with([[{"type": "tool_call", "tool": "Read", "args": {"file_path": "metrics.json"}},
                    {"type": "tool_call", "tool": "Read", "args": {"file_path": "/root/.claude/settings.json"}}]])
     assert post_cut_referenced_files(ir, 0) == []
+
+
+def test_post_cut_paths_quoted_flags_globs_and_variables():
+    def paths(cmd):
+        return [p["path"] for p in post_cut_referenced_files(
+            {"steps": [{"atif_step_id": 1, "events": [
+                {"type": "tool_call", "tool": "Bash", "args": {"command": cmd}}]}]}, 0)]
+
+    assert paths('cat "/app/input.json"') == ["/app/input.json"]
+    assert paths("head -n 5 /app/input.json") == ["/app/input.json"]
+    assert paths("wc -l /app/a.csv") == ["/app/a.csv"]
+    # a glob or a shell variable is not a single file that can be probed
+    assert paths("cat /app/*.json") == []
+    assert paths('cat "$OUT/metrics.json"') == []
+    assert paths("tail -n 3 /root/run.log; echo done") == ["/root/run.log"]
 
 
 # ------------------------------------------------------------------ screen policy

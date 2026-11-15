@@ -326,8 +326,13 @@ class Batch:
             if not out.is_file():
                 break
             rec = json.loads(out.read_text())
-            if rec.get("replay_gate_passed") and rec.get("snapshot_id"):
+            # a snapshot accepted under another policy was not gated the way this batch gates: never reuse it silently
+            same_policy = (rec.get("replay_policy") or "strict") == self.replay_policy
+            if rec.get("replay_gate_passed") and rec.get("snapshot_id") and same_policy:
                 return rec
+            if rec.get("replay_gate_passed") and rec.get("snapshot_id"):
+                raise RuntimeError(f"{out} holds a snapshot prepared under replay policy "
+                                   f"{rec.get('replay_policy') or 'strict'!r}; this batch runs {self.replay_policy!r}")
             if rec.get("snapshot_id"):
                 # a snapshot exists but its gate was never passed: a human must look at it
                 raise RuntimeError(f"{out} holds a snapshot without a passed replay gate; inspect it")
