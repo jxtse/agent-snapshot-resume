@@ -97,7 +97,8 @@ class Batch:
                  midrun_snapshot_every: float = 1200.0, cut_window: int = 200, max_cut_candidates: int = 16,
                  retry_failed: str = "off", prep_concurrency: int = 6,
                  launch_concurrency: int = 20, only: list[str] | None = None, agent: str = "claude-code",
-                 verifier: bool = True, log=print):
+                 verifier: bool = True, log=print, replay_policy: str = "strict",
+                 cost_alarm_usd: float = 100.0):
         self.name, self.work = name, Path(work_dir)
         self.batch_dir = self.work / "batch" / name
         self.manifest_path = Path(manifest)
@@ -113,6 +114,7 @@ class Batch:
         self.cut_window = cut_window
         self.max_cut_candidates = max_cut_candidates
         self.retry_failed = retry_failed
+        self.replay_policy, self.cost_alarm_usd = replay_policy, cost_alarm_usd
         self.prep_concurrency, self.launch_concurrency = prep_concurrency, launch_concurrency
         self.agent_name, self.verifier = agent, verifier
         self.state = State(self.batch_dir)
@@ -167,7 +169,8 @@ class Batch:
         out = ud / "screen.json"
         if out.is_file():
             rep = json.loads(out.read_text())
-            if rep.get("manifest_cut") == row["cut_line"]:
+            # a report made under another replay policy is not reusable: the policy decides which risks block a cut
+            if rep.get("manifest_cut") == row["cut_line"] and rep.get("policy") == self.replay_policy:
                 if rep.get("cut_line") is None:
                     raise RuntimeError(f"every cut in the fork window blocks ({len(rep.get('candidates') or [])} "
                                        "candidates): see screen.json")
@@ -202,7 +205,8 @@ class Batch:
         skipped: list[dict[str, Any]] = []
         for c in cands[:self.max_cut_candidates]:
             try:
-                rep = screen.screen_trial(self.adapter, trial_dir, cut_lines=[c], task_dir=self.task_dir(row), ir=ir)
+                rep = screen.screen_trial(self.adapter, trial_dir, cut_lines=[c], task_dir=self.task_dir(row), ir=ir,
+                                          policy=self.replay_policy)
             except (SystemExit, ValueError) as exc:  # e.g. a step at index 0 has no prefix to replay
                 skipped.append({"cut_line": c, "error": str(exc)[:200]})
                 continue
@@ -220,7 +224,8 @@ class Batch:
                 if r and r.get("verdict") == "review":
                     chosen = c
                     break
-        rep = {"task": task, "manifest_cut": row["cut_line"], "snapped_cut": near, "fork_session_line": fork_line,
+        rep = {"task": task, "manifest_cut": row["cut_line"], "policy": self.replay_policy,
+               "snapped_cut": near, "fork_session_line": fork_line,
                "candidates": [screen.summarize(by_cut[c]) for c in cands if c in by_cut], "skipped": skipped,
                "cut_line": chosen, "moved": chosen != row["cut_line"],
                "verdict": (by_cut.get(chosen) or {}).get("verdict") if chosen else "block",
@@ -291,6 +296,15 @@ class Batch:
         task = row["task"]
         out = self.state_dir / f"template-{task}.json"
         rec = json.loads(out.read_text()) if out.is_file() else {}
+        # The template's cpu/memory are the sandbox's cpu/memory: a template built with the package default (2 cpu /
+        # 4096 MB) does not reproduce a trial that ran with 4 cpu / 16 GB (torch thread count, solver memory). Rebuild.
+        want = templates.task_resources(self.task_dir(row))
+        rec_res = {"cpus": rec.get("cpu"), "memory_mb": rec.get("memory_mb")}
+        stale = ("ready" in str(rec.get("status")) and
+                 (rec_res["cpus"] != want["cpus"] or rec_res["memory_mb"] != want["memory_mb"]))
+        if stale:
+            out.rename(out.with_name(out.name + f".resources-{rec_res['cpus']}c-{rec_res['memory_mb']}m"))
+            rec = {}
         if "ready" not in str(rec.get("status")):
             rec = templates.build_template(task_dir=self.task_dir(row), state_dir=self.state_dir)
         if "ready" not in str(rec.get("status")):
@@ -323,7 +337,8 @@ class Batch:
             tag = f"{base_tag}-r{attempt}"
         rec = source.prepare_source(adapter=self.adapter, task_dir=self.task_dir(row),
                                     bundle=Path(bundled["bundles"]["hinted"]["dir"]),
-                                    template=str(tmpl_id), tag=tag, state_dir=self.state_dir)
+                                    template=str(tmpl_id), tag=tag, state_dir=self.state_dir,
+                                    replay_policy=self.replay_policy)
         if not rec.get("snapshot_id"):
             raise RuntimeError("prepare-snapshot produced no snapshot id")
         return rec
@@ -449,7 +464,11 @@ class Batch:
             self.state.update(task, stage="snapshot", template_id=tmpl.get("template_id"))
             snap = self.stage_snapshot(row, cut, bundled, tmpl.get("template_id"))
             snap_path = self.state_dir / f"snapshot-{snap['tag']}.json"
-            self.state.update(task, stage="fake", snapshot_id=snap["snapshot_id"])
+            div = snap.get("divergence_report") or {}
+            self.state.update(task, stage="fake", snapshot_id=snap["snapshot_id"], replay_policy=self.replay_policy,
+                              divergent_commands=div.get("n_divergent"),
+                              divergences_by_kind=div.get("by_kind"), files_missing=div.get("files_missing"),
+                              post_cut_paths=div.get("post_cut_paths"))
             fake = self.stage_fake(row, cut, bundled, snap_path)
             self.state.update(task, stage="ready")
             return {"task": task, "cut_line": cut, "bundled": bundled, "snap": snap_path, "fake": fake}
@@ -557,7 +576,10 @@ class Batch:
                 rows.append(self.run_status(row, st, job, info))
             if not runs:
                 rows.append({"task": task, "run": None, "job": None, "stage": st.get("stage"),
-                             "state": st.get("stage"), "cut_line": st.get("cut_line"), "error": st.get("error")})
+                             "state": st.get("stage"), "cut_line": st.get("cut_line"), "error": st.get("error"),
+                             "replay_policy": st.get("replay_policy"),
+                             "divergent_commands": st.get("divergent_commands"),
+                             "divergences_by_kind": st.get("divergences_by_kind")})
         return rows
 
     def run_status(self, row: dict[str, Any], st: dict[str, Any], job: str, info: dict[str, Any]) -> dict[str, Any]:
@@ -565,7 +587,9 @@ class Batch:
         out: dict[str, Any] = {"task": row["task"], "run": info.get("run"), "kind": info.get("kind"), "job": job,
                                "cut_line": st.get("cut_line"), "trial_dir": str(trial),
                                "state": "launched", "reward": None, "failed_tests": [], "cost_usd": None,
-                               "hint_counts": [], "n_compactions": 0, "class": None, "error": None}
+                               "hint_counts": [], "n_compactions": 0, "class": None, "error": None,
+                               "replay_policy": st.get("replay_policy"),
+                               "divergent_commands": st.get("divergent_commands")}
         res_path = trial / "result.json"
         if not res_path.is_file():
             started = info.get("launched")
@@ -579,6 +603,8 @@ class Batch:
         out["state"] = "done"
         out["reward"] = ((res.get("verifier_result") or {}).get("rewards") or {}).get("reward")
         out["cost_usd"] = (res.get("agent_result") or {}).get("cost_usd")
+        # report (never kill) a run that spends far more than a normal trial: a runaway agent fans out subagents
+        out["runaway"] = bool(out["cost_usd"] and out["cost_usd"] > self.cost_alarm_usd)
         exc = res.get("exception_info")
         if exc:
             out["error"] = str(exc)[:400]
@@ -627,6 +653,7 @@ def failed_tests(trial: Path, limit: int = 12) -> list[str]:
 
 def print_status(rows: list[dict[str, Any]]) -> None:
     cols = ("task", "run", "state", "reward", "cost_usd", "hint_counts", "n_compactions", "class", "error")
-    print("\t".join(cols))
+    print("\t".join(cols + ("runaway",)))
     for r in rows:
-        print("\t".join("" if r.get(c) is None else str(r.get(c))[:70] for c in cols))
+        tail = "RUNAWAY" if r.get("runaway") else ""
+        print("\t".join([("" if r.get(c) is None else str(r.get(c))[:70]) for c in cols] + [tail]))

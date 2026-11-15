@@ -171,6 +171,44 @@ def plan_with_observations(ir: dict[str, Any], k: int) -> dict[str, Any]:
     return plan
 
 
+# A file the agent *uses* after the cut: a `Read` call, or a shell command that prints one file's content. Only
+# absolute paths are taken (a relative path's meaning depends on a cwd the probe cannot reconstruct reliably), and the
+# harness's own scaffolding plus device/pseudo files are skipped.
+_POST_CUT_READ = re.compile(r"(?:^|[\s;&|(])(?:cat|head|tail|less|more|wc|zcat|grep|awk|sed|md5sum|sha256sum|file|"
+                            r"stat|jq|cut|sort|uniq|diff|python3?)\s+(?:-\S+\s+)*(?P<path>/[^\s'\"<>|;&()]+)")
+_POST_CUT_SKIP = ("/tmp/", "/dev/", "/proc/", "/sys/", "/logs/agent", "/var/log/", "/.asr-", "/root/.claude/",
+                  "CLAUDE_CONFIG_DIR")
+
+
+def post_cut_referenced_files(ir: dict[str, Any], k: int, max_paths: int = 120) -> list[dict[str, Any]]:
+    """Absolute files the agent reads after step k, from the original session's post-cut tool calls.
+
+    The lenient replay gate requires these to exist in the replayed environment: the resumed agent's history is
+    restored verbatim, so a file it already "remembers" reading must still be there when it reads it again or builds
+    on it."""
+    seen: dict[str, dict[str, Any]] = {}
+    for step in ir["steps"][k:]:
+        for e in step["events"]:
+            if e.get("type") != "tool_call":
+                continue
+            tool, args = e.get("tool"), e.get("args") or {}
+            found = []
+            if tool in ("Read", "NotebookRead"):
+                p = args.get("file_path") or args.get("path") or args.get("notebook_path")
+                if p:
+                    found.append((str(p), tool))
+            elif tool == "Bash":
+                for m in _POST_CUT_READ.finditer(args.get("command") or ""):
+                    found.append((m.group("path"), "Bash"))
+            for path, how in found:
+                if not path.startswith("/") or any(s in path for s in _POST_CUT_SKIP):
+                    continue
+                seen.setdefault(path, {"path": path, "how": how, "atif_step_id": step.get("atif_step_id")})
+                if len(seen) >= max_paths:
+                    return list(seen.values())
+    return list(seen.values())
+
+
 def step_for_cut_line(ir: dict[str, Any], cut_line: int, trimmed=None) -> int:
     """ATIF step id of the agent step that starts at session line cut_line (0-based; = number of prefix lines kept).
     Accepts the step's first line or its trimmed cut (adapter.cut_line, e.g. without trailing bookkeeping lines)."""
@@ -218,6 +256,8 @@ def build(*, adapter, trial_dir: Path, atif_step: int | None, out: Path, mode: s
     prev = ir["steps"][k - 1]
     cut = adapter.cut_line(raw_lines, ir, k)
     plan = plan_with_observations(ir, k)
+    # what the agent will read after the cut: the lenient replay gate requires these to survive the replay
+    plan["post_cut_paths"] = post_cut_referenced_files(ir, k)
     # ---- chained round-N build: a resumed trial's session must be normalised before it can seed the next run
     evidence = chain.run_evidence(trial_dir)
     if persist_hint and mode != "hint" and not evidence:
@@ -335,6 +375,7 @@ def build(*, adapter, trial_dir: Path, atif_step: int | None, out: Path, mode: s
         "orig_date": orig_date, "mode": mode, "hint": hint, "prior_hints": wanted[:-1] if mode == "hint" else wanted,
         "n_hints": len(wanted), "model": agent_model, "sentinel": sentinel, "aux_counts": aux_counts,
         "resume_cost": rp, "n_replay_actions": len(plan["actions"]), "flags": ir["flags"],
+        "n_post_cut_paths": len(plan["post_cut_paths"]),
         "n_compactions_before_cut": n_compactions, "orig_request_at_k": orig_request,
         "orig_request_locate_error": loc.get("error"),
         "fingerprint_roots": roots,

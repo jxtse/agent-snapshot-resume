@@ -82,7 +82,7 @@ def cmd_prepare_snapshot(a):
     from .sandbox import source
 
     if a.continue_state:
-        rec = source.finish_prepared_source(Path(a.continue_state))
+        rec = source.finish_prepared_source(Path(a.continue_state), replay_policy=a.replay_policy)
     else:
         missing = [n for n in ("task_dir", "bundle", "template", "tag") if not getattr(a, n)]
         if missing:
@@ -101,7 +101,8 @@ def cmd_prepare_snapshot(a):
         rec = source.prepare_source(adapter=_adapter(a.agent), task_dir=Path(a.task_dir), bundle=Path(a.bundle),
                                     template=template, tag=a.tag, state_dir=Path(a.state_dir), version=a.version,
                                     exec_cap=a.exec_cap, expected_fingerprint=a.expected_fingerprint,
-                                    retain_on_gate_failure=a.retain_on_gate_failure, base_snapshot=base)
+                                    retain_on_gate_failure=a.retain_on_gate_failure, base_snapshot=base,
+                                    replay_policy=a.replay_policy)
     print(json.dumps({k: rec.get(k) for k in ("snapshot_id", "fingerprint_source", "replay_gate_passed",
                                               "base_snapshot")}))
     return 0 if rec.get("snapshot_id") else 1
@@ -190,7 +191,8 @@ def cmd_batch(a):
               cut_window=a.cut_window, max_cut_candidates=a.max_cut_candidates, retry_failed=a.retry_failed,
               prep_concurrency=a.prep_concurrency,
               launch_concurrency=a.launch_concurrency, only=a.only.split(",") if a.only else None,
-              agent=a.agent, verifier=not a.no_verifier)
+              agent=a.agent, verifier=not a.no_verifier, replay_policy=a.replay_policy,
+              cost_alarm_usd=a.cost_alarm_usd)
     if a.mode == "status":
         rows = b.status()
         if a.json:
@@ -225,7 +227,7 @@ def cmd_screen(a):
     from . import screen
     reps = screen.screen_trial(_adapter(a.agent), Path(a.trial_dir), cut_lines=a.cut_line, steps=a.step,
                                agent_timeout_s=a.agent_timeout,
-                               task_dir=Path(a.task_dir) if a.task_dir else None)
+                               task_dir=Path(a.task_dir) if a.task_dir else None, policy=a.replay_policy)
     print(screen.main_json(reps, a.full))
     if a.out:
         Path(a.out).write_text(json.dumps(reps, ensure_ascii=False, indent=1))
@@ -333,9 +335,10 @@ def build_parser():
     p.add_argument("--task-dir", required=True)
     p.add_argument("--image", help="override task.toml [environment] docker_image")
     p.add_argument("--state-dir", default="state")
-    p.add_argument("--cpu", type=int, default=2)
-    p.add_argument("--memory-mb", type=int, default=4096)
-    p.add_argument("--disk-mib", type=int, default=15360)
+    p.add_argument("--cpu", type=int, help="default: task.toml [environment] cpus (the trial's own config)")
+    p.add_argument("--memory-mb", type=int, help="default: task.toml [environment] memory_mb")
+    p.add_argument("--disk-mib", type=int, choices=[512, 10240, 15360],
+                   help="default: the FC disk bucket covering task.toml storage_mb")
     p.set_defaults(fn=cmd_build_template)
 
     p = sub.add_parser("prepare-snapshot", help="replay steps < k in a source sandbox and snapshot it")
@@ -349,6 +352,10 @@ def build_parser():
     p.add_argument("--exec-cap", type=int, default=1800, help="max seconds per replayed command")
     p.add_argument("--expected-fingerprint")
     p.add_argument("--retain-on-gate-failure", action="store_true")
+    p.add_argument("--replay-policy", choices=["strict", "lenient"], default="strict",
+                   help="strict accepts only explained replay output; lenient accepts output divergences and blocks "
+                        "only a command that fails where the original succeeded, a file the agent reads after the "
+                        "cut that is missing, and a background job still in flight at the cut")
     p.add_argument("--full-replay", action="store_true",
                    help="ignore the bundle's base_snapshot and replay the whole prefix from the task template")
     p.add_argument("--continue", dest="continue_state", help="finish a retained source from its state json")
@@ -428,6 +435,9 @@ def build_parser():
     p.add_argument("--prep-concurrency", type=int, default=6)
     p.add_argument("--launch-concurrency", type=int, default=20)
     p.add_argument("--only", help="comma-separated task names")
+    p.add_argument("--replay-policy", choices=["strict", "lenient"], default="strict")
+    p.add_argument("--cost-alarm-usd", type=float, default=100.0,
+                   help="status flags (never kills) a run whose cost_usd exceeds this")
     p.add_argument("--no-verifier", action="store_true")
     p.add_argument("--json", action="store_true", help="status: machine-readable")
     p.set_defaults(fn=cmd_batch)
@@ -445,6 +455,8 @@ def build_parser():
     p.add_argument("--task-dir", help="Harbor task dir (for the agent timeout in task.toml)")
     p.add_argument("--full", action="store_true", help="print every risk, not a per-cut summary")
     p.add_argument("--out", help="write the full reports as JSON")
+    p.add_argument("--replay-policy", choices=["strict", "lenient"], default="strict",
+                   help="lenient treats pace-dependent reads of finished background jobs as a warning, not a block")
     p.set_defaults(fn=cmd_screen)
 
     p = sub.add_parser("parity", help="first rewritten request vs the original run's request at the cut")

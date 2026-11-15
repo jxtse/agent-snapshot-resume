@@ -80,7 +80,8 @@ def _python_like(cmd: str) -> bool:
 
 
 def screen_plan(plan: dict[str, Any], rp: dict[str, Any] | None = None, *, n_compactions: int = 0,
-                orig_request: dict[str, Any] | None = None, long_replay_s: float = 1800.0) -> dict[str, Any]:
+                orig_request: dict[str, Any] | None = None, long_replay_s: float = 1800.0,
+                policy: str = "strict") -> dict[str, Any]:
     risks: list[dict[str, Any]] = []
 
     def add(rule, sev, a=None, i=None, **kw):
@@ -122,13 +123,19 @@ def screen_plan(plan: dict[str, Any], rp: dict[str, Any] | None = None, *, n_com
                 end = trace_ir._ts(src.get("bg_finished_ts")) if src.get("bg_finished_ts") else None
                 if src.get("side_effect") == "exec_background" and end is not None and ts is not None and end <= ts:
                     # Claude Code-managed job that had finished when it was read: the replay runs such jobs in the
-                    # foreground to completion, so the read sees the same finished output
-                    add("pace_dependent_read", INFO, a, i, detail=f"reads finished output of background job "
-                        f"{src.get('call_id')}", background_finished_before_read=True)
+                    # foreground to completion, so the read sees the same finished output. In lenient mode the
+                    # replayed numbers/content may still differ, which the gate accepts: warn, never block.
+                    add("pace_dependent_read", WARN if policy == "lenient" else INFO, a, i,
+                        detail=f"reads finished output of background job {src.get('call_id')}"
+                        + ("; lenient policy accepts a differing body (only a changed exit status blocks)"
+                           if policy == "lenient" else ""),
+                        background_finished_before_read=True)
                 else:
-                    add("pace_dependent_read", BLOCK if src.get("side_effect") == "exec_background" else WARN, a, i,
+                    add("pace_dependent_read", WARN if policy == "lenient" else
+                        (BLOCK if src.get("side_effect") == "exec_background" else WARN), a, i,
                         detail=f"reads output of background job {src.get('call_id')} ({reads[0]}) while it was "
-                        "still running (or with unknown end): output depends on progress",
+                        "still running (or with unknown end): output depends on progress"
+                        + ("; lenient policy accepts the differing body" if policy == "lenient" else ""),
                         background_finished_before_read=False)
             elif alive and _POLL.search(cmd):
                 add("pace_dependent_read", WARN, a, i, detail="polls (sleep/ps/tail/wc) while a background job "
@@ -163,12 +170,13 @@ def screen_plan(plan: dict[str, Any], rp: dict[str, Any] | None = None, *, n_com
         add("missing_original", WARN, detail="original request at the cut not located; parity gate unavailable")
     by = {s: sum(r["severity"] == s for r in risks) for s in (BLOCK, WARN, INFO)}
     verdict = "block" if by[BLOCK] else ("review" if by[WARN] else "ok")
-    return {"verdict": verdict, "counts": by, "n_actions": len(plan["actions"]), "risks": risks}
+    return {"verdict": verdict, "counts": by, "n_actions": len(plan["actions"]), "risks": risks,
+            "policy": policy}
 
 
 def screen_trial(adapter, trial_dir: Path, *, cut_lines: list[int] | None = None, steps: list[int] | None = None,
                  agent_timeout_s: float | None = None, task_dir: Path | None = None,
-                 ir: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+                 ir: dict[str, Any] | None = None, policy: str = "strict") -> list[dict[str, Any]]:
     from . import parity
     from .bundle import plan_with_observations, resolve_agent_timeout, step_for_cut_line
     trial_dir = Path(trial_dir)
@@ -191,7 +199,8 @@ def screen_trial(adapter, trial_dir: Path, *, cut_lines: list[int] | None = None
         plan = plan_with_observations(ir, k)
         n_comp = sum(1 for s in ir["steps"][:k] for e in s["events"] if e["type"] == "compaction_boundary")
         loc = parity.locate_request(ir, k, reqs)
-        rep = screen_plan(plan, rps.get(k), n_compactions=n_comp, orig_request=loc.get("record"))
+        rep = screen_plan(plan, rps.get(k), n_compactions=n_comp, orig_request=loc.get("record"),
+                          policy=policy)
         rep.update(trial=trial_dir.name, atif_step=sid, cut_line=adapter.cut_line(raw, ir, k),
                    step_first_line=ir["steps"][k]["line_range"][0],
                    elapsed_s=ir["steps"][k].get("elapsed_s"), remaining_s=ir["steps"][k].get("remaining_s"),
