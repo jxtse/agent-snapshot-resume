@@ -185,7 +185,7 @@ uv run asr launch --bundle bundles/<run_id> --task-dir /path/to/tasks/<task> \
 
 ```bash
 asr batch run --name o70-r1 --manifest round1/manifest.csv --work-dir . \
-  --tasks-dir ../tbs-aliyun/tasks/o70 --hinted-reps 2 --control-reps 1 \
+  --tasks-dir ../tasks/o70 --hinted-reps 2 --control-reps 1 \
   --prep-concurrency 6 --launch-concurrency 20 \
   --agent-env CLAUDE_CODE_MAX_OUTPUT_TOKENS=128000 --passthrough-args '--drop-fields metadata --strip-is-error'
 asr batch status --name o70-r1          # or --json
