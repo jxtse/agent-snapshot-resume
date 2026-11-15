@@ -13,8 +13,10 @@ be retained (`--retain-on-gate-failure`) and finished later with `finish_prepare
 """
 from __future__ import annotations
 
+import glob
 import hashlib
 import json
+import os
 import shlex
 import time
 import tomllib
@@ -56,6 +58,53 @@ def probe_post_cut(sbx, run, plan: dict, state_dir: Path, tag: str) -> dict:
     missing = sorted(p for p, ok in raw.items() if not ok)
     (state_dir / f"{tag}-post_cut_paths.json").write_text(json.dumps({"present": raw}, indent=1) + "\n")
     return {"n": len(raw), "present": len(raw) - len(missing), "missing": missing}
+
+
+def transcript_prefix(meta: dict[str, Any], bundle: Path) -> bytes:
+    """The transcript the previous run really had at this cut (its own session file, resume scaffolding included).
+
+    The normalized seed (session_trunc.jsonl) is what Claude Code rebuilds its context from; the parent's file also
+    carried its resume scaffolding, and agents do read their own transcript back. Seeding the parent's prefix keeps
+    those commands byte-identical at the cut. Falls back to the seed when the parent session is not available.
+    """
+    seed = (bundle / "session_trunc.jsonl").read_bytes()
+    chain_meta = meta.get("chain") or {}
+    parent = chain_meta.get("parent_trial_dir")
+    if not parent or not meta.get("cut_line"):
+        return seed
+    removed = [i for a in (chain_meta.get("stripped") or []) for i in a.get("removed_lines") or []]
+    cut = int(meta["cut_line"])
+    cut_orig = cut
+    while True:  # the seed's line numbers are the parent's minus the scaffolding before the cut
+        grown = cut + sum(1 for i in removed if i < cut_orig)
+        if grown == cut_orig:
+            break
+        cut_orig = grown
+    paths = sorted(glob.glob(os.path.join(parent, "agent", "sessions", "projects", "*", "*.jsonl")))
+    if not paths:
+        return seed
+    with open(paths[0], encoding="utf-8") as f:
+        lines = [l for l in f.read().split("\n") if l.strip()]
+    if cut_orig > len(lines):
+        return seed
+    return ("\n".join(lines[:cut_orig]) + "\n").encode()
+
+
+def _write_in_parts(sbx, remote: str, data: bytes, part: int = 8 * 1024 * 1024) -> None:
+    """Write a file into the guest in parts: one API write request cannot carry a 40 MB session seed (it times
+    out, and the run then starts without a session at all)."""
+    if len(data) <= part:
+        sbx.files.write(remote, data)
+        return
+    parts = []
+    for i, lo in enumerate(range(0, len(data), part)):
+        rp = f"{remote}.part{i}"
+        sbx.files.write(rp, data[lo:lo + part])
+        parts.append(rp)
+    sbx.commands.run("cat " + " ".join(parts) + " > " + remote + " && rm -f " + " ".join(parts),
+                     user="root", timeout=180)
+    if not sbx.files.read(remote, format="bytes")[:64]:
+        raise RuntimeError(f"part upload of {remote} produced an empty file")
 
 
 def dispatch_replay(sbx, cwd: str, exec_cap: int) -> int:
@@ -325,6 +374,14 @@ print(json.dumps({"killed": killed}))
         run(sbx, f"mkdir -p {REPLAY_DIR}")
         sbx.files.write(f"{REPLAY_DIR}/plan.json", (bundle / "plan.json").read_bytes())
         sbx.files.write(f"{REPLAY_DIR}/replay_inside.py", REPLAY_SCRIPT.read_bytes())
+        # The parent run's own transcript was part of its environment: agents do read it back (e.g. to recover a
+        # plan after a compaction). Seed it before the tail replay so those commands see the same prefix they saw,
+        # at the same path the agent will use for the resumed session.
+        slug, sid = meta.get("project_slug"), meta.get("session_id")
+        if slug and sid:
+            sess_path = f"/logs/agent/sessions/projects/{slug}/{sid}.jsonl"
+            run(sbx, f"mkdir -p /logs/agent/sessions/projects/{slug}")
+            _write_in_parts(sbx, sess_path, transcript_prefix(meta, bundle))
         cwd = meta.get("cwd") or "/app"
         rec["replay_pid"] = dispatch_replay(sbx, cwd, exec_cap)
         step("replay_dispatched_once", t, pid=rec["replay_pid"])

@@ -141,6 +141,25 @@ class LaunchConfig(unittest.TestCase):
         self.assertNotIn("ANTHROPIC_API_KEY", env)
         self.assertNotIn("ANTHROPIC_BASE_URL", env)
 
+    def test_a_resumed_trial_does_not_donate_its_own_resume_gate(self):
+        """Chained units launch from a trial of a resumed run: its freeze/parity kwargs are not reproduction settings."""
+        from agent_snapshot_resume.launch import original_agent_settings
+        import shutil
+        trial = self.root / "resumed-trial"
+        shutil.copytree(TRIAL, trial)
+        c = json.loads((trial / "config.json").read_text())
+        c["agent"]["kwargs"].update({
+            "resume_bundle": "/tmp/round-1-bundle", "upstream_fake": True, "parity_gate": "require",
+            "expected_first_request_sha256": "0" * 64,
+            "freeze_first_request": "/tmp/round-1-fake/first_request_rewritten.json",
+            "passthrough_args": ["--strip-is-error"], "setup_timeout_s": 900})
+        (trial / "config.json").write_text(json.dumps(c))
+        _, kwargs = original_agent_settings(str(trial))
+        for k in ("resume_bundle", "upstream_fake", "parity_gate", "expected_first_request_sha256",
+                  "freeze_first_request", "passthrough_args", "version"):
+            self.assertNotIn(k, kwargs)
+        self.assertEqual(kwargs.get("setup_timeout_s"), 900)  # reproduction settings survive
+
     def test_no_verifier(self):
         self.assertEqual(self.cfg(verifier=False)["verifier"], {"disable": True})
 
