@@ -141,7 +141,27 @@ def content_reference(session_lines: list[dict[str, Any]], templates: list[str] 
             if isinstance(body, str) and body in leaves:
                 item["content_leaf"] = leaves.index(body)  # the file text rendered under its Read header
             attachments.append(item)
-    ref: dict[str, Any] = {"message_block_sha256": [block_digest(b) for b in blocks_from_session(ctx)],
+    # `isMeta` user records are not part of blocks_from_session (they are not conversation turns), but Claude Code
+    # does send them: e.g. the "[Your previous response had no visible output...]" nudge it writes after a turn with
+    # no visible text. They are model-visible context, so the reference tolerates them once each instead of calling
+    # them unexplained.
+    meta_blocks = []
+    for d in ctx:
+        if d.get("type") in ("user", "assistant") and d.get("isMeta"):
+            c = (d.get("message") or {}).get("content")
+            role = (d.get("message") or {}).get("role") or d["type"]
+            for b in ([c] if isinstance(c, str) else (c or [])):
+                if isinstance(b, dict) and b.get("type") == "text":
+                    meta_blocks.append(block_digest((role, "text", b["text"])))
+                elif isinstance(b, str):
+                    meta_blocks.append(block_digest((role, "text", b)))
+    blocks = blocks_from_session(ctx)
+    ref: dict[str, Any] = {"message_block_sha256": [block_digest(b) for b in blocks],
+                           # kinds let the gate recognise a *partial* trailing assistant message: a cut can fall
+                           # inside a message (its thinking persisted before the tool_use the cut resumes at), and
+                           # no request ever carried that fragment
+                           "block_kinds": [[b[0], b[1]] for b in blocks],
+                           "meta_block_sha256": meta_blocks,
                            "n_attachments": sum(1 for d in ctx if d.get("type") == "attachment"),
                            "attachments": attachments, "rendered_templates": templates}
     if cli is not None and sysp is not None:
@@ -171,11 +191,10 @@ def check_files(bundle_dir: str | os.PathLike, request_path: str | os.PathLike,
         return {"ok": False, "error": "bundle has no orig_request_at_k (original proxy log missing?)"}
     rq = json.loads(Path(request_path).read_text())
     body = rq.get("body", rq)
-    hints = list(spec.get("hints") or ([spec["hint"]] if spec.get("hint") else []))
-    rep = compare_parity(body, exp, route_from_passthrough_args(passthrough_args), hints)
+    from .proxy.resume_proxy import check_content, parity_hints, spec_hints
+    rep = compare_parity(body, exp, route_from_passthrough_args(passthrough_args), parity_hints(spec))
     if exp.get("content"):
-        from .proxy.resume_proxy import check_content
-        rep["content_problems"] = check_content(body, exp["content"], hints)
+        rep["content_problems"] = check_content(body, exp["content"], spec_hints(spec))
         rep["ok"] = rep["ok"] and not rep["content_problems"]
     rep.update(bundle=meta["run_id"], orig_index=exp.get("index"), locate_method=exp.get("method"))
     return rep

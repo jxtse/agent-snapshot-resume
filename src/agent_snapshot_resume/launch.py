@@ -35,6 +35,13 @@ def verifier_hashes(task_dir: Path) -> dict[str, str]:
             if p.is_file() and "__pycache__" not in p.parts and p.name not in ("Dockerfile", ".dockerignore")}
 
 
+# A trial of a resumed run carries its own resume gate in its agent kwargs (the freeze of ITS fake proof, its parity
+# mode, its bundle). Inheriting those would make the next round's fake run compare against the previous round's
+# request, which can never match, so they are dropped; only the reproduction settings (env, model, flags) are kept.
+_RESUME_KWARGS = {"resume_bundle", "upstream_fake", "upstream_url", "parity_gate", "expected_first_request_sha256",
+                  "freeze_first_request", "max_model_requests", "passthrough_args"}
+
+
 def original_agent_settings(trial_dir: str | None) -> tuple[dict[str, str], dict[str, Any]]:
     """Non-secret env and kwargs of the original run's agent (from <trial>/config.json), to reproduce its setup."""
     if not trial_dir or not (Path(trial_dir) / "config.json").is_file():
@@ -51,7 +58,8 @@ def original_agent_settings(trial_dir: str | None) -> tuple[dict[str, str], dict
                 print(f"warning: {k}={agent['env'][k]} not set here; dropped", file=sys.stderr)
                 continue
         env[k] = str(v)
-    kwargs = {k: v for k, v in (agent.get("kwargs") or {}).items() if k != "version" and not _SECRET_RE.search(k)}
+    kwargs = {k: v for k, v in (agent.get("kwargs") or {}).items()
+              if k not in _RESUME_KWARGS and k != "version" and not _SECRET_RE.search(k)}
     return env, kwargs
 
 

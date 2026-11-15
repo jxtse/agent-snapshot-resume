@@ -15,7 +15,8 @@ from agent_snapshot_resume import chain
 from agent_snapshot_resume.agents import get_adapter
 from agent_snapshot_resume.agents.claude_code import simulate_resume_request
 from agent_snapshot_resume.bundle import build
-from agent_snapshot_resume.proxy.resume_proxy import hint_block_text, rewrite
+from agent_snapshot_resume.proxy.resume_proxy import (compare_parity, hint_block_text, parity_hints,
+                                                      restore_carried_hints, rewrite, route_bytes)
 
 ROOT = Path(__file__).resolve().parent.parent
 TRIAL = ROOT / "examples/fixtures/synthetic-trial"
@@ -28,13 +29,23 @@ def _uid():
     return str(uuid.uuid4())
 
 
-def _rec(kind, content, parent=None, **extra):
+def _rec(kind, content, parent=None, mid=None, usage=None, **extra):
     rec = {"type": kind, "uuid": _uid(), "timestamp": "2026-01-01T00:00:10.000Z", "parentUuid": parent,
            "sessionId": "00000000-0000-4000-8000-000000000001"}
     if content is not None:
         rec["message"] = {"role": "user" if kind == "user" else "assistant", "content": content}
+    if mid:
+        rec.setdefault("message", {})["id"] = mid
+    if usage:
+        rec.setdefault("message", {})["usage"] = usage
     rec.update(extra)
     return rec
+
+
+def _usage(i):
+    """Distinct usage per assistant turn: parity locates the parent's request by exactly this tuple."""
+    return {"input_tokens": 100 + i, "cache_read_input_tokens": i, "cache_creation_input_tokens": 0,
+            "output_tokens": 50 + i}
 
 
 def make_fake_resumed_run(tmp: Path, *, compact: bool = False) -> dict:
@@ -68,15 +79,15 @@ def make_fake_resumed_run(tmp: Path, *, compact: bool = False) -> dict:
                attachment={"type": "environment", "snapshot": {"workingDirectory": "/app"}})
     a1 = _rec("assistant", [{"type": "thinking", "thinking": "next"}, {"type": "tool_use", "id": "toolu_new1",
                                                                     "name": "Bash", "input": {"command": "ls /app"}}],
-              parent=att["uuid"], message_id="msg_new1")
+              parent=att["uuid"], mid="msg_new1", usage=_usage(1))
     r1 = _rec("user", [{"type": "tool_result", "tool_use_id": "toolu_new1", "content": "sum.py"}], parent=a1["uuid"])
     a2 = _rec("assistant", [{"type": "thinking", "thinking": "write"}, {"type": "tool_use", "id": "toolu_new2",
                                                                      "name": "Bash", "input": {"command": "echo hi"}}],
-              parent=r1["uuid"], message_id="msg_new2")
+              parent=r1["uuid"], mid="msg_new2", usage=_usage(2))
     r2 = _rec("user", [{"type": "tool_result", "tool_use_id": "toolu_new2", "content": "hi"}], parent=a2["uuid"])
     a3 = _rec("assistant", [{"type": "thinking", "thinking": "done"}, {"type": "tool_use", "id": "toolu_new3",
                                                                     "name": "Bash", "input": {"command": "cat x"}}],
-              parent=r2["uuid"], message_id="msg_new3")
+              parent=r2["uuid"], mid="msg_new3", usage=_usage(3))
     recs += [cont, synth, sent, att, a1, r1, a2, r2, a3]
     sess = proj / f"{spec1.get('session_id') or '00000000-0000-4000-8000-000000000001'}.jsonl"
     sess.write_text("\n".join(json.dumps(r) for r in recs) + "\n")
@@ -91,6 +102,16 @@ def make_fake_resumed_run(tmp: Path, *, compact: bool = False) -> dict:
     rp = trial / "agent" / "resume-proxy" / m1["run_id"]
     rp.mkdir(parents=True)
     (rp / "first_request_rewritten.json").write_text(json.dumps({"body": first_request, "actions": acts}))
+    # the parent run's own passthrough log: what its first request really cost and carried upstream. A chained build
+    # takes the PARENT's effective request at the next cut as its parity reference, not the original L0 request.
+    mp = trial / "agent" / "model-proxy"
+    mp.mkdir(parents=True)
+    (mp / "requests-20260101.jsonl").write_text(json.dumps({
+        "ts": "2026-01-01T00:00:20+0000", "path": "/v1/messages", "model": first_request.get("model") or "test-model",
+        "n_messages": len(first_request["messages"]), "max_tokens": first_request.get("max_tokens"),
+        "thinking": first_request.get("thinking"), "n_tools": len(first_request.get("tools") or []),
+        "req_bytes": route_bytes(first_request, {}), "status": 200, "stop_reason": "tool_use",
+        "usage": _usage(1)}) + "\n")
     (trial / "result.json").write_text(json.dumps({"task_name": "sum-task", "verifier_result": {"rewards": {"reward": 0.0}},
                                                    "config": {"agent": {"model_name": "test-model"}}}))
     return {"trial": trial, "bundle1": b1, "meta1": m1, "spec1": spec1, "session": sess, "records": recs}
@@ -123,22 +144,6 @@ class ChainedBuild(unittest.TestCase):
         idx = audit[0]["removed_lines"][0]
         self.assertEqual(stripped[idx]["parentUuid"], audit[0]["reconnected"]["to"])
 
-    def test_hint_materialised_on_the_compaction_summary(self):
-        recs = list(self.fx["records"])
-        sidx = 500
-        recs.append({"type": "system", "subtype": "compact_boundary", "uuid": _uid(),
-                     "compactMetadata": {"preservedMessages": {"uuids": []}}})
-        summary = _rec("user", "This session is being continued from a previous conversation", isCompactSummary=True)
-        recs.append(summary)
-        after = _rec("assistant", [{"type": "tool_use", "id": "toolu_after", "name": "Bash",
-                                    "input": {"command": "ls"}}], parent=summary["uuid"], message_id="m_x")
-        recs.append(after)
-        anchors = [{"tool_use_id": "toolu_b1"}]  # injected on the pre-compaction prefix
-        out, audit, _cut = chain.materialize_hints(recs, [H1], anchors, len(recs))
-        self.assertEqual(audit[0]["where"], "compaction_summary")
-        self.assertIn(hint_block_text(H1), [b["text"] for b in out[-2]["message"]["content"]])
-        self.assertEqual(len(chain.anchors_for(out, [H1], len(out))), 0)  # a summary has no tool result
-
     def test_round_two_bundle_carries_both_hints(self):
         ir, steps = self._steps(self.fx["trial"])
         cut_step = steps[-1]  # the last agent step of the resumed run
@@ -152,16 +157,22 @@ class ChainedBuild(unittest.TestCase):
         self.assertTrue(spec["persist_hint"])
         self.assertEqual(meta["n_hints"], 2)
         self.assertEqual(meta["chain"]["carried_hints"], 1)
-        # the seed carries H1 once (its old injection point) and no scaffolding
+        # the seed carries H1 nowhere: --resume drops every form a seed could take, so it is re-injected instead
         seed = (bdir / "session_trunc.jsonl").read_text()
         seed_texts = [b.get("text") for r in (json.loads(l) for l in seed.splitlines() if l.strip())
                       for b in ((r.get("message") or {}).get("content") or []) if isinstance(b, dict)]
-        self.assertEqual(seed_texts.count(hint_block_text(H1)), 1)
+        self.assertEqual(seed_texts.count(hint_block_text(H1)), 0)
         self.assertNotIn(self.fx["spec1"]["sentinel"], seed)
         self.assertNotIn(chain.CONTINUE_TXT, seed)
+        # ... and the spec remembers the place the parent's proxy had it: the tool result it followed
+        pos = spec["prior_hint_positions"]
+        self.assertEqual(len(pos), 1)
+        self.assertFalse(pos[0].get("on_summary"))
+        self.assertEqual(pos[0]["tool_use_id"], self.anchor_tool_use_id())
+        self.assertEqual(spec["hint_anchors"], [{"block": hint_block_text(H1), "tool_use_id": pos[0]["tool_use_id"]}])
         # budget comes from the parent run, not from the copied prefix's timestamps
         self.assertEqual(meta["agent_budget_source"], "parent_budget_since_run_start")
-        # and the round-2 first request, rewritten, carries both hints exactly once in order
+        # the round-2 first request, rewritten, carries both hints exactly once in order
         lines = [json.loads(l) for l in seed.splitlines()]
         body, acts = rewrite(simulate_resume_request(lines, spec["sentinel"]), spec)
         flat = [b.get("text") for m in body["messages"] for b in
@@ -170,6 +181,49 @@ class ChainedBuild(unittest.TestCase):
         self.assertEqual(flat.count(hint_block_text(H2)), 1)
         self.assertLess(flat.index(hint_block_text(H1)), flat.index(hint_block_text(H2)))
         self.assertNotIn(self.fx["spec1"]["sentinel"], json.dumps(body["messages"]))
+        # H1 sits on the message that carried its anchor tool result, where the parent's proxy had injected it
+        idx = next(i for i, m in enumerate(body["messages"])
+                   if any(b.get("tool_use_id") == pos[0]["tool_use_id"] for b in m["content"]
+                          if isinstance(b, dict) and b.get("type") == "tool_result"))
+        self.assertIn(hint_block_text(H1), [b.get("text") for b in body["messages"][idx]["content"]])
+        # the proxy applies this on every request; once in place it adds nothing
+        again = restore_carried_hints(json.loads(json.dumps(body["messages"])), spec, [])
+        self.assertEqual(json.dumps(again), json.dumps(body["messages"]))
+
+    def _step_by_message(self, steps, mid):
+        return next(s for s in steps if s.get("message_id") == mid)
+
+    def test_chained_parity_uses_the_parent_effective_request(self):
+        """The parity reference is what the PARENT sent upstream at this cut, hint included."""
+        ir, steps = self._steps(self.fx["trial"])
+        step = self._step_by_message(steps, "msg_new1")  # first turn the parent produced after its own resume
+        bdir, meta = build(adapter=get_adapter("claude-code"), trial_dir=self.fx["trial"],
+                           atif_step=step["atif_step_id"], out=self.out / "b2p", task_dir=TASK, mode="hint", hint=H2,
+                           persist_hint=True)
+        exp = json.loads((bdir / "bundle.json").read_text())["orig_request_at_k"]
+        self.assertIsNotNone(exp, "the chained bundle has no parent request to compare against")
+        self.assertEqual(exp["method"], "usage")
+        self.assertEqual(exp["n_messages"], len(self._parent_first_request()["messages"]))
+        spec = json.loads((bdir / "proxy_spec.json").read_text())
+        lines = [json.loads(l) for l in (bdir / "session_trunc.jsonl").read_text().splitlines()]
+        body, acts = rewrite(simulate_resume_request(lines, spec["sentinel"]), spec)
+        rep = compare_parity(body, exp, exp.get("route") or {}, parity_hints(spec))
+        self.assertTrue(rep["ok"], rep["diffs"])
+        self.assertEqual(rep["hint_blocks_removed"], 1)  # only this round's hint; the parent's stays
+        self.assertEqual(len(body["messages"]), len(self._parent_first_request()["messages"]))
+        # the bundle also records the content reference of the same effective context (the proxy gate checks it)
+        self.assertTrue(exp.get("content"))
+
+    def _parent_first_request(self):
+        run = json.loads((self.fx["trial"] / "agent/resume-proxy" / self.fx["meta1"]["run_id"]
+                          / "first_request_rewritten.json").read_text())
+        return run["body"]
+
+    def anchor_tool_use_id(self):
+        """The tool result the parent's own first request injected H1 on."""
+        first = json.loads(Path(self.fx["trial"] / "agent/resume-proxy"
+                                / self.fx["meta1"]["run_id"] / "first_request_rewritten.json").read_text())
+        return chain.first_request_hints(first["body"], [H1])[0]["tool_use_id"]
 
     def test_prior_hint_files_must_match_the_run(self):
         ir, steps = self._steps(self.fx["trial"])
@@ -192,19 +246,6 @@ class ChainedBuild(unittest.TestCase):
         self.assertEqual(len(audit[0]["removed_lines"]), 4)
         self.assertFalse(any(r.get("type") == "attachment" and "environment" in json.dumps(r) for r in stripped))
 
-    def test_compacted_away_hint_is_refused_when_the_run_did_not_persist(self):
-        recs = [{"type": "user", "uuid": "u1", "message": {"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": "toolu_b1", "content": "x"}]}},
-                {"type": "system", "subtype": "compact_boundary", "uuid": "b1",
-                 "compactMetadata": {"preservedMessages": {"uuids": []}}},
-                {"type": "user", "uuid": "s1", "isCompactSummary": True,
-                 "message": {"role": "user", "content": "This session is being continued from a previous conversation"}}]
-        anchors = [{"tool_use_id": "toolu_b1"}]
-        with self.assertRaises(ValueError):
-            chain.materialize_hints(recs, [H1], anchors, len(recs), persistent=False)
-        out, audit, _cut = chain.materialize_hints(recs, [H1], anchors, len(recs), persistent=True)
-        self.assertEqual(audit[0]["where"], "compaction_summary")
-
     def test_same_mode_chain_keeps_the_chain_metadata(self):
         ir, steps = self._steps(self.fx["trial"])
         bdir, meta = build(adapter=get_adapter("claude-code"), trial_dir=self.fx["trial"],
@@ -214,13 +255,15 @@ class ChainedBuild(unittest.TestCase):
         self.assertEqual(spec["prior_hints"], [H1])
         self.assertEqual(spec["required_hint_blocks"], [hint_block_text(H1)])
         self.assertEqual(meta["n_hints"], 1)
-        # the hint is in the seed, so a compaction must re-apply it instead of losing it
+        # the hint is NOT in the seed (CC would drop it on --resume), so it is re-injected at its parent anchor
         seed = [json.loads(l) for l in (bdir / "session_trunc.jsonl").read_text().splitlines()]
+        self.assertNotIn(hint_block_text(H1), json.dumps(seed))
         body, acts = rewrite(simulate_resume_request(seed, spec["sentinel"]), spec)
-        self.assertNotIn("inject_hint", acts)  # same mode never injects, the seed carries it
+        self.assertNotIn("inject_hint", acts)  # same mode has no new hint of its own
         texts = [b.get("text") for m in body["messages"] for b in (m["content"] if isinstance(m["content"], list)
                                                                   else [])]
         self.assertEqual(texts.count(hint_block_text(H1)), 1)
+        self.assertTrue(any(str(a).startswith("prior_hint_on_tool_result@") for a in acts))
 
     def test_base_snapshot_must_match_the_run(self):
         import hashlib
@@ -314,3 +357,85 @@ class MultiHintPersistence(unittest.TestCase):
             # required_hint_blocks cannot be satisfied: H1 was neither seeded nor reinjected
             from agent_snapshot_resume.proxy.resume_proxy import check_chained_history
             check_chained_history({"messages": msgs}, self.spec())
+
+
+def make_compacted_after_hint_run(tmp: Path) -> dict:
+    """A round-1 run that compacted AFTER its proxy injected the hint, then kept working.
+
+    This is the regime a chained cut meets when the parent's cut is already post-compaction: the hint's anchor
+    tool result is gone from the model context and the parent's proxy re-injected the hint on the summary, so the
+    chained run must put it there too.
+    """
+    fx = make_fake_resumed_run(tmp)
+    recs = list(fx["records"])
+    kept = recs[-2]["uuid"]  # the parent's last assistant step survives into the preserved segment
+    boundary = {"type": "system", "subtype": "compact_boundary", "uuid": _uid(),
+                "timestamp": "2026-01-01T00:06:00.000Z",
+                "compactMetadata": {"trigger": "auto", "preTokens": 140000,
+                                    "preservedMessages": {"uuids": [kept]}}}
+    summary = _rec("user", "This session is being continued from a previous conversation that ran out of context",
+                   parent=boundary["uuid"], isCompactSummary=True, isVisibleInTranscriptOnly=True)
+    a4 = _rec("assistant", [{"type": "thinking", "thinking": "after compaction"},
+                            {"type": "tool_use", "id": "toolu_new4", "name": "Bash", "input": {"command": "wc -l"}}],
+              parent=summary["uuid"], mid="msg_new4", usage=_usage(4))
+    r4 = _rec("user", [{"type": "tool_result", "tool_use_id": "toolu_new4", "content": "3"}], parent=a4["uuid"])
+    recs += [boundary, summary, a4, r4]
+    fx["session"].write_text("\n".join(json.dumps(r) for r in recs) + "\n")
+    fx["records"] = recs
+    return fx
+
+
+class CompactedChainedBuild(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.out = Path(self.tmp.name)
+        self.fx = make_compacted_after_hint_run(self.out)
+
+    def _steps(self, trial):
+        adapter = get_adapter("claude-code")
+        ir = adapter.load_trace(trial, agent_timeout_s=600.0, task="sum-task", reward=0.0)
+        return ir, [s for s in ir["steps"] if s["source"] == "agent"]
+
+    def test_hint_is_reinjected_on_the_summary_at_a_post_compaction_cut(self):
+        ir, steps = self._steps(self.fx["trial"])
+        step = next(s for s in steps if s.get("message_id") == "msg_new4")
+        bdir, meta = build(adapter=get_adapter("claude-code"), trial_dir=self.fx["trial"],
+                           atif_step=step["atif_step_id"], out=self.out / "b2c", task_dir=TASK, mode="hint",
+                           hint=H2, persist_hint=True)
+        spec = json.loads((bdir / "proxy_spec.json").read_text())
+        pos = spec["prior_hint_positions"]
+        self.assertEqual(len(pos), 1)
+        self.assertTrue(pos[0]["on_summary"])
+        self.assertNotIn("hint_anchors", spec)  # a summary carries no tool result
+        seed = (bdir / "session_trunc.jsonl").read_text()
+        self.assertNotIn(hint_block_text(H1), seed)
+        self.assertNotIn(chain.CONTINUE_TXT, seed)
+        body, acts = rewrite(simulate_resume_request([json.loads(l) for l in seed.splitlines()],
+                                                     spec["sentinel"]), spec)
+        msgs = body["messages"]
+        c = next(i for i, m in enumerate(msgs) if m["role"] == "user" and
+                 "This session is being continued" in json.dumps(m["content"]))
+        # the request at this cut ends on the summary, so both hints ride it: H1 where the parent had it, H2 after
+        self.assertIn(hint_block_text(H1), [b.get("text") for b in msgs[c]["content"]])
+        last = [b.get("text") for b in msgs[-1]["content"] if isinstance(b, dict)]
+        self.assertEqual(last, [msgs[-1]["content"][0]["text"], hint_block_text(H1), hint_block_text(H2)])
+        self.assertEqual(c, len(msgs) - 1)
+        self.assertTrue(any(str(a).startswith("prior_hint_on_summary@") for a in acts))
+        # every later request (no sentinel turn any more) keeps both hints, once each, in chain order
+        body2, acts2 = rewrite(json.loads(json.dumps(body)), spec)
+        flat = [b.get("text") for m in body2["messages"] for b in (m["content"] if isinstance(m["content"], list)
+                                                                  else [])]
+        self.assertEqual(flat.count(hint_block_text(H1)), 1)
+        self.assertEqual(flat.count(hint_block_text(H2)), 1)
+        self.assertLess(flat.index(hint_block_text(H1)), flat.index(hint_block_text(H2)))
+
+    def test_a_lost_anchor_and_no_summary_fails_closed(self):
+        spec = {"mode": "hint", "sentinel": "ZZZ_s", "hint": H2, "prior_hints": [H1],
+                "prior_hint_positions": [{"hint": H1, "block": hint_block_text(H1), "tool_use_id": "toolu_gone"}],
+                "required_hint_blocks": [hint_block_text(H1), hint_block_text(H2)]}
+        msgs = [{"role": "user", "content": [{"type": "text", "text": "start"}]},
+                {"role": "user", "content": [{"type": "text", "text": "ZZZ_s"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "No response requested."}]}]
+        with self.assertRaises(ValueError):
+            rewrite({"messages": msgs}, spec)

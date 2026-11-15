@@ -35,7 +35,7 @@ replaces it. Logs: <log_dir>/<run_id>/requests.jsonl, first_request_{raw,rewritt
 
     python resume_proxy.py --port 4031 --spec-dir /opt/asr-proxy/resume/specs --log-dir /logs/agent/resume-proxy
 """
-import argparse, asyncio, copy, hashlib, json, os, re, time
+import argparse, asyncio, collections, copy, hashlib, json, os, re, time
 
 import aiohttp
 from aiohttp import web
@@ -159,6 +159,65 @@ def reinject_after_compaction(body, spec, acts):
     new[c] = dict(msgs[c], content=bl)
     acts.append(f"reinject_hint_after_compaction@{c}" + (f":{len(added)}" if len(added) > 1 else ""))
     return dict(body, messages=new)
+
+
+def restore_carried_hints(msgs, spec, acts):
+    """Re-inject the hints the previous run carried, at the place its own proxy had them.
+
+    A resumed run has no copy of these hints in its session (``--resume`` drops every form a seed could take), so
+    its proxy re-applied them to every request: on the message carrying the anchor tool result while the sentinel
+    region was live, and on the compaction summary once CC compacted (``persist_hint``). This mirrors that, which
+    is what makes the chained run's first request match the parent run's effective request at the cut.
+    """
+    entries = spec.get("prior_hint_positions") or []
+    if not entries:
+        return msgs
+    new = list(msgs)
+    c = find_compact_summary(new)
+    present = "".join(_text_of(b) for m in new for b in _blocks(m))
+    for i, e in enumerate(entries):
+        hint = e.get("hint") or (spec.get("prior_hints") or [])[i]
+        want = e.get("block") or hint_block_text(hint)
+        if any(_text_of(b) == want for m in new for b in _blocks(m)):
+            acts.append(f"prior_hint_present@{i}")
+            continue
+        if hint in present:
+            # The summary quotes it verbatim: the parent's proxy skipped the block for the same reason.
+            acts.append(f"prior_hint_quoted@{i}")
+            continue
+        blk = {"type": "text", "text": want}
+        if c is not None:
+            m, mi = new[c], c
+        elif e.get("tool_use_id"):
+            mi = next((j for j, m in enumerate(new)
+                       if any(b.get("type") == "tool_result" and b.get("tool_use_id") == e["tool_use_id"]
+                              for b in _blocks(m))), None)
+            if mi is None:
+                raise ValueError(f"carried hint {i} rode tool result {e['tool_use_id']} and this request carries "
+                                 "neither that message nor a compaction summary; refusing to guess its place")
+            m = new[mi]
+        else:
+            raise ValueError(f"carried hint {i} has neither a tool result anchor nor a compaction summary to go on")
+        bl = [dict(b) for b in _blocks(m)]
+        if bl and isinstance(bl[-1], dict) and "cache_control" in bl[-1]:
+            # Exactly what reinject_after_compaction does for the hint it puts on a summary: the block right after
+            # the target's last one is the new tail of that message, so the breakpoint moves onto the hint.
+            blk["cache_control"] = bl[-1].pop("cache_control")
+            acts.append("prior_hint_cache_breakpoint")
+        new[mi] = dict(m, content=bl + [blk])
+        acts.append(f"prior_hint_on_{'summary' if c is not None else 'tool_result'}@{mi}")
+    return new
+
+
+def parity_hints(spec):
+    """Hints the parity reference does not carry.
+
+    The reference is the previous run's own request at the cut; it already held the chain's earlier hints (its proxy
+    injected them), so only this run's new hint has to be removed before comparing bytes and message counts.
+    """
+    if spec.get("prior_hints"):
+        return [spec["hint"]] if spec.get("mode") == "hint" and spec.get("hint") else []
+    return spec_hints(spec)
 
 
 # ------------------------------------------------------------------ request parity (see agent_snapshot_resume.parity)
@@ -395,7 +454,7 @@ def system_digest(texts):
     return hashlib.sha256(json.dumps(list(texts), ensure_ascii=False).encode()).hexdigest()
 
 
-def check_content(body, ref, hints):
+def check_content(body, ref, hints, notes=None):
     """Model-visible content of a rewritten request vs the reference built from the session prefix
     (agent_snapshot_resume.parity.content_reference). Returns a list of problems (empty = ok).
 
@@ -432,6 +491,9 @@ def check_content(body, ref, hints):
     want = ref.get("message_block_sha256")
     if want is not None:
         hint_blocks = {hint_block_text(h) for h in hints or []}
+        # isMeta records are optional (a request may omit them) but never duplicated: consume one reference entry per
+        # matching block so a second copy is reported instead of silently skipped.
+        meta_blocks = collections.Counter(ref.get("meta_block_sha256") or [])
         j, extras, rendered = 0, 0, []
         for blk, _ in blocks_from_request(body.get("messages") or []):
             if j < len(want) and block_digest(blk) == want[j]:
@@ -445,6 +507,10 @@ def check_content(body, ref, hints):
                 continue
             if blk[1] == "text" and blk[2] in hint_blocks:
                 continue
+            digest = block_digest(blk)
+            if blk[1] == "text" and meta_blocks.get(digest):
+                meta_blocks[digest] -= 1
+                continue  # an isMeta record the agent sends verbatim (e.g. the "no visible output" nudge)
             if blk[0] == "system" or (blk[0] == "user" and blk[1] == "text"
                                       and blk[2].lstrip().startswith(ATTACHMENT_TEXT_PREFIXES)):
                 extras += 1
@@ -453,7 +519,15 @@ def check_content(body, ref, hints):
             problems.append(f"unexplained {blk[0]} {blk[1]} block before reference block {j}")
             break
         if j < len(want):
-            problems.append(f"reference block {j} of {len(want)} missing or different")
+            kinds = (ref.get("block_kinds") or [])[j:]
+            if kinds and all(k[0] == "assistant" and k[1] == "thinking" for k in kinds):
+                # A cut can fall inside an assistant message: the thinking block was persisted, the tool_use the cut
+                # resumes at came after it, and no request of either run carried the fragment on its own. Anything
+                # else missing is a real difference.
+                if notes is not None:
+                    notes.append(f"tail_thinking_blocks_not_sent:{len(kinds)}")
+            else:
+                problems.append(f"reference block {j} of {len(want)} missing or different")
         if extras > int(ref.get("n_attachments", 0)):
             problems.append(f"{extras} rendered-attachment blocks for {ref.get('n_attachments', 0)} attachments")
         # Every line of rendered attachment text must be explained by the attachments persisted at the same context
@@ -519,8 +593,15 @@ def rewrite(body, spec):
         if spec.get('require_sentinel'):
             raise ValueError('Required resume sentinel missing; refusing unverified continuation')
         acts.append("sentinel_not_found")
-        if spec.get("persist_hint") and spec_hints(spec):
-            body = reinject_after_compaction(body, spec, acts)
+        s_ = find_compact_summary(msgs)
+        if s_ is not None and (spec.get("prior_hint_positions") or (spec.get("persist_hint") and spec_hints(spec))):
+            # The sentinel turn is gone (compacted away): the hints the run carries ride the summary, exactly as the
+            # previous run's proxy reinjected them there. A request with neither a sentinel nor a summary is not the
+            # main chain (e.g. a sub-agent's own context): the parent's proxy left those alone, so leave them alone
+            # here too -- injecting a carried hint into a sub-agent would put it somewhere the parent never had it.
+            body = dict(body, messages=restore_carried_hints(body.get("messages") or [], spec, acts))
+            if spec.get("persist_hint") and spec_hints(spec):
+                body = reinject_after_compaction(body, spec, acts)
         return body, acts
     dropped = []
     # extra (non-sentinel) blocks CC attached to the sentinel turn at resume time
@@ -543,6 +624,9 @@ def rewrite(body, spec):
         acts.append(f"drop_post_sentinel_msgs:{e - s - 1}")
     new = msgs[:lo] + msgs[e:]
     acts.append(f"drop_sentinel_user@{s}")
+    # Hints the previous run carried: their session copy does not survive --resume, so they are re-injected at the
+    # place the parent's own proxy had them (the anchor tool result, or the summary when a compaction happened).
+    new = restore_carried_hints(new, spec, acts)
     # Claude Code puts a prompt-cache breakpoint on the last block of the last message. At resume time that is a
     # dropped resume-time block (2.1.280: the post-sentinel environment/date note; 2.1.207: the sentinel turn), so
     # carry it to the last block of the new last message, as the original run's request at step k had it.
@@ -675,9 +759,11 @@ async def handle(request):
                     # bytes as logged by the original route, model/max_tokens/thinking/tool and message counts,
                     # and the model-visible content (system prompt, tools, every message block of the prefix).
                     exp = spec["first_request_parity"]
-                    rep = compare_parity(nd, exp, exp.get("route") or {}, spec_hints(spec))
+                    rep = compare_parity(nd, exp, exp.get("route") or {}, parity_hints(spec))
                     if exp.get("content"):
-                        rep["content_problems"] = check_content(nd, exp["content"], spec_hints(spec))
+                        notes: list[str] = []
+                        rep["content_problems"] = check_content(nd, exp["content"], spec_hints(spec), notes)
+                        rep["notes"] = notes
                         rep["ok"] = rep["ok"] and not rep["content_problems"]
                     # provenance for --freeze-first-request: which exact request and route this report judged
                     rep.update(request_sha256=request_digest(nd), route=exp.get("route") or {},

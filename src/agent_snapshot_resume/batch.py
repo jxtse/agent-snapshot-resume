@@ -188,6 +188,10 @@ class Batch:
             fj = json.loads(fork.read_text())
             lines = [f["session_line"] for f in fj.get("forks") or [] if f.get("session_line")]
             fork_line = max(lines) if lines else None
+        # A chained cut resumes an environment restored from a mid-run snapshot of the parent's OWN session, so it
+        # must start after that snapshot's line: the replayed tail is the part the image does not have yet.
+        base_line = ((json.loads((ud / "chain.json").read_text()).get("base_snapshot") or {}).get("session_line")
+                     if (ud / "chain.json").is_file() else None)
         # a cut must start an agent step: snap the manifest cut to the nearest one, then take the neighbourhood
         ir = self.adapter.load_trace(trial_dir, agent_timeout_s=resolve_agent_timeout(trial_dir, None,
                                                                                      self.task_dir(row)),
@@ -198,9 +202,14 @@ class Batch:
         if not starts:
             raise RuntimeError("no agent steps in the session")
         near = min(starts, key=lambda s: (abs(s - row["cut_line"]), -s))
-        pool = [s for s in starts if abs(s - near) <= self.cut_window and (fork_line is None or s < fork_line)]
+        pool = [s for s in starts if abs(s - near) <= self.cut_window and (fork_line is None or s < fork_line)
+                and (base_line is None or s > int(base_line))]
         # nearest first, then earlier before later (a cut moved forward risks crossing the wrong decision)
-        cands = [near] + sorted((s for s in pool if s != near), key=lambda s: (abs(s - near), s))
+        cands = [c for c in [near] + sorted((s for s in pool if s != near), key=lambda s: (abs(s - near), s))
+                 if base_line is None or c > int(base_line)]
+        if not cands:
+            raise RuntimeError(f"no agent step before the fork window starts after the base snapshot's session "
+                               f"line {base_line}: no cut can replay the tail from that image")
         by_cut: dict[int, dict[str, Any]] = {}
         skipped: list[dict[str, Any]] = []
         for c in cands[:self.max_cut_candidates]:

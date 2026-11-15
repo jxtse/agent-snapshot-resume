@@ -13,8 +13,10 @@ be retained (`--retain-on-gate-failure`) and finished later with `finish_prepare
 """
 from __future__ import annotations
 
+import glob
 import hashlib
 import json
+import os
 import shlex
 import time
 import tomllib
@@ -56,6 +58,57 @@ def probe_post_cut(sbx, run, plan: dict, state_dir: Path, tag: str) -> dict:
     missing = sorted(p for p, ok in raw.items() if not ok)
     (state_dir / f"{tag}-post_cut_paths.json").write_text(json.dumps({"present": raw}, indent=1) + "\n")
     return {"n": len(raw), "present": len(raw) - len(missing), "missing": missing}
+
+
+def transcript_prefix(meta: dict[str, Any], bundle: Path) -> bytes:
+    """The transcript the previous run really had at this cut (its own session file, resume scaffolding included).
+
+    The normalized seed (session_trunc.jsonl) is what Claude Code rebuilds its context from; the parent's file also
+    carried its resume scaffolding, and agents do read their own transcript back. Seeding the parent's prefix keeps
+    those commands byte-identical at the cut. Falls back to the seed when the parent session is not available.
+    """
+    seed = (bundle / "session_trunc.jsonl").read_bytes()
+    chain_meta = meta.get("chain") or {}
+    parent = chain_meta.get("parent_trial_dir")
+    if not parent or not meta.get("cut_line"):
+        return seed
+    removed = [i for a in (chain_meta.get("stripped") or []) for i in a.get("removed_lines") or []]
+    cut = int(meta["cut_line"])
+    # cut_stripped = cut_orig - #{removed lines < cut_orig}: start from the largest possible answer (all scaffolding
+    # before the cut) and descend to the fixed point, so a cut right next to a removed range still maps correctly.
+    cut_orig = cut + len(removed)
+    while True:
+        nxt = cut + sum(1 for i in removed if i < cut_orig)
+        if nxt == cut_orig:
+            break
+        if nxt > cut_orig:  # not a fixed point: never happens for scaffolding before the cut
+            raise RuntimeError(f"cannot map the seed cut {cut} back to the parent session")
+        cut_orig = nxt
+    paths = sorted(glob.glob(os.path.join(parent, "agent", "sessions", "projects", "*", "*.jsonl")))
+    if not paths:
+        return seed
+    with open(paths[0], encoding="utf-8") as f:
+        lines = [l for l in f.read().split("\n") if l.strip()]
+    if cut_orig > len(lines):
+        return seed
+    return ("\n".join(lines[:cut_orig]) + "\n").encode()
+
+
+def _write_in_parts(sbx, remote: str, data: bytes, part: int = 8 * 1024 * 1024) -> None:
+    """Write a file into the guest in parts: one API write request cannot carry a 40 MB session seed (it times
+    out, and the run then starts without a session at all)."""
+    if len(data) <= part:
+        sbx.files.write(remote, data)
+        return
+    parts = []
+    for i, lo in enumerate(range(0, len(data), part)):
+        rp = f"{remote}.part{i}"
+        sbx.files.write(rp, data[lo:lo + part])
+        parts.append(rp)
+    sbx.commands.run("cat " + " ".join(parts) + " > " + remote + " && rm -f " + " ".join(parts),
+                     user="root", timeout=180)
+    if not sbx.files.read(remote, format="bytes")[:64]:
+        raise RuntimeError(f"part upload of {remote} produced an empty file")
 
 
 def dispatch_replay(sbx, cwd: str, exec_cap: int) -> int:
@@ -279,17 +332,29 @@ for _ in range(12):
     time.sleep(0.5)
 print(json.dumps({"killed": killed}))
 """
-            r = run(sbx, "echo " + __import__("base64").b64encode(kill.encode()).decode() +
-                    " | base64 -d | python3 -", timeout=180)
-            killed = json.loads((r.stdout or "{}").strip().splitlines()[-1] or "{}").get("killed", [])
+            kill_cmd = "echo " + __import__("base64").b64encode(kill.encode()).decode() + " | base64 -d | python3 -"
+
+            def survivors(tag: str) -> list[str]:
+                ps = run(sbx, "ps -eo pid=,ppid=,args=").stdout.splitlines()
+                return [l for l in ps if any(k in l for k in ("/claude", ".asr-proxy", "asr_proxy_runtime",
+                                                              "resume_proxy", "passthrough_proxy"))
+                        and "/bin/ps" not in l and "ps -eo" not in l]
+
+            killed: list[int] = []
+            left: list[str] = []
+            for attempt in range(3):
+                r = run(sbx, kill_cmd, timeout=180)
+                killed += json.loads((r.stdout or "{}").strip().splitlines()[-1] or "{}").get("killed", [])
+                # A restored clone can show the previous run's processes only after the guest settles, and a proxy
+                # wrapper restarts its child when it dies: stop again instead of failing on the first survivor.
+                run(sbx, "sleep 3; rm -rf /logs/agent /logs/verifier /logs/artifacts /tmp/.asr-resume", timeout=120)
+                left = survivors("cleanup")
+                if not left:
+                    break
             rec["base_snapshot_killed"] = killed
-            run(sbx, "sleep 3; rm -rf /logs/agent /logs/verifier /logs/artifacts /tmp/.asr-resume", timeout=120)
-            left = run(sbx, "ps -eo pid=,args=").stdout.splitlines()
-            left = [l for l in left if any(k in l for k in ("/claude", ".asr-proxy", "asr_proxy_runtime",
-                                                            "resume_proxy", "passthrough_proxy"))
-                    and "/bin/ps" not in l]
             if left:
-                raise RuntimeError("live clone processes survived the base-snapshot cleanup: " + "\n".join(left[-6:]))
+                raise RuntimeError("live clone processes survived the base-snapshot cleanup (3 passes): "
+                                   + "\n".join(left[-6:]))
             step("base_snapshot_cleanup", t, base_snapshot=base_snapshot, killed=len(killed))
         t = time.time()
         run(sbx, (healthcheck + " && " if healthcheck else "") + "chmod 1777 /tmp")
@@ -313,6 +378,14 @@ print(json.dumps({"killed": killed}))
         run(sbx, f"mkdir -p {REPLAY_DIR}")
         sbx.files.write(f"{REPLAY_DIR}/plan.json", (bundle / "plan.json").read_bytes())
         sbx.files.write(f"{REPLAY_DIR}/replay_inside.py", REPLAY_SCRIPT.read_bytes())
+        # The parent run's own transcript was part of its environment: agents do read it back (e.g. to recover a
+        # plan after a compaction). Seed it before the tail replay so those commands see the same prefix they saw,
+        # at the same path the agent will use for the resumed session.
+        slug, sid = meta.get("project_slug"), meta.get("session_id")
+        if slug and sid:
+            sess_path = f"/logs/agent/sessions/projects/{slug}/{sid}.jsonl"
+            run(sbx, f"mkdir -p /logs/agent/sessions/projects/{slug}")
+            _write_in_parts(sbx, sess_path, transcript_prefix(meta, bundle))
         cwd = meta.get("cwd") or "/app"
         rec["replay_pid"] = dispatch_replay(sbx, cwd, exec_cap)
         step("replay_dispatched_once", t, pid=rec["replay_pid"])

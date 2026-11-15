@@ -100,7 +100,8 @@ class PersistHint(unittest.TestCase):
         body = {"messages": [{"role": "user", "content": [{"type": "text", "text": "explore the data dir"}]}]}
         out, acts = proxy.rewrite(copy.deepcopy(body), spec())
         self.assertEqual(out, body)
-        self.assertIn("no_anchor", acts)
+        # neither sentinel nor summary: a sub-agent's own context, left exactly as the parent's proxy left it
+        self.assertEqual([a for a in acts if "hint" in a or "anchor" in a], [])
 
     def test_off_without_persist_or_in_same_mode(self):
         for sp in (spec(persist=False), spec(mode="same")):
