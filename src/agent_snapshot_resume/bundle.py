@@ -183,12 +183,30 @@ _POST_CUT_SKIP = ("/tmp/", "/dev/", "/proc/", "/sys/", "/logs/agent", "/var/log/
                   "CLAUDE_CONFIG_DIR")
 
 
+_ABS_TOKEN = re.compile(r"[\"']?(/[^\s\"'<>|;&(),]+)[\"']?")
+
+
+def absolute_paths_before(ir: dict[str, Any], k: int) -> set[str]:
+    """Absolute paths named by the session before the cut (the files pre-cut work produced or touched)."""
+    out: set[str] = set()
+    for step in ir["steps"][:k]:
+        for e in step["events"]:
+            if e.get("type") != "tool_call":
+                continue
+            text = json.dumps(e.get("args") or {}, ensure_ascii=False)
+            for m in _ABS_TOKEN.finditer(text):
+                out.add(m.group(1).rstrip("."))
+    return out
+
+
 def post_cut_referenced_files(ir: dict[str, Any], k: int, max_paths: int = 120) -> list[dict[str, Any]]:
-    """Absolute files the agent reads after step k, from the original session's post-cut tool calls.
+    """Absolute files the agent reads after step k that pre-cut work had already produced.
 
     The lenient replay gate requires these to exist in the replayed environment: the resumed agent's history is
     restored verbatim, so a file it already "remembers" reading must still be there when it reads it again or builds
-    on it."""
+    on it. A path that is only named *after* the cut is the agent's own future output (it does not exist yet by
+    design), so it is not required."""
+    pre = absolute_paths_before(ir, k)
     seen: dict[str, dict[str, Any]] = {}
     for step in ir["steps"][k:]:
         for e in step["events"]:
@@ -209,6 +227,8 @@ def post_cut_referenced_files(ir: dict[str, Any], k: int, max_paths: int = 120) 
                 if any(ch in path for ch in _POST_CUT_UNPROBEABLE):
                     continue
                 path = path.rstrip(",;:)]")  # trailing punctuation from a shell one-liner
+                if path not in pre and path.rstrip(".") not in pre:
+                    continue  # produced after the cut: reading it before it exists is expected
                 seen.setdefault(path, {"path": path, "how": how, "atif_step_id": step.get("atif_step_id")})
                 if len(seen) >= max_paths:
                     return list(seen.values())
@@ -232,7 +252,8 @@ def build(*, adapter, trial_dir: Path, atif_step: int | None, out: Path, mode: s
           agent_timeout: float | None = None, task_dir: Path | None = None, run_id: str | None = None,
           model: str | None = None, pin_date: bool = True, fingerprint_roots: list[str] | None = None,
           force: bool = False, persist_hint: bool = False, cut_line: int | None = None,
-          prior_hints: list[str] | None = None, base_snapshot: dict[str, Any] | None = None) -> tuple[Path, dict]:
+          prior_hints: list[str] | None = None, base_snapshot: dict[str, Any] | None = None,
+          seed_carried: bool = True) -> tuple[Path, dict]:
     if mode not in ("same", "hint"):
         raise SystemExit("--mode must be same or hint")
     if mode == "hint" and not hint:
@@ -279,6 +300,10 @@ def build(*, adapter, trial_dir: Path, atif_step: int | None, out: Path, mode: s
         if prior_hints is not None and [h.strip() for h in prior_hints] != carried:
             raise SystemExit("--prior-hint-file does not match the hints this run carried "
                              f"({len(carried)} hint(s) recorded in its proxy spec)")
+        if not seed_carried:
+            # The round-N hint restates the earlier decisions and the proxy injects it at the cut as one message, so
+            # the carried hints are not placed in the history (only their resume scaffolding is removed).
+            carried = []
         wanted = carried + ([hint] if mode == "hint" and hint else [])
         if not evidence.get("first_request"):
             raise SystemExit(f"{trial}: no agent/resume-proxy/*/first_request_rewritten.json; cannot place the "
@@ -295,10 +320,12 @@ def build(*, adapter, trial_dir: Path, atif_step: int | None, out: Path, mode: s
             # Only the hints this run already carried are in its session; the new hint is injected by the proxy at
             # the cut, exactly like a first-round hint bundle, so it must NOT be seeded into the history.
             anchors = chain.first_request_hints(evidence["first_request"]["body"], carried)
-            seeded, hint_audit = chain.materialize_hints(stripped, carried, anchors, cut,
-                                                        persistent=bool(evidence["spec"].get("persist_hint")))
+            seeded, hint_audit, cut = chain.materialize_hints(stripped, carried, anchors, cut,
+                                                             persistent=bool(evidence["spec"].get("persist_hint")))
         except ValueError as exc:  # every chained-build refusal is a user-facing error, never a traceback
             raise SystemExit(f"{trial}: cannot seed a chained resume: {exc}") from exc
+        # anchors only exist when the hint sits inside the tool-result message; a hint that needed a record of its
+        # own has none (the chain gate then requires only the ordered single occurrence)
         hint_anchors = chain.anchors_for(seeded, carried, cut)
         seed_lines = [json.dumps(r, ensure_ascii=False, separators=(",", ":")) for r in seeded]
         chain_audit = {"parent_run_id": (evidence.get("parent_bundle") or {}).get("run_id"),

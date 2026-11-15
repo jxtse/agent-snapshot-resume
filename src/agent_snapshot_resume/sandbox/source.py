@@ -229,37 +229,65 @@ def prepare_source(*, adapter, task_dir: Path, bundle: Path, template: str, tag:
             # runs it (its own command line contains the pattern) and could abort the cleanup half way.
             t = time.time()
             kill = """
-import json, os, subprocess
+import json, os, subprocess, time
 me = os.getpid()
-out = subprocess.run(["ps", "-eo", "pid=,ppid=,args="], capture_output=True, text=True).stdout
-targets = []
-for line in out.splitlines():
-    parts = line.strip().split(None, 2)
-    if len(parts) < 3:
+killed = []
+# The proxy runtime is started by wrapper scripts (/root/.asr-proxy/run-4013.sh, run-resume.sh) that respawn their
+# child when it dies, so the wrappers must be matched too: the leading dot covers both /root/.asr-proxy and
+# /opt/asr-proxy without matching this script's own command line.
+MARKS = ("/claude", "claude-code", "claude --", ".asr-proxy", "asr_proxy_runtime", "resume_proxy",
+         "passthrough_proxy")
+
+
+def targets():
+    out = subprocess.run(["ps", "-eo", "pid=,ppid=,args="], capture_output=True, text=True).stdout
+    hits = []
+    for line in out.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) < 3:
+            continue
+        pid, ppid, args = parts
+        if int(pid) in (me, os.getppid()) or "/bin/ps" in args or "ps -eo" in args:
+            continue
+        if "pkill" in args or "asr-base-cleanup" in args:
+            continue
+        if any(k in args for k in MARKS):
+            hits.append(int(pid))
+    return hits
+
+
+# A restored clone carries the previous run's agent and its proxy runtime. The proxy runtime respawns its children
+# when they die, so one pass can leave a fresh proxy behind (and it holds the proxy ports the replay needs). The
+# restored VM also needs a moment before those processes are visible at all, so scan-kill-scan and only stop after
+# two consecutive empty scans.
+quiet = 0
+for _ in range(12):
+    hits = targets()
+    if not hits:
+        quiet += 1
+        if quiet >= 2:
+            break
+        time.sleep(1.0)
         continue
-    pid, ppid, args = parts
-    if int(pid) in (me, os.getppid()) or "/bin/ps" in args or "ps -eo" in args:
-        continue
-    if "pkill" in args or "asr-base-cleanup" in args:
-        continue
-    if any(k in args for k in ("/claude", "claude-code", "claude --", "asr_proxy_runtime", "resume_proxy",
-                               "passthrough_proxy")):
-        targets.append(int(pid))
-for pid in targets:
-    try:
-        os.kill(pid, 9)
-    except OSError:
-        pass
-print(json.dumps({"killed": targets}))
+    quiet = 0
+    for pid in hits:
+        try:
+            os.kill(pid, 9)
+            killed.append(pid)
+        except OSError:
+            pass
+    time.sleep(0.5)
+print(json.dumps({"killed": killed}))
 """
             r = run(sbx, "echo " + __import__("base64").b64encode(kill.encode()).decode() +
-                    " | base64 -d | python3 -", timeout=120)
+                    " | base64 -d | python3 -", timeout=180)
             killed = json.loads((r.stdout or "{}").strip().splitlines()[-1] or "{}").get("killed", [])
             rec["base_snapshot_killed"] = killed
-            run(sbx, "sleep 2; rm -rf /logs/agent /logs/verifier /logs/artifacts /tmp/.asr-resume", timeout=120)
+            run(sbx, "sleep 3; rm -rf /logs/agent /logs/verifier /logs/artifacts /tmp/.asr-resume", timeout=120)
             left = run(sbx, "ps -eo pid=,args=").stdout.splitlines()
-            left = [l for l in left if any(k in l for k in ("/claude", "asr_proxy_runtime", "resume_proxy",
-                                                            "passthrough_proxy")) and "/bin/ps" not in l]
+            left = [l for l in left if any(k in l for k in ("/claude", ".asr-proxy", "asr_proxy_runtime",
+                                                            "resume_proxy", "passthrough_proxy"))
+                    and "/bin/ps" not in l]
             if left:
                 raise RuntimeError("live clone processes survived the base-snapshot cleanup: " + "\n".join(left[-6:]))
             step("base_snapshot_cleanup", t, base_snapshot=base_snapshot, killed=len(killed))

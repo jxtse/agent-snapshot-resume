@@ -134,7 +134,7 @@ class ChainedBuild(unittest.TestCase):
                                     "input": {"command": "ls"}}], parent=summary["uuid"], message_id="m_x")
         recs.append(after)
         anchors = [{"tool_use_id": "toolu_b1"}]  # injected on the pre-compaction prefix
-        out, audit = chain.materialize_hints(recs, [H1], anchors, len(recs))
+        out, audit, _cut = chain.materialize_hints(recs, [H1], anchors, len(recs))
         self.assertEqual(audit[0]["where"], "compaction_summary")
         self.assertIn(hint_block_text(H1), [b["text"] for b in out[-2]["message"]["content"]])
         self.assertEqual(len(chain.anchors_for(out, [H1], len(out))), 0)  # a summary has no tool result
@@ -202,7 +202,7 @@ class ChainedBuild(unittest.TestCase):
         anchors = [{"tool_use_id": "toolu_b1"}]
         with self.assertRaises(ValueError):
             chain.materialize_hints(recs, [H1], anchors, len(recs), persistent=False)
-        out, audit = chain.materialize_hints(recs, [H1], anchors, len(recs), persistent=True)
+        out, audit, _cut = chain.materialize_hints(recs, [H1], anchors, len(recs), persistent=True)
         self.assertEqual(audit[0]["where"], "compaction_summary")
 
     def test_same_mode_chain_keeps_the_chain_metadata(self):
