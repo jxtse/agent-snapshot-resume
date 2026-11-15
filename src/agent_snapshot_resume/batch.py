@@ -252,8 +252,17 @@ class Batch:
             if not (chain_spec.get("trial_dir") and chain_spec.get("base_snapshot")):
                 raise RuntimeError(f"{ud}/chain.json needs trial_dir and base_snapshot")
         trial_dir = Path(chain_spec["trial_dir"]) if chain_spec else Path(src["trial_dir"])
-        specs = {"hinted": {"mode": "hint", "hint": hint, "run_id": f"{task}-s{cut}-hint"},
-                 "control": {"mode": "same", "hint": None, "run_id": f"{task}-s{cut}-control"}}
+        # A chained unit whose earlier hints cannot be seeded into the history restates them in the new hint message
+        # ("combine_hints"): the resumed model still sees the round-1 decision, in the same single injection.
+        combine = bool((chain_spec or {}).get("combine_hints"))
+        if combine and chain_spec.get("prior_hints"):
+            hint = "\n\n".join([h.strip() for h in chain_spec["prior_hints"]] + [hint.strip()])
+        control = {"mode": "same", "hint": None, "run_id": f"{task}-s{cut}-control"}
+        if combine and chain_spec.get("prior_hints"):
+            # the same cut with only the round-1 decision, i.e. the round-2 hinted run minus its new decision
+            control = {"mode": "hint", "hint": "\n\n".join(h.strip() for h in chain_spec["prior_hints"]),
+                       "run_id": f"{task}-s{cut}-control"}
+        specs = {"hinted": {"mode": "hint", "hint": hint, "run_id": f"{task}-s{cut}-hint"}, "control": control}
         # A cached bundle is only reusable if it was built from the same inputs; a changed hint file, cut or source
         # session must rebuild it, and a downstream fake/parity proof must never legitimise the stale one.
         inputs = {"cut_line": cut, "source_trial_dir": str(trial_dir.resolve()),
@@ -284,7 +293,8 @@ class Batch:
                                              # only the hinted bundle names the carried hints explicitly; the
                                              # control bundle inherits them from the resumed session's own proxy spec
                                              prior_hints=(chain_spec.get("prior_hints") or None)
-                                             if (chain_spec and spec["mode"] == "hint") else None,
+                                             if (chain_spec and spec["mode"] == "hint" and not combine) else None,
+                                             seed_carried=not (chain_spec and combine),
                                              base_snapshot=(chain_spec.get("base_snapshot") or None)
                                              if chain_spec else None)
             # Reviewed replay exceptions are an *input* to the bundle, not something to be produced by hand after

@@ -173,7 +173,8 @@ def ir_with(steps):
 
 def test_post_cut_paths_from_reads_and_shell_reads():
     ir = ir_with([
-        [{"type": "tool_call", "tool": "Bash", "args": {"command": "python3 train.py"}}],          # before the cut
+        [{"type": "tool_call", "tool": "Bash", "args": {
+            "command": "python3 train.py --out /root/outputs/metrics.json --summary /app/results/summary.csv"}}],
         [{"type": "tool_call", "tool": "Read", "args": {"file_path": "/root/outputs/metrics.json"}},
          {"type": "tool_call", "tool": "Bash", "args": {"command": "cat /app/results/summary.csv | head -3"}},
          {"type": "tool_call", "tool": "Bash", "args": {"command": "cat /tmp/scratch/log.txt"}},
@@ -182,6 +183,15 @@ def test_post_cut_paths_from_reads_and_shell_reads():
     ])
     got = {p["path"]: p["how"] for p in post_cut_referenced_files(ir, 1)}
     assert got == {"/root/outputs/metrics.json": "Read", "/app/results/summary.csv": "Bash"}
+
+
+def test_post_cut_paths_skip_files_the_agent_only_creates_after_the_cut():
+    ir = ir_with([
+        [{"type": "tool_call", "tool": "Bash", "args": {"command": "python3 train.py"}}],
+        [{"type": "tool_call", "tool": "Read", "args": {"file_path": "/root/outputs/dem.tif"}},
+         {"type": "tool_call", "tool": "Bash", "args": {"command": "cat /root/outputs/mass_balance.json"}}],
+    ])
+    assert post_cut_referenced_files(ir, 1) == []  # its own future outputs: absent by design
     assert post_cut_referenced_files(ir, 0) == [] or all("1000" not in str(p) for p in [])  # every step is post-cut at k=1
 
 
@@ -193,9 +203,13 @@ def test_post_cut_paths_ignore_relative_and_agent_state():
 
 def test_post_cut_paths_quoted_flags_globs_and_variables():
     def paths(cmd):
+        # step 0 is before the cut and produced the files; step 1 reads them
         return [p["path"] for p in post_cut_referenced_files(
-            {"steps": [{"atif_step_id": 1, "events": [
-                {"type": "tool_call", "tool": "Bash", "args": {"command": cmd}}]}]}, 0)]
+            {"steps": [{"atif_step_id": 0, "events": [
+                {"type": "tool_call", "tool": "Bash", "args": {"command": "python3 gen.py --in /app/input.json "
+                "--log /root/run.log --csv /app/a.csv --dir /app --out $OUT/metrics.json"}}]},
+                {"atif_step_id": 1, "events": [
+                    {"type": "tool_call", "tool": "Bash", "args": {"command": cmd}}]}]}, 1)]
 
     assert paths('cat "/app/input.json"') == ["/app/input.json"]
     assert paths("head -n 5 /app/input.json") == ["/app/input.json"]

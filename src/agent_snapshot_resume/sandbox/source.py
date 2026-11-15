@@ -232,12 +232,16 @@ def prepare_source(*, adapter, task_dir: Path, bundle: Path, template: str, tag:
 import json, os, subprocess, time
 me = os.getpid()
 killed = []
-# A live clone carries the previous run's agent and its proxy runtime. The proxy runtime respawns its children when
-# they die, so a single pass can leave a fresh proxy behind (and it holds the proxy ports the replay needs): repeat
-# until nothing matches, which only terminates once the respawning supervisor itself has been killed.
-for _ in range(6):
+# The proxy runtime is started by wrapper scripts (/root/.asr-proxy/run-4013.sh, run-resume.sh) that respawn their
+# child when it dies, so the wrappers must be matched too: the leading dot covers both /root/.asr-proxy and
+# /opt/asr-proxy without matching this script's own command line.
+MARKS = ("/claude", "claude-code", "claude --", ".asr-proxy", "asr_proxy_runtime", "resume_proxy",
+         "passthrough_proxy")
+
+
+def targets():
     out = subprocess.run(["ps", "-eo", "pid=,ppid=,args="], capture_output=True, text=True).stdout
-    targets = []
+    hits = []
     for line in out.splitlines():
         parts = line.strip().split(None, 2)
         if len(parts) < 3:
@@ -247,12 +251,26 @@ for _ in range(6):
             continue
         if "pkill" in args or "asr-base-cleanup" in args:
             continue
-        if any(k in args for k in ("/claude", "claude-code", "claude --", "/opt/asr-proxy", "asr_proxy_runtime",
-                                   "resume_proxy", "passthrough_proxy")):
-            targets.append(int(pid))
-    if not targets:
-        break
-    for pid in targets:
+        if any(k in args for k in MARKS):
+            hits.append(int(pid))
+    return hits
+
+
+# A restored clone carries the previous run's agent and its proxy runtime. The proxy runtime respawns its children
+# when they die, so one pass can leave a fresh proxy behind (and it holds the proxy ports the replay needs). The
+# restored VM also needs a moment before those processes are visible at all, so scan-kill-scan and only stop after
+# two consecutive empty scans.
+quiet = 0
+for _ in range(12):
+    hits = targets()
+    if not hits:
+        quiet += 1
+        if quiet >= 2:
+            break
+        time.sleep(1.0)
+        continue
+    quiet = 0
+    for pid in hits:
         try:
             os.kill(pid, 9)
             killed.append(pid)
@@ -262,12 +280,12 @@ for _ in range(6):
 print(json.dumps({"killed": killed}))
 """
             r = run(sbx, "echo " + __import__("base64").b64encode(kill.encode()).decode() +
-                    " | base64 -d | python3 -", timeout=120)
+                    " | base64 -d | python3 -", timeout=180)
             killed = json.loads((r.stdout or "{}").strip().splitlines()[-1] or "{}").get("killed", [])
             rec["base_snapshot_killed"] = killed
-            run(sbx, "sleep 2; rm -rf /logs/agent /logs/verifier /logs/artifacts /tmp/.asr-resume", timeout=120)
+            run(sbx, "sleep 3; rm -rf /logs/agent /logs/verifier /logs/artifacts /tmp/.asr-resume", timeout=120)
             left = run(sbx, "ps -eo pid=,args=").stdout.splitlines()
-            left = [l for l in left if any(k in l for k in ("/claude", "/opt/asr-proxy", "asr_proxy_runtime",
+            left = [l for l in left if any(k in l for k in ("/claude", ".asr-proxy", "asr_proxy_runtime",
                                                             "resume_proxy", "passthrough_proxy"))
                     and "/bin/ps" not in l]
             if left:
