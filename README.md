@@ -314,6 +314,33 @@ tool_result id/is_error/content. Anything else in the request is reported as an 
 - the provider/route behind `ASR_UPSTREAM_URL`, which may differ from the original run's;
 - sampling. Continuations differ by design, so "equivalent" applies only to the input context.
 
+## Replay policy (`--replay-policy strict|lenient`)
+
+The gate that decides whether a replay may be snapshotted has two policies (`asr prepare-snapshot`,
+`asr batch run`, `asr screen` and `asr build-template` take the flag):
+
+- **strict** (default, unchanged): every replayed observation must be identical or explained by a command-bound
+  reviewed exception. Anything else fails closed.
+- **lenient**: accepts output divergences — different numbers, package/interpreter versions, listing order, external
+  content, timings — because the resumed agent's conversation history is restored verbatim from the original session,
+  so a differing printed number is invisible to it. What matters is the state it will act on. Lenient blocks only:
+  1. a replayed command that *fails where the original succeeded* (non-zero rc, a timeout, a replayer crash, a
+     kill/OOM, or an edit the original applied that the replay could not apply);
+  2. a file the agent reads *after* the cut that is missing in the replayed environment — the paths come from the
+     original session's post-cut tool calls (`Read`, and `cat`/`head`/`tail`/`wc`/… of an absolute path), stored in
+     `plan.json` as `post_cut_paths` and probed right after the replay;
+  3. a background job still *in flight* at the cut whose output the agent uses later.
+
+  A pace-dependent read of a background job that had already finished before the cut is a warning in lenient mode,
+  not a block (its output body may differ; its exit status is still checked). Every accepted divergence is recorded
+  per task in a divergence report (count of divergent commands, changed numbers, version diffs, missing files) written
+  to `<state-dir>/<tag>-divergence_report.json`, `<bundle>/divergence_report.json` and the batch unit state.
+
+Independent of the policy, the replay itself now runs in a **login shell** (as the original agent's shell did, with
+`/etc/profile.d` sourced after the task healthcheck installs the task environment) and templates are built with the
+task's own `[environment]` cpu/memory and an FC-legal disk bucket, so a replay is not silently given fewer cpus or
+less memory than the trial it reproduces.
+
 ## Known gaps
 
 - **Shell cwd is not restored.** Claude Code restarts its Bash tool in the project root. If the original agent had
@@ -323,8 +350,9 @@ tool_result id/is_error/content. Anything else in the request is reported as an 
   seeds, and caches outside the fingerprinted roots are not restored. Background jobs that finished before *k* are
   re-run in the foreground (their outputs are hash-checked). Jobs still running at *k* are started detached and
   flagged. Prefer a *k* with `bg_inflight == 0` and `subagents_inflight == 0`.
-- **Replay can diverge.** A replayed command that gives different output fails the gate. Nothing is snapshotted
-  until the difference is reviewed.
+- **Replay can diverge.** Under the strict policy a replayed command that gives different output fails the gate;
+  nothing is snapshotted until the difference is reviewed. Under `--replay-policy lenient` the divergence is accepted
+  and recorded, and only the three blocking classes above stop a snapshot.
 - **Redacted sessions.** If a pipeline replaced values with `[REDACTED]` in the session, the prefix is no longer
   byte-faithful (flag `redaction_*`). Do not resume such trials.
 - **Agent version is pinned.** Claude Code 2.1.207 and 2.1.280 (binary sha256 pinned per version; the bundle uses

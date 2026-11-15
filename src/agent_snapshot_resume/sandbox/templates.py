@@ -17,8 +17,10 @@ from typing import Any
 from ..config import owner_tag
 from .fc_env import template_alias
 
-# FC sandbox build options: second-generation micro VM (supports snapshots) and the disk size in MiB.
+# FC sandbox build options: second-generation micro VM (supports snapshots) and the disk size in MiB. FC only
+# accepts these disk sizes; a task asking for more memory/disk must still be built with the largest legal disk.
 FC_BUILD_HEADERS = {"X-E2B-Template-Build-Mode": "micro", "X-E2B-Template-Alpha-Disk-Size": "{disk_mib}"}
+FC_DISK_MIB = (512, 10240, 15360)
 
 
 def task_image(task_dir: Path) -> str:
@@ -29,19 +31,45 @@ def task_image(task_dir: Path) -> str:
     return image
 
 
+def fc_disk_mib(storage_mb: int | None) -> int:
+    """The FC disk size for a task's storage request (smallest legal bucket that covers it, else the largest)."""
+    want = int(storage_mb or FC_DISK_MIB[-1])
+    for bucket in FC_DISK_MIB:
+        if bucket >= want:
+            return bucket
+    return FC_DISK_MIB[-1]
+
+
+def task_resources(task_dir: Path) -> dict[str, int]:
+    """The cpu/memory/disk the task's own `[environment]` asks for (the trial ran with these).
+
+    A replay sandbox built with fewer cpus or less memory does not reproduce the trial: torch scales its thread pool
+    to the visible cpu count (4 -> 2 changes numerics) and a solver that fit in the trial's memory is OOM-killed."""
+    cfg = tomllib.loads((task_dir / "task.toml").read_text())
+    env = cfg.get("environment") or {}
+    return {"cpus": int(env.get("cpus") or 2), "memory_mb": int(env.get("memory_mb") or 4096),
+            "storage_mb": int(env.get("storage_mb") or FC_DISK_MIB[-1]),
+            "disk_mib": fc_disk_mib(env.get("storage_mb"))}
+
+
 def template_name(task: str, now: float | None = None) -> str:
     stamp = time.strftime("%Y%m%dt%H%M%S", time.localtime(now)).lower()
     name = f"{owner_tag()}-{re.sub(r'[^a-z0-9-]', '-', task.lower())}-{stamp}"
     return template_alias(name)
 
 
-def build_template(*, task_dir: Path, state_dir: Path, image: str | None = None, cpu: int = 2,
-                   memory_mb: int = 4096, disk_mib: int = 15360, poll_s: int = 10,
+def build_template(*, task_dir: Path, state_dir: Path, image: str | None = None, cpu: int | None = None,
+                   memory_mb: int | None = None, disk_mib: int | None = None, poll_s: int = 10,
                    max_wait_s: int = 1200) -> dict[str, Any]:
     from e2b import Template
 
     task = task_dir.name
     image = image or task_image(task_dir)
+    # Resources default to the task's own [environment] block: the trial config and task.toml are the ground truth.
+    res = task_resources(task_dir)
+    cpu = res["cpus"] if cpu is None else cpu
+    memory_mb = res["memory_mb"] if memory_mb is None else memory_mb
+    disk_mib = res["disk_mib"] if disk_mib is None else fc_disk_mib(disk_mib)
     name = template_name(task)
     state_dir.mkdir(parents=True, exist_ok=True)
     out = state_dir / f"template-{task}.json"

@@ -24,15 +24,47 @@ from typing import Any
 from ..config import owner_tag
 from ..proxy import runtime
 from ..replay.fingerprint import DEFAULT_ROOTS, build_fingerprint_command
-from ..replay.gate import validate_replay
+from ..replay.gate import lenient_report, validate_replay
 
 REPLAY_DIR = "/tmp/.asr-resume"
 REPLAY_SCRIPT = Path(__file__).resolve().parent.parent / "replay" / "replay_inside.py"
 REPLAY_DEADLINE_S = 10800
 
 
+POSTCUT_SCRIPT = """import json, os, sys
+paths = [p["path"] for p in json.load(open(sys.argv[1]))]
+present = {}
+for p in paths:
+    present[p] = bool(os.path.exists(p) or os.path.lexists(p))
+json.dump(present, open(sys.argv[2], "w"), indent=1)
+"""
+
+
+def probe_post_cut(sbx, run, plan: dict, state_dir: Path, tag: str) -> dict:
+    """Existing/absent state of the files the agent reads after the cut (lenient gate rule 2).
+
+    The paths come from the bundle (post_cut_paths, built from the original session's post-cut tool calls); the probe
+    runs in the replayed environment right after the replay."""
+    paths = plan.get("post_cut_paths") or []
+    if not paths:
+        return {"n": 0, "present": 0, "missing": []}
+    sbx.files.write(f"{REPLAY_DIR}/postcut_paths.json", json.dumps(paths).encode())
+    sbx.files.write(f"{REPLAY_DIR}/postcut_probe.py", POSTCUT_SCRIPT.encode())
+    run(sbx, f"python3 {REPLAY_DIR}/postcut_probe.py {REPLAY_DIR}/postcut_paths.json "
+             f"{REPLAY_DIR}/postcut_presence.json")
+    raw = json.loads(bytes(sbx.files.read(f"{REPLAY_DIR}/postcut_presence.json", format="bytes")).decode())
+    missing = sorted(p for p, ok in raw.items() if not ok)
+    (state_dir / f"{tag}-post_cut_paths.json").write_text(json.dumps({"present": raw}, indent=1) + "\n")
+    return {"n": len(raw), "present": len(raw) - len(missing), "missing": missing}
+
+
 def dispatch_replay(sbx, cwd: str, exec_cap: int) -> int:
-    """Start the replay exactly once in SDK background mode; completion is signalled by an atomic rc file."""
+    """Start the replay exactly once in SDK background mode; completion is signalled by an atomic rc file.
+
+    The replay runs in a LOGIN shell, as the original agent's shell did (Harbor's task healthcheck installs the
+    task's environment through /etc/profile.d/*.sh). A plain `bash -c` inherits only the image's ENV PATH, whose
+    first entry is typically the base conda environment, so a task whose image selects another env replays with the
+    wrong interpreter (e.g. /opt/conda/bin/python3 without numpy instead of /opt/conda/envs/stereo/bin/python3)."""
     command = (f'cd {shlex.quote(cwd)} && timeout -s TERM -k 10s {REPLAY_DEADLINE_S}s '
                f'python3 {REPLAY_DIR}/replay_inside.py {REPLAY_DIR}/plan.json '
                f'{REPLAY_DIR}/replay_report.json --exec-cap {int(exec_cap)} '
@@ -40,7 +72,7 @@ def dispatch_replay(sbx, cwd: str, exec_cap: int) -> int:
                f'printf "%s\\n" "$rc" > {REPLAY_DIR}/rc.tmp; '
                f'mv {REPLAY_DIR}/rc.tmp {REPLAY_DIR}/rc')
     # One dispatch only. SDK-background detaches the process; a shell '&' did not.
-    return sbx.commands.run(command, user='root', background=True, timeout=0).pid
+    return sbx.commands.run(f'bash -lc {shlex.quote(command)}', user='root', background=True, timeout=0).pid
 
 
 def retain_for_audit(requested: bool, plan: dict, report: dict, rc) -> bool:
@@ -153,7 +185,7 @@ def kill_source(sbx, attempts: int = 30, delay_s: float = 10.0) -> None:
 def prepare_source(*, adapter, task_dir: Path, bundle: Path, template: str, tag: str, state_dir: Path,
                    version: str | None = None, exec_cap: int = 1800, expected_fingerprint: str | None = None,
                    retain_on_gate_failure: bool = False, sandbox_timeout_s: int = 4 * 3600,
-                   base_snapshot: str | None = None) -> dict[str, Any]:
+                   base_snapshot: str | None = None, replay_policy: str = "strict") -> dict[str, Any]:
     Sandbox = _sandbox_cls()
     state_dir.mkdir(parents=True, exist_ok=True)
     out = state_dir / f"snapshot-{tag}.json"
@@ -171,7 +203,7 @@ def prepare_source(*, adapter, task_dir: Path, bundle: Path, template: str, tag:
                            "run_id": meta["run_id"], "resume_atif_step": meta["resume_atif_step"],
                            "cut_identity": snapshot_cut_identity(bundle),
                            "agent": adapter.name, "agent_version": version, "owner": owner,
-                           "steps": []}
+                           "replay_policy": replay_policy, "steps": []}
 
     def save():
         out.write_text(json.dumps(rec, indent=1, ensure_ascii=False) + "\n")
@@ -234,7 +266,11 @@ print(json.dumps({"killed": targets}))
         t = time.time()
         run(sbx, (healthcheck + " && " if healthcheck else "") + "chmod 1777 /tmp")
         r = run(sbx, "uname -a; nproc; free -m | head -2; df -h / | tail -1; cat /etc/os-release | head -2")
-        step("healthcheck", t, system=r.stdout[-600:])
+        # Evidence for the replay environment: the login shell the replay uses must resolve the same tools the
+        # original agent's shell did (the healthcheck above installs the task env into /etc/profile.d).
+        r2_ = run(sbx, "bash -lc 'command -v python3; python3 -c \"import sys; print(sys.executable)\"; "
+                      "echo PATH=$PATH'", timeout=180)
+        step("healthcheck", t, system=r.stdout[-600:], agent_shell=(r2_.stdout or "").strip().splitlines()[:3])
 
         t = time.time()
         for name, cmd, timeout in adapter.install_commands(version):
@@ -267,9 +303,15 @@ print(json.dumps({"killed": targets}))
         rep = json.loads((state_dir / f"{tag}-replay_report.json").read_text())
         step("replay", t, rc=rc, summary={k: v for k, v in rep.items() if k != "results"})
         plan = json.loads((bundle / "plan.json").read_text())
+        t = time.time()
+        post_cut = probe_post_cut(sbx, run, plan, state_dir, tag)
+        step("post_cut_probe", t, **post_cut)
         try:
-            validate_replay(plan, rep, rc, meta.get("replay_reviewed_exceptions", {}))
+            gate_result = validate_replay(plan, rep, rc, meta.get("replay_reviewed_exceptions", {}),
+                                          policy=replay_policy, post_cut=post_cut)
         except RuntimeError as exc:
+            if replay_policy == "lenient":
+                rec["divergence_report"] = lenient_report(plan, rep, post_cut)
             if retain_for_audit(retain_on_gate_failure, plan, rep, rc):
                 rec["replay_gate_error"] = str(exc)
                 rec["replay_gate_passed"] = False
@@ -282,6 +324,17 @@ print(json.dumps({"killed": targets}))
                 save()
             raise
         (state_dir / f"{tag}-replay_report.json").write_text(json.dumps(rep, ensure_ascii=False, indent=1))
+        rec["replay_gate_passed"] = True
+        if replay_policy == "lenient" and isinstance(gate_result, dict):
+            # Per-task divergence report: travels with the bundle and the state so results can quote it.
+            rec["divergence_report"] = gate_result
+            (state_dir / f"{tag}-divergence_report.json").write_text(
+                json.dumps(gate_result, ensure_ascii=False, indent=1) + "\n")
+            try:
+                (bundle / "divergence_report.json").write_text(
+                    json.dumps(gate_result, ensure_ascii=False, indent=1) + "\n")
+            except OSError:
+                pass
         _collect_gate_evidence(sbx, rec, rep, save)
         _snapshot_and_kill(sbx, rec, step, run, fingerprint_cmd, expected_fingerprint)
     finally:
@@ -298,7 +351,8 @@ print(json.dumps({"killed": targets}))
     return rec
 
 
-def finish_prepared_source(state_path: Path, *, observe_timeout_s: int = 10800) -> dict[str, Any]:
+def finish_prepared_source(state_path: Path, *, observe_timeout_s: int = 10800,
+                           replay_policy: str | None = None) -> dict[str, Any]:
     """Finish an already-dispatched replay on a retained source sandbox. Never dispatches commands again.
 
     Re-validates the replay with the bundle's (possibly updated) reviewed exceptions, refuses if the task fingerprint
@@ -360,14 +414,27 @@ def finish_prepared_source(state_path: Path, *, observe_timeout_s: int = 10800) 
             raise RuntimeError("Previously recorded task fingerprint changed or replay evidence changed: " + key)
         rec[key] = value
     save()
+    policy = replay_policy or rec.get("replay_policy") or "strict"
+    t = time.time()
+    post_cut = probe_post_cut(sb, run, plan, state_dir, rec["tag"])
+    step("post_cut_probe", t, **post_cut)
     try:
-        validate_replay(plan, report, rc, meta.get("replay_reviewed_exceptions", {}))
+        gate_result = validate_replay(plan, report, rc, meta.get("replay_reviewed_exceptions", {}),
+                                      policy=policy, post_cut=post_cut)
     except RuntimeError as exc:
+        if policy == "lenient":
+            rec["divergence_report"] = lenient_report(plan, report, post_cut)
         rec["replay_gate_error"] = str(exc)
         rec["replay_gate_passed"] = False
         save()
         raise
     rec.pop("replay_gate_error", None)
+    rec["replay_gate_passed"] = True
+    rec["replay_policy"] = policy
+    if policy == "lenient" and isinstance(gate_result, dict):
+        rec["divergence_report"] = gate_result
+        (state_dir / f"{rec['tag']}-divergence_report.json").write_text(
+            json.dumps(gate_result, ensure_ascii=False, indent=1) + "\n")
     # Reviewed exceptions may have been added to the bundle after prepare; the snapshot is gated with these.
     from ..bundle import snapshot_cut_identity
     rec["cut_identity"] = snapshot_cut_identity(bundle)

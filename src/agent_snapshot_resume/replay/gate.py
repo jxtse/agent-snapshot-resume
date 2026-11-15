@@ -210,7 +210,172 @@ def replay_output_sha256(result):
     return hashlib.sha256(data.encode()).hexdigest()
 
 
-def validate_replay(plan, report, rc, reviewed_exceptions=None):
+# --------------------------------------------------------------------------------------------- replay policy
+# The strict policy (validate_replay below) rejects any observation it cannot explain. The lenient policy accepts
+# output divergences (numbers, package versions, listing order, external content, timing) because the resumed agent's
+# conversation history is restored verbatim from the original session: a differing printed number is invisible to it.
+# What it does not accept is a difference the agent will act on after the cut, so it blocks exactly three things:
+#   (1) a replayed command fails where the original succeeded (non-zero rc, timeout, replayer crash, kill/OOM) or an
+#       edit the original applied is not applied;
+#   (2) a file the agent reads AFTER the cut (paths taken from the original session's post-cut tool calls) is missing
+#       in the replayed environment;
+#   (3) a background job still in flight at the cut, whose output the agent uses afterwards.
+# Every accepted divergence is recorded (lenient_report) so a batch can report it next to the results.
+LENIENT_ACCEPTED = {"exact", "normalized", "error_reproduced", "orig_error_not_applied", "bg_rerun_foreground",
+                    "same_lines_reordered", "volatile_only", "address_and_order_only",
+                    "line_alignment_and_order_only", "numbers_differ", "differs", "persisted_preview"}
+KILL_MARKS = re.compile(r"(?i)\b(killed|out of memory|oom[-_ ]kill|oom_reaper|memoryerror|cannot allocate memory|"
+                        r"std::bad_alloc|segmentation fault|core dumped|bus error|illegal instruction)\b")
+KILL_RCS = (137, -9, 134, 139, 135)
+# package/interpreter versions are dotted x.y.z (two or more dots); a plain decimal such as 0.831 is a number
+_VERSION = re.compile(r"\b\d+(?:\.\d+){2,}\b")
+_NUMTOK = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
+
+
+def _violently_killed(action, result):
+    """A replay result whose process was killed by the kernel/scheduler (OOM, signal) rather than exiting.
+
+    A kill mark in the output only counts when the original output did not already contain it: a command that
+    legitimately prints or reproduces such a line (a test of the error path, a reproduced traceback) must not be
+    mistaken for a killed process."""
+    if result.get("rc") in KILL_RCS:
+        return True
+    if result.get("rc") == 0 and result.get("fidelity") in ("exact", "normalized"):
+        return False
+    text = (result.get("stdout_full") or "") + "\n" + (result.get("stderr_full") or "")
+    orig = action.get("orig_text") or ""
+    marks = {m.group(0).lower() for m in KILL_MARKS.finditer(text)}
+    return bool(marks - {m.group(0).lower() for m in KILL_MARKS.finditer(orig)})
+
+
+def _version_pairs(action, result):
+    """Version tokens that differ, paired by position, between the original and the replayed output."""
+    old = _VERSION.findall(action.get("orig_text") or "")
+    new = _VERSION.findall(result.get("stdout_full") or "")
+    if len(old) != len(new):
+        return []
+    return [[o, n] for o, n in zip(old, new) if o != n]
+
+
+def lenient_divergence(action, result):
+    """How one replayed action's observation diverged from the original (None when it did not)."""
+    fidelity = result.get("fidelity")
+    if fidelity in ("exact", "normalized", "error_reproduced", "orig_error_not_applied"):
+        return None
+    versions = _version_pairs(action, result)
+    if versions and fidelity in ("numbers_differ", "differs", "volatile_only"):
+        kind = "version_diff"
+    elif fidelity == "numbers_differ":
+        kind = "changed_numbers"
+    elif fidelity in ("same_lines_reordered", "line_alignment_and_order_only", "address_and_order_only"):
+        kind = "listing_or_line_order"
+    elif fidelity == "volatile_only":
+        kind = "timing_or_address"
+    elif fidelity == "differs":
+        kind = "text_differs"
+    elif fidelity == "bg_rerun_foreground":
+        # the background job's output file is rewritten with the replay's own output: its body may differ, its exit
+        # status is checked separately
+        kind = "background_content"
+    else:
+        kind = fidelity or "unknown"
+    entry = {"call_id": action.get("call_id"), "tool": action.get("tool"), "side_effect": action.get("side_effect"),
+             "fidelity": fidelity, "kind": kind}
+    if versions:
+        entry["versions"] = versions
+    old_nums, new_nums = _NUMTOK.findall(action.get("orig_text") or ""), _NUMTOK.findall(result.get("stdout_full") or "")
+    if len(old_nums) == len(new_nums):
+        entry["changed_numbers"] = sum(1 for a, b in zip(old_nums, new_nums) if a != b)
+    return entry
+
+
+def lenient_blocks(plan, report, rc, post_cut=None):
+    """Blocking findings of the lenient policy: the three classes named in the module-level comment."""
+    blocks = []
+    if str(rc).strip() != "0":
+        blocks.append({"rule": "replayer_failed", "detail": f"replay process exited rc={rc}"})
+    results = list((report or {}).get("results") or [])
+    actions = list((plan or {}).get("actions") or [])
+    if len(results) != len(actions):
+        blocks.append({"rule": "replay_incomplete",
+                       "detail": f"{len(results)} of {len(actions)} planned actions replayed"})
+    for action, result in zip(actions, results):
+        cid = action.get("call_id")
+        if result.get("call_id") != cid:
+            blocks.append({"rule": "identity_mismatch", "call_id": cid})
+            continue
+        se, orig_ok = action.get("side_effect"), not action.get("is_error")
+        if result.get("pacing_unmet"):
+            blocks.append({"rule": "pacing_unmet", "call_id": cid,
+                           "detail": "original pacing of a running background job could not be kept"})
+        if result.get("status") == "replayer_exception":
+            blocks.append({"rule": "replayer_exception", "call_id": cid, "detail": str(result.get("error"))[:200]})
+        if se in ("exec", "exec_background") and orig_ok:
+            if result.get("status") == "timeout" and not result.get("orig_timed_out"):
+                blocks.append({"rule": "replay_timeout", "call_id": cid,
+                               "detail": "timed out where the original finished"})
+            if result.get("rc") not in (None, 0) and not result.get("orig_timed_out"):
+                blocks.append({"rule": "exit_code_changed", "call_id": cid, "rc": result.get("rc"),
+                               "detail": "non-zero exit where the original succeeded"})
+            if _violently_killed(action, result):
+                blocks.append({"rule": "killed_or_oom", "call_id": cid, "rc": result.get("rc"),
+                               "detail": "process killed (OOM/signal) where the original completed"})
+        if se == "file_write" and orig_ok and result.get("status") not in ("applied", "skipped_orig_error"):
+            # includes an unsupported write tool (status "skipped"): the original applied a change the replay did
+            # not, so the file the agent works on afterwards differs
+            blocks.append({"rule": "edit_not_applied", "call_id": cid, "status": result.get("status"),
+                           "fidelity": result.get("fidelity"),
+                           "detail": "the original edit applied; the replay could not apply it"})
+        if se == "exec_background":
+            if not action.get("bg_finished_before_k", True):
+                blocks.append({"rule": "background_in_flight_at_cut", "call_id": cid,
+                               "output_file": action.get("background_output_file"),
+                               "detail": "background job still running at the cut; the agent uses its output later"})
+            elif action.get("background_output_file") and not result.get("background_output_file"):
+                blocks.append({"rule": "background_output_missing", "call_id": cid,
+                               "path": action.get("background_output_file")})
+    missing = list(post_cut.get("missing") or []) if isinstance(post_cut, dict) else []
+    for path in missing:
+        blocks.append({"rule": "post_cut_file_missing", "path": path,
+                       "detail": "the agent reads this file after the cut; the replayed environment lacks it"})
+    return blocks
+
+
+def lenient_report(plan, report, post_cut=None, blocks=None):
+    """Per-task divergence report: what differed (invisible to the agent) and what blocked (if anything)."""
+    blocks = lenient_blocks(plan, report, (report or {}).get("rc", 0), post_cut) if blocks is None else list(blocks)
+    entries, by_kind = [], {}
+    for action, result in zip((plan or {}).get("actions") or [], (report or {}).get("results") or []):
+        d = lenient_divergence(action, result)
+        if d:
+            entries.append(d)
+            by_kind[d["kind"]] = by_kind.get(d["kind"], 0) + 1
+    missing = list((post_cut or {}).get("missing") or []) if isinstance(post_cut, dict) else []
+    return {"policy": "lenient", "n_actions": len((plan or {}).get("actions") or []),
+            "n_divergent": len(entries), "by_kind": by_kind, "divergences": entries,
+            "changed_numbers": [e["call_id"] for e in entries if e["kind"] == "changed_numbers"],
+            "text_differs": [e["call_id"] for e in entries if e["kind"] == "text_differs"],
+            "version_diffs": [{"call_id": e["call_id"], "versions": e.get("versions")}
+                              for e in entries if e.get("versions")],
+            "listing_or_line_order": [e["call_id"] for e in entries
+                                      if e["kind"] == "listing_or_line_order"],
+            "files_missing": missing,
+            "post_cut_paths": (post_cut or {}).get("n") if isinstance(post_cut, dict) else 0,
+            "blocks": blocks}
+
+
+def validate_replay(plan, report, rc, reviewed_exceptions=None, policy="strict", post_cut=None):
+    """Replay gate. policy="strict" keeps the historical fail-closed behaviour; "lenient" accepts output
+    divergences and blocks only the three classes in lenient_blocks (see the module comment)."""
+    if policy not in ("strict", "lenient"):
+        raise RuntimeError(f"unknown replay policy {policy!r}")
+    if policy == "lenient":
+        blocks = lenient_blocks(plan, report, rc, post_cut)
+        if blocks:
+            raise RuntimeError("Lenient replay blocked: " + "; ".join(
+                "/".join(str(b.get(k)) for k in ("rule", "call_id", "path", "detail") if b.get(k))
+                for b in blocks))
+        return lenient_report(plan, report, post_cut, blocks)
     import hashlib
     reviewed_exceptions = reviewed_exceptions or {}
     if str(rc).strip() != '0' or len(report.get('results', [])) != len(plan['actions']):
