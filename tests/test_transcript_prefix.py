@@ -35,3 +35,15 @@ def test_without_a_parent_session_the_seed_is_used(tmp_path):
     (bdir / "session_trunc.jsonl").write_text("{}\n")
     assert transcript_prefix({"cut_line": 1, "chain": {"parent_trial_dir": str(tmp_path / "gone")}},
                              bdir).decode() == "{}\n"
+
+
+def test_a_cut_right_next_to_a_removed_range_maps_back(tmp_path):
+    """removed [6, 12) with the cut at original line 12 (normalized 6): the answer must be 12, not 6."""
+    raw = [json.dumps({"type": "user", "n": i}) for i in range(20)]
+    parent = _trial(tmp_path, raw)
+    bdir = tmp_path / "bundle"
+    bdir.mkdir()
+    (bdir / "session_trunc.jsonl").write_text("{}\n")
+    meta = {"cut_line": 6, "chain": {"parent_trial_dir": str(parent),
+                                     "stripped": [{"removed_lines": [6, 7, 8, 9, 10, 11]}]}}
+    assert transcript_prefix(meta, bdir).decode().splitlines() == raw[:12]

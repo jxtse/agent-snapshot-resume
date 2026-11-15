@@ -98,3 +98,40 @@ def test_compacted_away_hint_without_persistence_is_refused():
     ]
     with pytest.raises(ValueError, match="did not persist hints"):
         chain.carried_hint_positions(parent_evidence(persist_hint=False), records, len(records), [HINT])
+
+
+PREFIX = "This session is being continued from a previous conversation"
+
+
+def summary_records():
+    return [
+        user("u0", "instruction"),
+        boundary("b0", []),
+        summary(f"{PREFIX}. summary zero: the agent compacted before its resume"),
+        {"type": "assistant", "uuid": "a1", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "c1", "name": "Bash", "input": {"command": "ls"}}]}},
+        user("u1", [{"type": "tool_result", "tool_use_id": "c1", "content": "a.csv"}]),
+        user("u2", "more work"),
+    ]
+
+
+def test_the_same_summary_keeps_the_hint_on_its_anchor():
+    """The run resumed from a compaction, injected the hint on a tool result, and did not compact again."""
+    recs = summary_records()
+    ev = parent_evidence(persist_hint=True)
+    ev["first_request"]["body"]["messages"].insert(
+        0, {"role": "user", "content": f"{PREFIX}. summary zero: the agent compacted before its resume"})
+    pos = chain.carried_hint_positions(ev, recs, len(recs), [HINT])
+    assert not pos[0].get("on_summary")
+    assert pos[0]["tool_use_id"] == "c1"
+
+
+def test_a_later_compaction_moves_the_hint_to_the_new_summary():
+    recs = summary_records()
+    recs += [boundary("b1", []), summary(f"{PREFIX}. summary one: the agent compacted again"),
+             user("u3", "after")]
+    ev = parent_evidence(persist_hint=True)
+    ev["first_request"]["body"]["messages"].insert(
+        0, {"role": "user", "content": f"{PREFIX}. summary zero: the agent compacted before its resume"})
+    pos = chain.carried_hint_positions(ev, recs, len(recs), [HINT])
+    assert pos[0]["on_summary"] is True

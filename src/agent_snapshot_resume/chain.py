@@ -175,6 +175,24 @@ def hint_block(hint: str) -> str:
     return hint_block_text(hint)
 
 
+def _text_of_record(rec: dict[str, Any]) -> str:
+    c = (rec.get("message") or {}).get("content")
+    if isinstance(c, str):
+        return c
+    return "".join(b.get("text") or "" for b in c if isinstance(b, dict) and b.get("type") == "text")
+
+
+def _first_request_summary_text(body: dict[str, Any]) -> str | None:
+    """The compact summary the run's own first request carried, if it was already resumed from a compaction."""
+    from .proxy.resume_proxy import COMPACT_SUMMARY_PREFIX
+    for m in body.get("messages") or []:
+        c = m.get("content")
+        texts = [c] if isinstance(c, str) else [b.get("text") or "" for b in (c or []) if isinstance(b, dict)]
+        if any(COMPACT_SUMMARY_PREFIX in t for t in texts):
+            return next(t for t in texts if COMPACT_SUMMARY_PREFIX in t)
+    return None
+
+
 def _summary_index(records: list[dict[str, Any]], cut: int) -> int | None:
     """Index of the compaction summary that is *in the model context* of records[:cut].
 
@@ -207,7 +225,13 @@ def carried_hint_positions(evidence: dict[str, Any], stripped: list[dict[str, An
     was injected as a new message cannot be placed and the build fails closed.
     """
     anchors = first_request_hints(evidence["first_request"]["body"], carried)
-    on_summary = _summary_index(stripped, cut) is not None
+    # Is the summary the run sees at this cut the SAME summary it had when its proxy injected the hint? Then the
+    # injection message (a tool-result turn) is still the place the hint lives; a LATER compaction moved it onto
+    # the new summary (the parent's reinject_after_compaction). Comparing the texts decides which regime applies.
+    sidx = _summary_index(stripped, cut)
+    cut_summary = _text_of_record(stripped[sidx]) if sidx is not None else None
+    parent_summary = _first_request_summary_text(evidence["first_request"]["body"])
+    on_summary = cut_summary is not None and cut_summary != parent_summary
     if on_summary and not (evidence.get("spec") or {}).get("persist_hint"):
         # Its own proxy dropped the hint at the first compaction, so every later request of that run carried no
         # hint: re-injecting one here would give the model an instruction it never saw.

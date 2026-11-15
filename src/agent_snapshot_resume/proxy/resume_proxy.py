@@ -35,7 +35,7 @@ replaces it. Logs: <log_dir>/<run_id>/requests.jsonl, first_request_{raw,rewritt
 
     python resume_proxy.py --port 4031 --spec-dir /opt/asr-proxy/resume/specs --log-dir /logs/agent/resume-proxy
 """
-import argparse, asyncio, copy, hashlib, json, os, re, time
+import argparse, asyncio, collections, copy, hashlib, json, os, re, time
 
 import aiohttp
 from aiohttp import web
@@ -200,11 +200,10 @@ def restore_carried_hints(msgs, spec, acts):
             raise ValueError(f"carried hint {i} has neither a tool result anchor nor a compaction summary to go on")
         bl = [dict(b) for b in _blocks(m)]
         if bl and isinstance(bl[-1], dict) and "cache_control" in bl[-1]:
-            # Only move the breakpoint when the hint lands on the last message (the request's cache point), the way
-            # reinject_after_compaction does; a mid-history hint must leave the breakpoint alone.
-            if mi == len(new) - 1:
-                blk["cache_control"] = bl[-1].pop("cache_control")
-                acts.append("prior_hint_cache_breakpoint")
+            # Exactly what reinject_after_compaction does for the hint it puts on a summary: the block right after
+            # the target's last one is the new tail of that message, so the breakpoint moves onto the hint.
+            blk["cache_control"] = bl[-1].pop("cache_control")
+            acts.append("prior_hint_cache_breakpoint")
         new[mi] = dict(m, content=bl + [blk])
         acts.append(f"prior_hint_on_{'summary' if c is not None else 'tool_result'}@{mi}")
     return new
@@ -492,7 +491,9 @@ def check_content(body, ref, hints, notes=None):
     want = ref.get("message_block_sha256")
     if want is not None:
         hint_blocks = {hint_block_text(h) for h in hints or []}
-        meta_blocks = set(ref.get("meta_block_sha256") or [])
+        # isMeta records are optional (a request may omit them) but never duplicated: consume one reference entry per
+        # matching block so a second copy is reported instead of silently skipped.
+        meta_blocks = collections.Counter(ref.get("meta_block_sha256") or [])
         j, extras, rendered = 0, 0, []
         for blk, _ in blocks_from_request(body.get("messages") or []):
             if j < len(want) and block_digest(blk) == want[j]:
@@ -506,7 +507,9 @@ def check_content(body, ref, hints, notes=None):
                 continue
             if blk[1] == "text" and blk[2] in hint_blocks:
                 continue
-            if blk[1] == "text" and block_digest(blk) in meta_blocks:
+            digest = block_digest(blk)
+            if blk[1] == "text" and meta_blocks.get(digest):
+                meta_blocks[digest] -= 1
                 continue  # an isMeta record the agent sends verbatim (e.g. the "no visible output" nudge)
             if blk[0] == "system" or (blk[0] == "user" and blk[1] == "text"
                                       and blk[2].lstrip().startswith(ATTACHMENT_TEXT_PREFIXES)):
@@ -590,9 +593,12 @@ def rewrite(body, spec):
         if spec.get('require_sentinel'):
             raise ValueError('Required resume sentinel missing; refusing unverified continuation')
         acts.append("sentinel_not_found")
-        if spec.get("prior_hint_positions") or (spec.get("persist_hint") and spec_hints(spec)):
-            # The sentinel turn is gone (compacted away): the hints the run carries ride the summary, exactly as
-            # the previous run's proxy reinjected them there.
+        s_ = find_compact_summary(msgs)
+        if s_ is not None and (spec.get("prior_hint_positions") or (spec.get("persist_hint") and spec_hints(spec))):
+            # The sentinel turn is gone (compacted away): the hints the run carries ride the summary, exactly as the
+            # previous run's proxy reinjected them there. A request with neither a sentinel nor a summary is not the
+            # main chain (e.g. a sub-agent's own context): the parent's proxy left those alone, so leave them alone
+            # here too -- injecting a carried hint into a sub-agent would put it somewhere the parent never had it.
             body = dict(body, messages=restore_carried_hints(body.get("messages") or [], spec, acts))
             if spec.get("persist_hint") and spec_hints(spec):
                 body = reinject_after_compaction(body, spec, acts)

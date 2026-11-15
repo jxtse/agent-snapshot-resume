@@ -74,12 +74,16 @@ def transcript_prefix(meta: dict[str, Any], bundle: Path) -> bytes:
         return seed
     removed = [i for a in (chain_meta.get("stripped") or []) for i in a.get("removed_lines") or []]
     cut = int(meta["cut_line"])
-    cut_orig = cut
-    while True:  # the seed's line numbers are the parent's minus the scaffolding before the cut
-        grown = cut + sum(1 for i in removed if i < cut_orig)
-        if grown == cut_orig:
+    # cut_stripped = cut_orig - #{removed lines < cut_orig}: start from the largest possible answer (all scaffolding
+    # before the cut) and descend to the fixed point, so a cut right next to a removed range still maps correctly.
+    cut_orig = cut + len(removed)
+    while True:
+        nxt = cut + sum(1 for i in removed if i < cut_orig)
+        if nxt == cut_orig:
             break
-        cut_orig = grown
+        if nxt > cut_orig:  # not a fixed point: never happens for scaffolding before the cut
+            raise RuntimeError(f"cannot map the seed cut {cut} back to the parent session")
+        cut_orig = nxt
     paths = sorted(glob.glob(os.path.join(parent, "agent", "sessions", "projects", "*", "*.jsonl")))
     if not paths:
         return seed

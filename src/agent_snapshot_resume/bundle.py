@@ -152,8 +152,11 @@ def default_fingerprint_roots(plan: dict[str, Any]) -> list[str] | None:
     if roots:
         return sorted(roots)
     # A task that works outside /app (e.g. a /task workdir) with no file writes in the plan: bind its own work
-    # directory -- fingerprinting /app would fail on an image that has no /app at all.
-    return [cwd] if cwd != "/root" else None
+    # directory -- fingerprinting /app would fail on an image that has no /app at all. A cwd inside a user's home
+    # is never bound as a whole (it carries caches and agent config); such a run keeps the default root and fails
+    # its fingerprint step instead of silently hashing the home.
+    home_dirs = ("/root", "/home", "/Users")
+    return [cwd] if cwd and not any(cwd == h or cwd.startswith(h + "/") for h in home_dirs) else None
 
 
 def plan_with_observations(ir: dict[str, Any], k: int) -> dict[str, Any]:

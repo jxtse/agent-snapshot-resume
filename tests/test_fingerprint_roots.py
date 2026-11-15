@@ -12,8 +12,10 @@ def test_a_task_workdir_becomes_the_root_when_the_plan_writes_nothing():
 
 def test_a_home_cwd_never_binds_the_whole_home():
     assert default_fingerprint_roots({"initial_cwd": "/root", "actions": []}) is None
-    # a subdirectory of the home is allowed
-    assert default_fingerprint_roots({"initial_cwd": "/root/work", "actions": []}) == ["/root/work"]
+    assert default_fingerprint_roots({"initial_cwd": "/home/agent", "actions": []}) is None
+    # a work directory the run used inside the home is still bound
+    assert default_fingerprint_roots({"initial_cwd": "/root/work",
+                                      "actions": [{"cwd": "/root/work"}]}) == ["/root/work"]
 
 
 def test_directories_an_action_used_are_preferred():
