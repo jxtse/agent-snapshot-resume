@@ -70,7 +70,7 @@ def hints_of(spec: dict[str, Any]) -> list[str]:
 def first_request_hints(body: dict[str, Any], hints: list[str]) -> list[dict[str, Any]]:
     """Where each hint block sits in the run's first request: the message it was appended to and the tool result
     it followed (the proxy appends the block to the last user message, keeping its tool results)."""
-    from .proxy.resume_proxy import hint_block_text
+    from .proxy.resume_proxy import COMPACT_SUMMARY_PREFIX, hint_block_text
 
     blocks: list[tuple[int, int, dict[str, Any]]] = []
     for mi, m in enumerate(body.get("messages") or []):
@@ -88,11 +88,20 @@ def first_request_hints(body: dict[str, Any], hints: list[str]) -> list[dict[str
         ids = [b.get("tool_use_id") for m2, b2, b in blocks if m2 == mi and b2 < bi
                and b.get("type") == "tool_result" and b.get("tool_use_id")]
         if not ids:
-            # The proxy only starts a new message when it cannot append to the anchor; the anchor rule below would
-            # then be wrong, so refuse instead of guessing where the hint belongs.
+            # A hint the parent's proxy re-injected after a compaction rides the compaction summary message, so
+            # there is no tool result before it: that placement is the post-compaction rule and is re-injectable
+            # (the proxy appends it to the summary again). Anything else means the hint was injected as a message
+            # of its own, whose place the anchor rule below cannot reproduce, so fail closed.
+            on_summary = any(b.get("type") == "text" and COMPACT_SUMMARY_PREFIX in (b.get("text") or "")
+                             for m2, _b2, b in blocks if m2 == mi)
+            if on_summary:
+                out.append({"hint": hint, "block": want, "msg_index": mi, "block_index": bi, "tool_use_id": None,
+                            "on_summary": True})
+                continue
             raise ValueError("the run's first request has no tool result before a hint block (new-message injection "
                              "is not supported by chained builds)")
-        out.append({"hint": hint, "block": want, "msg_index": mi, "block_index": bi, "tool_use_id": ids[-1]})
+        out.append({"hint": hint, "block": want, "msg_index": mi, "block_index": bi, "tool_use_id": ids[-1],
+                    "on_summary": False})
     return out
 
 
@@ -240,7 +249,9 @@ def carried_hint_positions(evidence: dict[str, Any], stripped: list[dict[str, An
     out: list[dict[str, Any]] = []
     for a in anchors:
         entry = {"hint": a["hint"], "block": a["block"], "tool_use_id": a["tool_use_id"]}
-        if on_summary:
+        # a hint the parent already held on a summary has no tool-result anchor at all; one that was anchored on a
+        # tool result moves onto the summary once the parent compacted past it
+        if on_summary or a.get("on_summary"):
             entry["on_summary"] = True
         out.append(entry)
     return out

@@ -135,3 +135,24 @@ def test_a_later_compaction_moves_the_hint_to_the_new_summary():
         0, {"role": "user", "content": f"{PREFIX}. summary zero: the agent compacted before its resume"})
     pos = chain.carried_hint_positions(ev, recs, len(recs), [HINT])
     assert pos[0]["on_summary"] is True
+
+
+def test_a_hint_the_parent_held_on_its_summary_is_placed_not_refused():
+    """Round 3 off a run that was itself resumed: its first request carries hint 1 on the summary and hint 2 on a
+    tool result, and the chained build must accept both placements (it re-injects them there, not as messages)."""
+    second = "Decisions:\n1. Do not bridge the transfer matrix with a Hadamard basis change."
+    msgs = [
+        {"role": "user", "content": [{"type": "text", "text": f"{PREFIX}. summary zero: compacted"},
+                                     {"type": "text", "text": hint_block_text(HINT)}]},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "c1", "name": "Bash",
+                                           "input": {"command": "ls"}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "c1", "content": "a.csv"},
+                                     {"type": "text", "text": hint_block_text(second)}]},
+    ]
+    pos = chain.first_request_hints({"messages": msgs}, [HINT, second])
+    assert pos[0]["on_summary"] is True and pos[0]["tool_use_id"] is None
+    assert pos[1]["on_summary"] is False and pos[1]["tool_use_id"] == "c1"
+    # a hint that was injected as a message of its own (no summary in its message) is still refused
+    lonely = {"messages": [{"role": "user", "content": [{"type": "text", "text": hint_block_text(second)}]}]}
+    with pytest.raises(ValueError, match="new-message injection"):
+        chain.first_request_hints(lonely, [second])
