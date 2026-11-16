@@ -19,6 +19,24 @@ from typing import Any
 from .launch import SNAPSHOT_ENV_IMPORT, verifier_hashes
 
 
+def check_output_dir(trials_dir: Path, trial_name: str, source: Path) -> Path:
+    """The new trial dir, refusing one that already exists or that overlaps the source trial.
+
+    A regrade copies the recorded logs/artifacts into a *new* directory and then writes its own config, result and
+    verifier logs there; pointing it at an existing directory would merge into records another run wrote (and a
+    directory that is the source trial itself would modify the record this command promises to only read).
+    """
+    target = (Path(trials_dir) / trial_name).resolve()
+    src = Path(source).resolve()
+    if target == src or target in src.parents or src in target.parents:
+        raise SystemExit(f'refusing to regrade {src} into {target}: the output dir must not overlap the source '
+                         f'trial (which is read-only here)')
+    if target.exists():
+        raise SystemExit(f'{target} already exists; a regrade writes a new trial dir - remove it or pass another '
+                         f'--trial-name')
+    return target
+
+
 def build_regrade_config(*, source: Path, task_dir: Path, trials_dir: Path, owner: str, job: str,
                          trial_name: str | None = None) -> Any:
     """The harbor TrialConfig of a regrade trial of `source` with this project's verifier environment."""
@@ -30,6 +48,7 @@ def build_regrade_config(*, source: Path, task_dir: Path, trials_dir: Path, owne
 
     source = Path(source).resolve()
     task_dir = Path(task_dir).resolve()
+    check_output_dir(trials_dir, trial_name or f"regrade-{source.name}", source)
     paths = TrialPaths(trial_dir=source)
     if not paths.result_path.is_file():
         raise SystemExit(f"{source} has no result.json; nothing to regrade")
@@ -78,6 +97,7 @@ def regrade(*, source: Path, task_dir: Path, trials_dir: Path, owner: str, job: 
     result = asyncio.run(_run())
     out: dict[str, Any] = {"source": str(Path(source).resolve()), "trial_dir": str(Path(trials_dir) / config.trial_name),
                            "rewards": (result.verifier_result.rewards if result.verifier_result else None),
-                           "exception": (result.exception_info.model_dump() if result.exception_info else None)}
+                           "exception": (result.exception_info.model_dump(mode="json")
+                                         if result.exception_info else None)}
     (Path(trials_dir) / config.trial_name / "regrade.json").write_text(json.dumps(out, indent=1))
     return out
