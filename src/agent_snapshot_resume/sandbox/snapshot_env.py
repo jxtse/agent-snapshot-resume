@@ -17,9 +17,11 @@ Job config:
                                verifier sandbox)
   Hash checks are written to <trial_dir>/infra-validation/.
 * exec() goes through SnapshotCommandRecovery (one dispatch, same-PID reconnect).
+* A verifier image that ships an incomplete /tests (only the top-level test files) is repaired from the task's own
+  tests/ before grading, never by hand: the gate's expectation *is* the task's tests/, so restoring it is the fix.
 """
 import json
-import shlex
+from pathlib import Path
 
 from e2b import AsyncSandbox
 from harbor.models.task.config import NetworkMode
@@ -29,6 +31,9 @@ from ..replay.fingerprint import DEFAULT_ROOTS, build_fingerprint_command
 from ..replay.gate import check_hashes
 from .command_recovery import SnapshotCommandRecovery
 from .fc_env import SANDBOX_TIMEOUT_SEC, SandboxEnvironment
+from .runtime_hash import collect_command, hash_problems, parse_collect, tests_files_tar_bytes
+
+UPLOAD_PART_BYTES = 8 * 1024 * 1024
 
 DEFAULT_FINGERPRINT = build_fingerprint_command(list(DEFAULT_ROOTS))
 
@@ -66,17 +71,65 @@ class SnapshotCloneEnvironment(SnapshotCommandRecovery, SandboxEnvironment):
             await self._check_runtime_hashes(self._expected_auxiliary_hashes, 'auxiliary')
 
     async def _check_runtime_hashes(self, expected, label):
-        code = ('import hashlib,json,pathlib; paths=json.loads(' + repr(json.dumps(list(expected))) + '); '
-                'print(json.dumps({p:hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest() for p in paths}))')
-        result = await self.exec('python3 -c ' + shlex.quote(code), timeout_sec=120, user='root')
-        if result.return_code != 0:
-            raise RuntimeError(label + ' runtime file-hash collection failed: ' + (result.stderr or '')[-1500:])
-        actual = json.loads(result.stdout)
-        record = {'sandbox_id': self._sandbox.sandbox_id, 'label': label, 'expected': expected, 'actual': actual}
+        """Fail-closed check of restored files, with the guest's per-file outcome recorded and reported.
+
+        A verifier environment is repaired once from the task's own tests/ when the check finds files the image does
+        not carry (some task images ship /tests without its nested data dirs), then the check runs again: the trial
+        must be graded on the task's real tests, not fail because of how an image was packaged.
+        """
+        expected = dict(expected)
+        actual, errors = await self._collect_runtime_hashes(expected)
+        repaired = None
+        if label == 'verifier' and hash_problems(expected, actual, errors):
+            repaired = await self._repair_verifier_tests(expected)
+            if repaired.get('files'):
+                actual, errors = await self._collect_runtime_hashes(expected)
+        record = {'sandbox_id': self._sandbox.sandbox_id, 'label': label, 'expected': expected,
+                  'actual': actual, 'errors': errors, 'repaired': repaired}
         target = self.trial_paths.trial_dir / 'infra-validation'
         target.mkdir(parents=True, exist_ok=True)
         (target / (self.session_id + '-' + label + '.json')).write_text(json.dumps(record, indent=2))
-        check_hashes(expected, actual, label)
+        problems = hash_problems(expected, actual, errors)
+        if problems:
+            raise RuntimeError(f'{label} runtime files do not match the task definition: ' + '; '.join(problems))
+        return check_hashes(expected, actual, label)
+
+    async def _collect_runtime_hashes(self, expected):
+        result = await self.exec(collect_command(expected), timeout_sec=180, user='root')
+        if result.return_code != 0:
+            return {}, {p: 'collector failed: ' + (result.stderr or '')[-300:] for p in expected}
+        return parse_collect(result.stdout or '{}')
+
+    async def _repair_verifier_tests(self, expected):
+        """Restore the expected /tests files in this verifier sandbox from the task's tests/ (the gate's own
+        expectation): only the expected paths, so a task whose image deliberately omits parts of tests/ (packed
+        archives a build step unpacks) keeps its corpus exactly as the image defines it."""
+        src = Path(self.environment_dir)
+        rels = sorted({p.split('/tests/', 1)[1] for p in expected if p.startswith('/tests/')})
+        if not src.is_dir() or not rels:
+            return {'files': 0, 'reason': f'no local tests/ at {src}'}
+        data, n = tests_files_tar_bytes(src, rels)
+        remote = '/tmp/.asr-tests-repair.tar.gz'
+        await self._upload_bytes(remote, data)
+        r = await self.exec(f'tar -xzf {remote} -C /tests && rm -f {remote}', timeout_sec=600, user='root')
+        if r.return_code != 0:
+            return {'files': 0, 'source': str(src), 'reason': (r.stderr or '')[-500:]}
+        return {'files': n, 'bytes': len(data), 'source': str(src)}
+
+    async def _upload_bytes(self, remote, data):
+        """Write a guest file, in parts: one API write cannot carry a 25 MB tests archive."""
+        if len(data) <= UPLOAD_PART_BYTES:
+            await self._sandbox.files.write(remote, data)
+            return
+        parts = []
+        for i, lo in enumerate(range(0, len(data), UPLOAD_PART_BYTES)):
+            part = f'{remote}.part{i}'
+            await self._sandbox.files.write(part, data[lo:lo + UPLOAD_PART_BYTES])
+            parts.append(part)
+        r = await self.exec('cat ' + ' '.join(parts) + ' > ' + remote + ' && rm -f ' + ' '.join(parts),
+                            timeout_sec=300, user='root')
+        if r.return_code != 0:
+            raise RuntimeError('part upload of ' + remote + ' failed: ' + (r.stderr or '')[-300:])
 
     async def _create_sandbox(self):
         if self._is_verifier or not self._snapshot_id:

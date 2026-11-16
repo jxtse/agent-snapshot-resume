@@ -130,6 +130,45 @@ def bundle_identity(bundle_dir: Path) -> dict[str, Any]:
             "orig_request_at_k": meta.get("orig_request_at_k"), "run_id": meta.get("run_id")}
 
 
+# Keys the content reference *derived* after some fake runs were recorded. They describe the same message blocks
+# `message_block_sha256` already covers (block kinds of those blocks, digests of the isMeta records), so a fake run
+# that predates them judged exactly the same original request. Any other key difference stays a refusal.
+ADDITIVE_CONTENT_KEYS = ("block_kinds", "meta_block_sha256")
+
+
+def orig_request_diff(mine: dict[str, Any] | None, theirs: dict[str, Any] | None) -> list[str]:
+    """Fields in which a recorded original-request reference differs from this bundle's (empty == identical)."""
+    if not mine or not theirs:
+        return ["orig_request_at_k"]
+    diff = [k for k in mine if k != "content" and theirs.get(k) != mine.get(k)]
+    a, b = mine.get("content") or {}, theirs.get("content") or {}
+    for k in set(a) | set(b):
+        if k not in a or k not in b:
+            if k in ADDITIVE_CONTENT_KEYS:
+                continue  # derived, absent on one side: the shared message-block digests decide the content
+            if k in a or k in b:
+                diff.append("content." + k)
+            continue
+        if a[k] != b[k]:
+            diff.append("content." + k)
+    return sorted(diff)
+
+
+def bundle_identity_diff(mine: dict[str, Any], theirs: dict[str, Any]) -> list[str]:
+    """Top-level identity fields that differ, with the compatibility rules of `cut_identity_diff` and
+    `orig_request_diff` (an older record that lacks only derived content keys is identical)."""
+    diff = []
+    for k in mine:
+        if theirs.get(k) == mine.get(k):
+            continue
+        if k == "cut" and not cut_identity_diff(mine.get("cut") or {}, theirs.get("cut") or {}):
+            continue
+        if k == "orig_request_at_k" and not orig_request_diff(mine.get(k), theirs.get(k)):
+            continue
+        diff.append(k)
+    return sorted(diff)
+
+
 def default_fingerprint_roots(plan: dict[str, Any]) -> list[str] | None:
     """Task directories to fingerprint when none are given. None (= DEFAULT_ROOTS, /app) if the run worked under
     /app or its cwd is unknown. For a run in a home directory (e.g. cwd /root): every first-level, non-hidden

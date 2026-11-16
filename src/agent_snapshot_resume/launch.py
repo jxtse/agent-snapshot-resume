@@ -28,11 +28,20 @@ _RESERVED_ENV = {"ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKE
                  "OPENAI_API_KEY", "CLAUDE_CONFIG_DIR"}
 
 
+# Packed inputs a task image unpacks during its build and then drops (round 1b: a task's `tests/data/*.tar.gz`
+# population archives). They are never verifier runtime files, and a task's own corpus gate treats a restored copy
+# as an "extra" file, so they are not part of the /tests identity the gate asserts.
+PACKED_INPUT_SUFFIXES = (".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz", ".zip")
+
+
 def verifier_hashes(task_dir: Path) -> dict[str, str]:
+    """sha256 of the files the verifier sandbox's /tests must equal: the task's tests/, minus its build context
+    (Dockerfile/.dockerignore), caches and packed inputs the image build unpacks."""
     tests = task_dir / "tests"
     return {"/tests/" + str(p.relative_to(tests)): hashlib.sha256(p.read_bytes()).hexdigest()
             for p in sorted(tests.rglob("*"))
-            if p.is_file() and "__pycache__" not in p.parts and p.name not in ("Dockerfile", ".dockerignore")}
+            if p.is_file() and "__pycache__" not in p.parts and p.name not in ("Dockerfile", ".dockerignore")
+            and not p.name.lower().endswith(PACKED_INPUT_SUFFIXES)}
 
 
 # A trial of a resumed run carries its own resume gate in its agent kwargs (the freeze of ITS fake proof, its parity
@@ -137,12 +146,10 @@ def frozen_first_request_digest(path: Path, bundle: Path, passthrough_args: list
     if theirs is None:
         problems.append("fake run's bundle identity differs from this bundle in ['<missing>']")
     else:
-        # top-level fields must match exactly; the cut is compared with the absent-optional-fingerprint-roots rule
-        # (a fake run recorded before that field existed is identical to a bundle that names no optional roots)
-        from .bundle import cut_identity_diff
-        diff = sorted(k for k in mine if theirs.get(k) != mine.get(k))
-        if diff == ["cut"] and not cut_identity_diff(mine["cut"], theirs.get("cut") or {}):
-            diff = []
+        # top-level fields must match exactly; the cut and the original-request reference are compared with their
+        # compatibility rules (an absent optional fingerprint root, or a record written before derived content keys)
+        from .bundle import bundle_identity_diff
+        diff = bundle_identity_diff(mine, theirs or {})
         if diff:
             problems.append(f"fake run's bundle identity differs from this bundle in {diff}")
     if problems:
