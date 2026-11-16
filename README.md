@@ -202,6 +202,21 @@ is never launched twice (`runs/<job>/job.json` is the marker).
 `asr batch status` reports per run: state, reward, failed tests from the verifier log, native `cost_usd`, per-request
 hint counts and compaction count from the resume proxy log, first-request parity, and an infra-vs-model failure class.
 
+### 5c. Regrade a finished trial (no agent call)
+
+A trial whose agent work finished but whose verifier never ran (an image that shipped an incomplete `/tests`, an
+interrupted verifier sandbox) can be graded from its recorded artifacts. Harbor's regrade trial replaces the agent
+phase with "restore the recorded outputs", so nothing is re-generated and the source trial is never modified:
+
+```bash
+asr regrade --source jobs/<job>/<trial> --task-dir ../tasks/o70/<task> --trials-dir regrade --job regrade-<trial>
+```
+
+The verifier sandbox is this project's environment class, so it carries the same gate a live launch does: the
+verifier's `/tests` must hash-match the task's `tests/`, and when the task image carries only the top-level test
+files those expected files are restored from the task directory before grading (only the expected paths - a task
+whose image unpacks and drops packed archives keeps its corpus as the image defines it).
+
 ### 6. Clean up
 
 ```bash

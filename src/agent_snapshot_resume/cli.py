@@ -8,6 +8,7 @@
   equiv             check a rewritten first request against the original session prefix (offline)
   parity            check a rewritten first request against the original run's request at the cut (offline)
   screen            replayability risks of candidate cuts (offline, no sandbox)
+  regrade           re-run a finished trial's verifier against its recorded artifacts (no agent call)
   selfcheck         simulate the resumed first request from a bundle, rewrite it, run equiv (offline)
   sandboxes         list sandboxes tagged with ASR_OWNER_TAG; --kill-id to kill one
   delete-snapshot   delete a snapshot
@@ -216,6 +217,21 @@ def cmd_batch(a):
                       "launched": len(res["launched"]), "launch_failed": res["launch_failed"]},
                      ensure_ascii=False, indent=1))
     return 0 if not res["failed"] and not res["launch_failed"] else 1
+
+
+def cmd_regrade(a):
+    """Re-run a finished trial's verifier against its recorded artifacts (the agent is never re-run)."""
+    from . import regrade as regrade_mod
+
+    out = []
+    for source in a.source:
+        rec = regrade_mod.regrade(source=Path(source), task_dir=Path(a.task_dir),
+                                  trials_dir=Path(a.trials_dir), owner=config.owner_tag(),
+                                  job=a.job or f"regrade-{Path(source).parent.name}",
+                                  trial_name=a.trial_name or None)
+        out.append(rec)
+    print(json.dumps(out, ensure_ascii=False, indent=1))
+    return 0 if all(r["exception"] is None for r in out) else 1
 
 
 def cmd_equiv(a):
@@ -470,6 +486,15 @@ def build_parser():
     p.add_argument("--bundle", required=True)
     p.add_argument("--out", help="default: <bundle>/selfcheck")
     p.set_defaults(fn=cmd_selfcheck)
+
+    p = sub.add_parser("regrade", help="re-run a finished trial's verifier against its recorded artifacts")
+    p.add_argument("--source", action="append", required=True,
+                   help="trial dir of a finished run (repeat for several trials)")
+    p.add_argument("--task-dir", required=True, help="Harbor task dir providing the verifier")
+    p.add_argument("--trials-dir", required=True, help="parent dir for the new regrade trial dirs")
+    p.add_argument("--job", help="job label recorded in the verifier sandbox metadata")
+    p.add_argument("--trial-name", help="name of the new trial dir")
+    p.set_defaults(fn=cmd_regrade)
 
     p = sub.add_parser("sandboxes", help="list own sandboxes (metadata owner=ASR_OWNER_TAG)")
     p.add_argument("--kill-id")
