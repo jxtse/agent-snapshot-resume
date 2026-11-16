@@ -28,11 +28,20 @@ _RESERVED_ENV = {"ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKE
                  "OPENAI_API_KEY", "CLAUDE_CONFIG_DIR"}
 
 
+# Packed inputs a task image unpacks during its build and then drops (round 1b: a task's `tests/data/*.tar.gz`
+# population archives). They are never verifier runtime files, and a task's own corpus gate treats a restored copy
+# as an "extra" file, so they are not part of the /tests identity the gate asserts.
+PACKED_INPUT_SUFFIXES = (".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz", ".zip")
+
+
 def verifier_hashes(task_dir: Path) -> dict[str, str]:
+    """sha256 of the files the verifier sandbox's /tests must equal: the task's tests/, minus its build context
+    (Dockerfile/.dockerignore), caches and packed inputs the image build unpacks."""
     tests = task_dir / "tests"
     return {"/tests/" + str(p.relative_to(tests)): hashlib.sha256(p.read_bytes()).hexdigest()
             for p in sorted(tests.rglob("*"))
-            if p.is_file() and "__pycache__" not in p.parts and p.name not in ("Dockerfile", ".dockerignore")}
+            if p.is_file() and "__pycache__" not in p.parts and p.name not in ("Dockerfile", ".dockerignore")
+            and not p.name.lower().endswith(PACKED_INPUT_SUFFIXES)}
 
 
 # A trial of a resumed run carries its own resume gate in its agent kwargs (the freeze of ITS fake proof, its parity
