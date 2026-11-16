@@ -161,7 +161,9 @@ class ContentParity(unittest.TestCase):
         def toolm(b):
             b["tools"][0] = {"name": "Bash", "description": "other"}
         def extra(b):
-            b["tools"].append({"name": "WebFetch"})
+            # WebFetch/WebSearch are always-sent tools the prompt snapshot never records (see
+            # proxy.resume_proxy.ALWAYS_SENT_TOOLS); any other unseen tool stays a difference.
+            b["tools"].append({"name": "CronList"})
         for m in (sysm, toolm, extra):
             self.assertTrue(proxy.check_content(self.rewritten(m), ref, []), m.__name__)
 

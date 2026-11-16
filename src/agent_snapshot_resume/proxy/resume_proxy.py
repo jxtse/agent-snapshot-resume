@@ -454,13 +454,20 @@ def system_digest(texts):
     return hashlib.sha256(json.dumps(list(texts), ensure_ascii=False).encode()).hexdigest()
 
 
+# Claude Code sends these tools on every request but never lists them in the prompt snapshot it persists
+# (`attachment.prompt_snapshot.tools`), so a reference built from that snapshot cannot contain them and a resumed
+# request is not "extra"-tooled by their presence. Everything else must be snapshotted, and the request's tool *count*
+# is still compared with the original request's (compare_parity n_tools), so this cannot hide a different toolset.
+ALWAYS_SENT_TOOLS = frozenset({"WebFetch", "WebSearch"})
+
+
 def check_content(body, ref, hints, notes=None):
     """Model-visible content of a rewritten request vs the reference built from the session prefix
     (agent_snapshot_resume.parity.content_reference). Returns a list of problems (empty = ok).
 
       system         sha256 of the system block texts == the prompt snapshot the agent persisted (if recorded)
       tools          every recorded tool present with the same name/description/input_schema; any other tool must
-                     be listed in extra_tools_allowed
+                     be listed in extra_tools_allowed or be one of ALWAYS_SENT_TOOLS
       messages       every reference block (session prefix after compaction rebuild) present in order, byte-identical
                      (a tool_result may carry an appended <system-reminder> suffix); every other block must be a
                      system-role message, an exact hint block, or user text that starts with a rendered-attachment
@@ -481,7 +488,7 @@ def check_content(body, ref, hints, notes=None):
         for name, dg in ref["tools"].items():
             if got.get(name) != dg:
                 problems.append(f"tool {name} missing or different")
-        allowed = set(ref.get("extra_tools_allowed") or [])
+        allowed = set(ref.get("extra_tools_allowed") or []) | ALWAYS_SENT_TOOLS
         extra = [n for n in got if n not in ref["tools"] and n not in allowed]
         if extra:
             problems.append(f"unexpected tools {extra}")
