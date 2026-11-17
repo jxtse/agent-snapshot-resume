@@ -219,17 +219,21 @@ def plan_with_observations(ir: dict[str, Any], k: int) -> dict[str, Any]:
     plan = trace_ir.replay_plan(ir, k)
     obs: dict[str, Any] = {}
     obs_line: dict[str, Any] = {}
+    interpretations: dict[str, Any] = {}
     for s in ir["steps"][:k]:
         for e in s["events"]:
             if e["type"] == "observation":
                 obs[e["call_id"]] = e["text"]
                 obs_line[e["call_id"]] = e.get("line")
+                interpretations[e["call_id"]] = e.get("return_code_interpretation")
     for sc in ir["sidechains"]:
         for c in sc["tool_calls"]:
             obs.setdefault(c["call_id"], c.get("observation_text"))
     for a in plan["actions"]:
         a["orig_text"] = obs.get(a["call_id"])
         a["obs_line"] = obs_line.get(a["call_id"])
+        if interpretations.get(a["call_id"]):
+            a["return_code_interpretation"] = interpretations[a["call_id"]]
         if a.get("side_effect") == "exec_background":
             for step in ir["steps"][:k]:
                 for event in step["events"]:

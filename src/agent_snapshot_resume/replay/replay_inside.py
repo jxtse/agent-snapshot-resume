@@ -22,8 +22,9 @@ Policy (per side-effect class):
               approximately. Flagged in report. Failed terminal jobs are bounded by their historical duration;
               known timeout/signal exits are reproduced, ordinary fast failures must actually recur.
               Jobs retained from a mid-run image have their cloned output writers stopped before a foreground rerun.
-  pacing      a replayed foreground command that leaves processes running (`nohup ... &`) keeps its process group
-              alive; while it is, later Bash actions wait until the original time gap since that command has elapsed
+  pacing      commands that leave processes running (`nohup ... &`) use file capture, avoiding inherited pipe
+              EOF waits. Track their isolated session, including process groups created by timeout. While any
+              member lives, later Bash/Read actions wait until the original time gap since launch has elapsed
               (capped by --exec-cap), so polls and log reads see a comparable progress point ("paced_wait_s"). If the
               wait cannot be kept (beyond the cap, or the action's original time is unknown), the action is marked
               "pacing_unmet" and the replay gate rejects the snapshot. A surviving job whose own original start time
@@ -103,36 +104,72 @@ def original_timeout(text):
 
 
 def run_bash(cmd, cwd, timeout, merge_stderr=False, termination_code=None, shell_env=None):
-    """merge_stderr: one pipe for both streams, in write order (how Claude Code captures a background task's
+    """merge_stderr: one capture file for both streams, in write order (how Claude Code captures a background task's
     output file); stderr is then empty."""
     t0 = time.time()
     if shell_env and shell_env.get("PATH"):
         import shlex
         cmd = "export PATH=" + shlex.quote(shell_env["PATH"]) + "; " + cmd
-    p = subprocess.Popen(["bash", "-lc", cmd], env=dict(os.environ, **(shell_env or {})), cwd=cwd if cwd and os.path.isdir(cwd) else None,
-                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
-                         start_new_session=True)
-    try:
-        stdout, stderr = p.communicate(timeout=timeout)
-        out = stdout.decode(errors="replace")
-        err = (stderr or b"").decode(errors="replace")
-        return {"rc": 128 - p.returncode if p.returncode < 0 else p.returncode, "stdout": out, "stderr": err, "dur": round(time.time() - t0, 2), "timeout": False,
-                "pgid": p.pid}
-    except subprocess.TimeoutExpired:
+    # Regular files decouple shell completion from EOF on inherited child descriptors.
+    # Do not rewrite shell syntax: redirects, heredocs, pipelines and $! retain their semantics.
+    import tempfile
+    with tempfile.TemporaryFile() as out_file, tempfile.TemporaryFile() as err_file:
+        p = subprocess.Popen(["bash", "-lc", cmd], env=dict(os.environ, **(shell_env or {})),
+                             cwd=cwd if cwd and os.path.isdir(cwd) else None,
+                             stdin=subprocess.DEVNULL, stdout=out_file,
+                             stderr=out_file if merge_stderr else err_file, start_new_session=True)
+        timed_out = False
         try:
-            os.killpg(p.pid, signal.SIGKILL if termination_code == 137 else
-                      signal.SIGTERM if termination_code in (None, 124, 143, 144) else signal.SIGTERM)
+            p.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            sig = signal.SIGKILL if termination_code == 137 else signal.SIGTERM
+            signal_session(p.pid, sig)
+            try:
+                p.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                signal_session(p.pid, signal.SIGKILL)
+                p.wait()
+            # A child in a separate group may survive after the shell exits on TERM.
+            signal_session(p.pid, signal.SIGKILL)
+        def read_capture(f):
+            # pread does not change the shared open-file offset used by surviving writers.
+            return os.pread(f.fileno(), os.fstat(f.fileno()).st_size, 0).decode(errors="replace")
+        rc = termination_code if timed_out else (128 - p.returncode if p.returncode < 0 else p.returncode)
+        return {"rc": rc, "stdout": read_capture(out_file), "stderr": "" if merge_stderr else read_capture(err_file),
+                "dur": round(time.time() - t0, 2), "timeout": timed_out and termination_code is None,
+                "termination_reproduced": timed_out and termination_code is not None, "pgid": p.pid}
+
+
+def session_groups(sid):
+    """Live groups within our isolated Linux session, including timeout-created groups.
+
+    GNU timeout creates a new process group without changing session. Zombies must not
+    keep pacing alive. Outside Linux, retain the original process-group fallback.
+    """
+    if not os.path.isdir("/proc/self"):
+        return None
+    groups = set()
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            with open("/proc/" + name + "/stat") as f:
+                fields = f.read().rsplit(")", 1)[1].split()
+            if int(fields[3]) == sid and fields[0] not in ("Z", "X"):
+                groups.add(int(fields[2]))
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+    return groups
+
+
+def signal_session(sid, sig):
+    groups = session_groups(sid)
+    for pgid in ({sid} if groups is None else groups | {sid}):
+        try:
+            os.killpg(pgid, sig)
         except ProcessLookupError:
             pass
-        try:
-            stdout, stderr = p.communicate(timeout=1)
-        except subprocess.TimeoutExpired:
-            os.killpg(p.pid, signal.SIGKILL)
-            stdout, stderr = p.communicate()
-        out = (stdout or b"").decode(errors="replace")
-        err = (stderr or b"").decode(errors="replace")
-        return {"rc": termination_code, "stdout": out, "stderr": err, "dur": round(time.time() - t0, 2),
-                "timeout": termination_code is None, "termination_reproduced": termination_code is not None}
 
 
 TIMING_SRC = re.compile(r"time\.time\(|perf_counter|time\.monotonic|process_time|timeit")
@@ -152,7 +189,10 @@ def scripts_measure_time(cmd, cwd):
 
 
 def group_alive(pgid):
-    """True while any process of the replayed command's process group (e.g. a `nohup ... &` child) is alive."""
+    """True while the isolated session has live members (group fallback outside Linux)."""
+    groups = session_groups(pgid)
+    if groups is not None:
+        return bool(groups)
     try:
         os.killpg(pgid, 0)
         return True
@@ -261,7 +301,7 @@ def main():
                "atif_step_id": a.get("atif_step_id"), "orig_is_error": a.get("is_error"),
                "orig_duration_s": a.get("duration_s")}
         rec["started_at"] = round(time.time(), 3)  # replay clock, for the gate's clock-provenance check
-        if live and not dry and tool == "Bash":
+        if live and not dry and tool in ("Bash", "Read"):
             w, met = pace_wait(live, a, cap)
             if w:
                 rec["paced_wait_s"] = w

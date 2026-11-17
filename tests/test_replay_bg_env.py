@@ -155,3 +155,68 @@ def test_snapshot_ownership_check_fails_without_proc(tmp_path, monkeypatch):
     monkeypatch.setattr(replay.os.path, 'isdir', lambda p: False)
     with pytest.raises(RuntimeError, match='cannot identify'):
         replay.stop_snapshot_background(bg(tmp_path, 'echo x'))
+
+
+def test_inherited_descriptors_do_not_timeout_launcher(tmp_path):
+    import signal
+    # The asynchronous AND-list shell inherits both capture fds despite its child's redirect.
+    r = replay.run_bash('true && sleep 5 >/dev/null 2>&1 & echo launched', str(tmp_path), .4)
+    try:
+        assert not r['timeout'] and r['rc'] == 0
+        assert r['stdout'].strip() == 'launched' and r['dur'] < 1
+        assert replay.group_alive(r['pgid'])
+    finally:
+        replay.signal_session(r['pgid'], signal.SIGKILL)
+
+
+def test_session_tracks_new_groups_and_ignores_zombies(tmp_path, monkeypatch):
+    import builtins
+    real_open = builtins.open
+    real_isdir = replay.os.path.isdir
+    # Linux stat fields: state, parent, process group, session. Names may contain ')'.
+    records = {'20': '20 (timeout) S 1 20 10 0',
+               '21': '21 (worker (x)) S 20 20 10 0',
+               '22': '22 (dead) Z 1 22 11 0',
+               '30': '30 (unrelated) S 1 30 30 0'}
+    for pid, value in records.items():
+        (tmp_path / pid).write_text(value)
+    monkeypatch.setattr(replay.os.path, 'isdir', lambda p: True if p == '/proc/self' else real_isdir(p))
+    monkeypatch.setattr(replay.os, 'listdir', lambda p: list(records))
+    monkeypatch.setattr(builtins, 'open', lambda p, *a, **kw: real_open(
+        tmp_path / p.split('/')[2] if str(p).startswith('/proc/') else p, *a, **kw))
+    assert replay.session_groups(10) == {20}
+    assert replay.group_alive(10)
+    assert not replay.group_alive(11)
+    killed = []
+    monkeypatch.setattr(replay.os, 'killpg', lambda pg, sig: killed.append(pg))
+    replay.signal_session(10, 9)
+    assert set(killed) == {10, 20}
+
+
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='Linux session/process-group integration')
+def test_regrouped_background_is_paced_before_read(tmp_path, monkeypatch):
+    import shlex
+    code = 'import os,time; os.setpgid(0,0); time.sleep(.5); open("ready","w").write("done")'
+    a = dict(call_id='launch', tool='Bash', side_effect='exec',
+             args={'command': shlex.quote(sys.executable) + ' -c ' + shlex.quote(code) + ' > job.log 2>&1 & sleep .1'},
+             timestamp='2026-01-01T00:00:00Z', orig_text='(Bash completed with no output)')
+    read = dict(call_id='read', tool='Bash', side_effect='exec', args={'command': 'cat ready'},
+                timestamp='2026-01-01T00:00:01Z', orig_text='done')
+    _, report = execute(tmp_path, monkeypatch, [a, read])
+    assert report['results'][0]['left_background_job']
+    assert report['results'][1]['paced_wait_s'] > 0
+    assert report['results'][1]['fidelity'] in ('exact', 'normalized')
+
+
+def test_recorded_no_match_requires_metadata_and_same_output():
+    a = dict(call_id='probe', tool='Bash', side_effect='exec', args={'command': 'grep x absent'},
+             orig_text='historical import failure', is_error=False,
+             return_code_interpretation='No matches found')
+    r = dict(call_id='probe', rc=1, status='ran', fidelity='differs',
+             stdout_full='historical import failure\n', stderr_full='')
+    for policy in ('strict', 'lenient'):
+        gate.validate_replay({'actions': [a]}, {'results': [dict(r)]}, 0, policy=policy)
+    for changed in (dict(r, stdout_full=''), dict(r, rc=2), dict(r, pacing_unmet=True),
+                    dict(r, status='timeout')):
+        assert not gate.recorded_no_match(a, changed)
+    assert not gate.recorded_no_match(dict(a, return_code_interpretation=None), r)

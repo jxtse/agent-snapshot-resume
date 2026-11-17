@@ -347,6 +347,16 @@ def background_failure_equivalent(action, result, results):
     return True
 
 
+def recorded_no_match(action, result):
+    """CC explicitly recorded grep's exit-1 convention; require unchanged complete output."""
+    return (action.get("tool") == "Bash" and action.get("side_effect") == "exec"
+            and action.get("return_code_interpretation") == "No matches found"
+            and not action.get("is_error") and result.get("status") == "ran"
+            and result.get("rc") == 1 and not result.get("pacing_unmet")
+            and action.get("orig_text") is not None
+            and str(action["orig_text"]).strip() == _replayed_text(dict(result, rc=0)).strip())
+
+
 def lenient_blocks(plan, report, rc, post_cut=None):
     """Blocking findings of the lenient policy: the three classes named in the module-level comment."""
     blocks = []
@@ -363,6 +373,9 @@ def lenient_blocks(plan, report, rc, post_cut=None):
             blocks.append({"rule": "identity_mismatch", "call_id": cid})
             continue
         se, orig_ok = action.get("side_effect"), not action.get("is_error")
+        if recorded_no_match(action, result):
+            result["fidelity"] = result["automatic_equivalence"] = "recorded_no_match"
+            continue
         if harness_path_only(action, result, plan.get("harness_owned_paths", HARNESS_PATHS)):
             result["fidelity"] = result["automatic_equivalence"] = "harness_path_only"
             continue
@@ -464,6 +477,9 @@ def validate_replay(plan, report, rc, reviewed_exceptions=None, policy="strict",
         if result.get('pacing_unmet'):
             raise RuntimeError('Replay could not keep the original pacing of a running background job: '
                                + action['call_id'])
+        if recorded_no_match(action, result):
+            result["fidelity"] = result["automatic_equivalence"] = "recorded_no_match"
+            continue
         if harness_path_only(action, result, plan.get("harness_owned_paths", HARNESS_PATHS)):
             result["fidelity"] = result["automatic_equivalence"] = "harness_path_only"
             continue
