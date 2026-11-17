@@ -327,34 +327,83 @@ def harness_path_only(action, result, paths=HARNESS_PATHS):
     return bool(tail and all(re.fullmatch(r"[\w. -]+", line) for line in tail.splitlines()))
 
 
-def background_failure_equivalent(action, result, results):
-    """A known terminal failure, with every later output consumer reproduced exactly."""
+def _numeric_background_read(action, result, producer):
+    """Lenient-only numeric drift in a direct read of this failed task's log."""
+    from .replay_inside import NO_OUTPUT, numfree
+    path = producer.get("background_output_file")
+    if not path or result.get("status") != "ran" or result.get("rc") not in (None, 0):
+        return False
+    if result.get("pacing_unmet") or result.get("stderr_full"):
+        return False
+    args = action.get("args") or {}
+    if action.get("tool") == "Read":
+        if args.get("file_path") != path:
+            return False
+    elif action.get("tool") == "Bash":
+        # Only literal log reads, optionally delayed or piped through head/tail.
+        reader = r"(?:cat|head(?: -[0-9]+)?|tail(?: -[0-9]+)?)"
+        command = args.get("command", "").strip()
+        pattern = (r"(?:sleep [0-9]+;\s*)?" + reader + r" " + re.escape(path)
+                   + r"(?: 2>/dev/null)?(?: \| (?:head|tail)(?: -[0-9]+)?)?")
+        if not re.fullmatch(pattern, command):
+            return False
+    else:
+        return False
+    old = action.get("orig_text")
+    if old is None or "stdout_full" not in result:
+        return False
+    new = result["stdout_full"]
+    # Foreground reproduction exposes the recorded terminal trailer to earlier polls.
+    trailer = r"\n?\[exited with code " + str(producer["bg_exit_code"]) + r"\]\s*$"
+    old = re.sub(trailer, "", old)
+    new = re.sub(trailer, "", new)
+    if old == NO_OUTPUT:
+        old = ""
+    return numfree(old) == numfree(new)
+
+
+def background_failure_reasons(action, result, results, *, actions=(), lenient=False):
+    """Explain each failed equivalence condition without hiding later consumer failures."""
+    reasons = []
     if action.get("bg_status") != "failed" or action.get("bg_exit_code") in (None, 0):
-        return False
+        reasons.append({"condition": "unknown_terminal_failure"})
     if result.get("status") != "ran" or result.get("rc") != action.get("bg_exit_code"):
-        return False
+        reasons.append({"condition": "terminal_outcome", "expected_rc": action.get("bg_exit_code"),
+                        "actual_rc": result.get("rc"), "status": result.get("status")})
     if "bg_original_output" in action:
         from .replay_inside import numfree
         original = numfree(re.sub(r"\n?\[exited with code \d+\]\s*$", "", action["bg_original_output"]))
         actual = numfree(result.get("stdout_full", "") + result.get("stderr_full", ""))
         if bool(original) != bool(actual) or not (original.startswith(actual) or actual.startswith(original)):
-            return False
+            reasons.append({"condition": "output_prefix"})
     by_id = {r.get("call_id"): r for r in results}
+    action_by_id = {a.get("call_id"): a for a in actions}
     for cid in action.get("bg_output_read_later") or []:
         read = by_id.get(cid)
-        if not read or read.get("fidelity") not in ("exact", "normalized"):
-            return False
-    return True
+        if read and read.get("fidelity") in ("exact", "normalized"):
+            continue
+        if (lenient and read and action.get("bg_exit_code") in (124, 137, 143, 144)
+                and _numeric_background_read(action_by_id.get(cid, {}), read, action)):
+            continue
+        reasons.append({"condition": "consumer_not_exact", "call_id": cid,
+                        "fidelity": (read or {}).get("fidelity")})
+    return reasons
 
 
-def recorded_no_match(action, result):
+def background_failure_equivalent(action, result, results, *, actions=(), lenient=False):
+    return not background_failure_reasons(action, result, results, actions=actions, lenient=lenient)
+
+
+def recorded_no_match(action, result, *, lenient=False):
     """CC explicitly recorded grep's exit-1 convention; require unchanged complete output."""
+    from .replay_inside import numfree
+    same = numfree if lenient else lambda text: str(text).strip()
     return (action.get("tool") == "Bash" and action.get("side_effect") == "exec"
             and action.get("return_code_interpretation") == "No matches found"
             and not action.get("is_error") and result.get("status") == "ran"
             and result.get("rc") == 1 and not result.get("pacing_unmet")
             and action.get("orig_text") is not None
-            and str(action["orig_text"]).strip() == _replayed_text(dict(result, rc=0)).strip())
+            and same(action["orig_text"]) == same(_replayed_text(dict(result, rc=0))))
 
 
 def lenient_blocks(plan, report, rc, post_cut=None):
@@ -373,7 +422,7 @@ def lenient_blocks(plan, report, rc, post_cut=None):
             blocks.append({"rule": "identity_mismatch", "call_id": cid})
             continue
         se, orig_ok = action.get("side_effect"), not action.get("is_error")
-        if recorded_no_match(action, result):
+        if recorded_no_match(action, result, lenient=True):
             result["fidelity"] = result["automatic_equivalence"] = "recorded_no_match"
             continue
         if harness_path_only(action, result, plan.get("harness_owned_paths", HARNESS_PATHS)):
@@ -382,8 +431,9 @@ def lenient_blocks(plan, report, rc, post_cut=None):
         if se == "exec_background":
             orig_ok = action.get("bg_status") == "completed"
             if action.get("bg_status") == "failed":
-                if not background_failure_equivalent(action, result, results):
-                    blocks.append({"rule": "background_failure_changed", "call_id": cid})
+                reasons = background_failure_reasons(action, result, results, actions=actions, lenient=True)
+                if reasons:
+                    blocks.append({"rule": "background_failure_changed", "call_id": cid, "conditions": reasons})
                 else:
                     result["automatic_equivalence"] = result["fidelity"] = (
                         "bg_termination_reproduced" if action.get("bg_exit_code") in (124, 137, 143, 144)

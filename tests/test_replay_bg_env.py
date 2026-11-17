@@ -220,3 +220,37 @@ def test_recorded_no_match_requires_metadata_and_same_output():
                     dict(r, status='timeout')):
         assert not gate.recorded_no_match(a, changed)
     assert not gate.recorded_no_match(dict(a, return_code_interpretation=None), r)
+
+
+def test_lenient_no_match_numeric_drift_only():
+    a = dict(call_id='grep', tool='Bash', side_effect='exec', is_error=False,
+             return_code_interpretation='No matches found', orig_text='STATUS optimal time 25.25\n===')
+    r = dict(call_id='grep', status='ran', rc=1, stdout_full='STATUS optimal time 25.17\n===', stderr_full='')
+    assert gate.recorded_no_match(a, r, lenient=True)
+    assert not gate.recorded_no_match(a, r)
+    assert not gate.recorded_no_match(a, dict(r, stdout_full='STATUS failed time 25.17\n==='), lenient=True)
+    assert not gate.recorded_no_match(a, dict(r, pacing_unmet=True), lenient=True)
+    assert not gate.recorded_no_match(dict(a, return_code_interpretation=None), r, lenient=True)
+
+
+def test_lenient_failed_log_read_and_diagnostics(tmp_path):
+    a = bg(tmp_path, 'job')
+    a['bg_output_read_later'] = ['reader']
+    reader = dict(call_id='reader', tool='Bash', args={'command': 'sleep 20; cat ' + a['background_output_file']},
+                  orig_text='iteration 1 loss 2.0')
+    r = dict(call_id='job', status='ran', rc=124)
+    read = dict(call_id='reader', status='ran', rc=0, fidelity='differs',
+                stdout_full='iteration 1 loss 2.1\n[exited with code 124]\n', stderr_full='')
+    def reasons(rd=read, ac=reader, job=r):
+        return gate.background_failure_reasons(a, job, [rd], actions=[ac], lenient=True)
+    assert not reasons()
+    assert not gate.background_failure_equivalent(a, r, [read])  # strict unchanged
+    assert reasons(dict(read, stdout_full='iteration 1 loss 2.1\niteration 2 loss 1.0'))
+    assert reasons(dict(read, stdout_full='Traceback: failed'))
+    assert reasons(dict(read, pacing_unmet=True))
+    assert reasons(dict(read, rc=1))
+    assert reasons(ac=dict(reader, args={'command': 'cat /app/final.npy'}))
+    assert reasons(ac=dict(reader, args={'command': reader['args']['command'] + '; touch final'}))
+    assert reasons(job=dict(r, rc=0))[0]['condition'] == 'terminal_outcome'
+    a['bg_original_output'] = 'different failure'
+    assert reasons()[0]['condition'] == 'output_prefix'
