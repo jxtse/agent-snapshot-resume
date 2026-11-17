@@ -129,10 +129,11 @@ def replay_plan(ir, k_index, include_read_only=False):
         for e in st["events"]:
             if e["type"] == "attachment" and e.get("bg_task_id"):
                 done[e["bg_task_id"]] = {"status": e.get("bg_status"), "timestamp": e.get("timestamp"),
-                                         "exit_code": e.get("bg_exit_code")}
+                                         "exit_code": e.get("bg_exit_code"), "line": e.get("line")}
     for a in actions:
         if a.get("background_task_id"):
             info = done.get(a["background_task_id"])
+            a["bg_finished_line"] = info.get("line") if info else None
             a["bg_finished_before_k"] = bool(info)
             a["bg_status"] = info["status"] if info else None
             a["bg_finished_ts"] = info["timestamp"] if info else None
@@ -155,9 +156,9 @@ def replay_plan(ir, k_index, include_read_only=False):
     for st in ir["steps"][:k]:
         for e in st["events"]:
             if (e["type"] == "tool_call" and e["call_id"] in want and e["call_id"] not in have
-                    and e["tool"] == "Bash" and e["side_effect"] == "read_only"):
+                    and e["tool"] in ("Bash", "Read") and e["side_effect"] == "read_only"):
                 actions.append({"origin": "main", "atif_step_id": st["atif_step_id"], "step_index": st["index"],
-                                "call_id": e["call_id"], "tool": e["tool"], "side_effect": "exec",
+                                "call_id": e["call_id"], "tool": e["tool"], "side_effect": "exec" if e["tool"] == "Bash" else "read_only",
                                 "args": e["args"], "timestamp": e["timestamp"], "duration_s": e.get("duration_s"),
                                 "is_error": e.get("is_error"), "background_task_id": None,
                                 "background_output_file": None, "cwd": e.get("cwd"), "auto_backgrounded": False,

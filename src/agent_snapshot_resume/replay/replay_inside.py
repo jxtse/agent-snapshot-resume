@@ -12,14 +12,16 @@ Policy (per side-effect class):
   file_write  Write: write args.content exactly (mkdir -p parents).  Edit: apply old_string->new_string exactly
               (replace_all honoured); NotebookEdit: skipped+flagged. Originally-failed edits (is_error) are replayed
               too and must fail again (fidelity: 'error_reproduced').
-  exec        Bash (foreground): `bash -c` in the original cwd with timeout = max(60, 2*orig_duration+30), capped
+  exec        Bash (foreground): `bash -lc` in the original cwd with timeout = max(60, 2*orig_duration+30), capped
               by --exec-cap. Output compared with the original observation (exact / normalized-whitespace /
               numeric-tolerant / differs).
   exec_background  Bash run_in_background or auto-backgrounded: executed in the foreground with
               timeout = max(60, 2*orig_runtime+30) when the original task finished before step k (its outputs feed
               the prefix; the output file gets the agent's completion trailer, plan "bg_output_trailer"); if it was
               still running at step k, it is started detached (nohup) and left running, matching the original state
-              approximately. Flagged in report.
+              approximately. Flagged in report. Failed terminal jobs are bounded by their historical duration;
+              known timeout/signal exits are reproduced, ordinary fast failures must actually recur.
+              Jobs retained from a mid-run image have their cloned output writers stopped before a foreground rerun.
   pacing      a replayed foreground command that leaves processes running (`nohup ... &`) keeps its process group
               alive; while it is, later Bash actions wait until the original time gap since that command has elapsed
               (capped by --exec-cap), so polls and log reads see a comparable progress point ("paced_wait_s"). If the
@@ -100,22 +102,26 @@ def original_timeout(text):
     return int(match[1]) * 60 + int(match[2]) if match else None
 
 
-def run_bash(cmd, cwd, timeout, merge_stderr=False):
+def run_bash(cmd, cwd, timeout, merge_stderr=False, termination_code=None, shell_env=None):
     """merge_stderr: one pipe for both streams, in write order (how Claude Code captures a background task's
     output file); stderr is then empty."""
     t0 = time.time()
-    p = subprocess.Popen(["bash", "-c", cmd], cwd=cwd if cwd and os.path.isdir(cwd) else None,
+    if shell_env and shell_env.get("PATH"):
+        import shlex
+        cmd = "export PATH=" + shlex.quote(shell_env["PATH"]) + "; " + cmd
+    p = subprocess.Popen(["bash", "-lc", cmd], env=dict(os.environ, **(shell_env or {})), cwd=cwd if cwd and os.path.isdir(cwd) else None,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
                          start_new_session=True)
     try:
         stdout, stderr = p.communicate(timeout=timeout)
         out = stdout.decode(errors="replace")
         err = (stderr or b"").decode(errors="replace")
-        return {"rc": p.returncode, "stdout": out, "stderr": err, "dur": round(time.time() - t0, 2), "timeout": False,
+        return {"rc": 128 - p.returncode if p.returncode < 0 else p.returncode, "stdout": out, "stderr": err, "dur": round(time.time() - t0, 2), "timeout": False,
                 "pgid": p.pid}
     except subprocess.TimeoutExpired:
         try:
-            os.killpg(p.pid, signal.SIGTERM)
+            os.killpg(p.pid, signal.SIGKILL if termination_code == 137 else
+                      signal.SIGTERM if termination_code in (None, 124, 143, 144) else signal.SIGTERM)
         except ProcessLookupError:
             pass
         try:
@@ -125,7 +131,8 @@ def run_bash(cmd, cwd, timeout, merge_stderr=False):
             stdout, stderr = p.communicate()
         out = (stdout or b"").decode(errors="replace")
         err = (stderr or b"").decode(errors="replace")
-        return {"rc": None, "stdout": out, "stderr": err, "dur": round(time.time() - t0, 2), "timeout": True}
+        return {"rc": termination_code, "stdout": out, "stderr": err, "dur": round(time.time() - t0, 2),
+                "timeout": termination_code is None, "termination_reproduced": termination_code is not None}
 
 
 TIMING_SRC = re.compile(r"time\.time\(|perf_counter|time\.monotonic|process_time|timeit")
@@ -192,6 +199,49 @@ def cc_bash_text(r):
     return out or err
 
 
+def stop_snapshot_background(action):
+    """Stop cloned writers identified by the exact CC output fd before rerunning the action.
+
+    The source cleanup stops CC itself, so its completion trailer cannot be relied upon. Linux /proc is
+    required here: never silently duplicate a job when process ownership cannot be checked.
+    """
+    import glob
+    if not os.path.isdir("/proc/self/fd") or not action.get("background_output_file"):
+        raise RuntimeError("cannot identify cloned background writers")
+    path = action["background_output_file"]
+    groups = set()
+    for fd in glob.glob("/proc/[0-9]*/fd/*"):
+        try:
+            if os.readlink(fd) == path:
+                pgid = os.getpgid(int(fd.split("/")[2]))
+                if pgid == os.getpgrp():
+                    raise RuntimeError("background writer shares replayer process group")
+                groups.add(pgid)
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+    for pgid in groups:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    # All fd holders must stop before the output is replaced. Zombies hold no fds.
+    deadline = time.monotonic() + 5
+    while groups:
+        holders = []
+        for fd in glob.glob("/proc/[0-9]*/fd/*"):
+            try:
+                if os.readlink(fd) == path:
+                    holders.append(fd)
+            except (FileNotFoundError, ProcessLookupError):
+                pass
+        if not holders:
+            break
+        if time.monotonic() >= deadline:
+            raise RuntimeError("cloned background writers did not stop")
+        time.sleep(0.05)
+    return sorted(groups)
+
+
 def main():
     plan_p, rep_p = sys.argv[1], sys.argv[2]
     cap = 1800
@@ -253,6 +303,19 @@ def main():
                         open(fp, "w", encoding="utf-8").write(txt)
                         rec["status"] = "applied"
                         rec["fidelity"] = "exact"
+            elif tool == "Read" and a.get("evidence_read_for"):
+                with open(args["file_path"], encoding="utf-8", errors="replace") as f:
+                    lines = f.read().splitlines()
+                original = a.get("orig_text") or ""
+                rows = list(re.finditer(r"(?m)^(\s*(\d+)[→\t])(.*)$", original))
+                if not rows:
+                    raise RuntimeError("unsupported background Read rendering")
+                def render(match):
+                    index = int(match[2]) - 1
+                    return match[1] + (lines[index] if index < len(lines) else "<missing line>")
+                actual = re.sub(r"(?m)^(\s*(\d+)[→\t])(.*)$", render, original)
+                rec.update(status="read", fidelity=compare(original, actual), stdout_full=actual,
+                           stderr_full="", orig_full=original)
             elif tool == "Bash" and se in ("exec", "exec_background"):
                 cmd = args.get("command", "")
                 cwd = a.get("cwd") or shell_cwd
@@ -264,15 +327,30 @@ def main():
                     rec["fidelity"] = "bg_running_at_k"
                 else:
                     od = a.get("bg_duration_s") if se == "exec_background" else a.get("duration_s")
-                    orig_to = original_timeout(a.get("orig_text"))
+                    orig_to = original_timeout(a.get("orig_text")) if se == "exec" else None
+                    termination_code = None
+                    failed_bg = se == "exec_background" and a.get("bg_status") == "failed"
+                    if failed_bg and od is not None and a.get("bg_exit_code") in (124, 137, 143, 144):
+                        termination_code = a["bg_exit_code"]
                     if orig_to:  # original hit CC's Bash timeout: reproduce the same cut-off (state = partial run)
                         to = orig_to
                         rec["orig_timed_out"] = True
                     else:
                         to = int(min(cap, max(60, 2 * (od or 0) + 30)))
+                    if failed_bg and od is not None:
+                        to = min(cap, max(0.1, od + 0.25))
+                    if termination_code and to < od:
+                        termination_code = None  # the execution cap cannot masquerade as the historical kill
                     if scripts_measure_time(cmd, cwd):
                         rec["scripts_measure_time"] = True
-                    r = run_bash(cmd, cwd, to, merge_stderr=(se == "exec_background"))
+                    if a.get("bg_inflight_at_snapshot"):
+                        rec["snapshot_background_groups_stopped"] = stop_snapshot_background(a)
+                        rec["background_resume"] = "rerun_from_snapshot"
+                    r = run_bash(cmd, cwd, to, merge_stderr=(se == "exec_background"),
+                                 termination_code=termination_code, shell_env=plan.get("shell_env"))
+                    rec["shell_environment"] = "captured_path" if plan.get("shell_env") else "login_shell"
+                    if r.get("termination_reproduced"):
+                        rec["termination_reproduced"] = True
                     rec.update({"status": "timeout" if r["timeout"] else "ran", "rc": r["rc"], "dur_s": r["dur"],
                                 "timeout_s": to})
                     if not r["timeout"] and r.get("pgid") and group_alive(r["pgid"]):
@@ -291,6 +369,8 @@ def main():
                             rec["new_head"] = new[:400]
                     else:
                         rec["fidelity"] = "bg_rerun_foreground"
+                        if failed_bg and r["rc"] == a.get("bg_exit_code"):
+                            rec["fidelity"] = "bg_termination_reproduced" if termination_code else "bg_failure_reproduced"
                         output = a.get("background_output_file")
                         if output:
                             os.makedirs(os.path.dirname(output), exist_ok=True)

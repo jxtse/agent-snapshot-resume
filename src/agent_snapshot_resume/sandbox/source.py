@@ -111,14 +111,14 @@ def _write_in_parts(sbx, remote: str, data: bytes, part: int = 8 * 1024 * 1024) 
         raise RuntimeError(f"part upload of {remote} produced an empty file")
 
 
-def dispatch_replay(sbx, cwd: str, exec_cap: int) -> int:
+def dispatch_replay(sbx, cwd: str, exec_cap: int, replay_deadline_s: int = REPLAY_DEADLINE_S) -> int:
     """Start the replay exactly once in SDK background mode; completion is signalled by an atomic rc file.
 
     The replay runs in a LOGIN shell, as the original agent's shell did (Harbor's task healthcheck installs the
     task's environment through /etc/profile.d/*.sh). A plain `bash -c` inherits only the image's ENV PATH, whose
     first entry is typically the base conda environment, so a task whose image selects another env replays with the
     wrong interpreter (e.g. /opt/conda/bin/python3 without numpy instead of /opt/conda/envs/stereo/bin/python3)."""
-    command = (f'cd {shlex.quote(cwd)} && timeout -s TERM -k 10s {REPLAY_DEADLINE_S}s '
+    command = (f'cd {shlex.quote(cwd)} && timeout -s TERM -k 10s {int(replay_deadline_s)}s '
                f'python3 {REPLAY_DIR}/replay_inside.py {REPLAY_DIR}/plan.json '
                f'{REPLAY_DIR}/replay_report.json --exec-cap {int(exec_cap)} '
                f'> {REPLAY_DIR}/replay_stdout.log 2>&1; rc=$?; '
@@ -238,7 +238,11 @@ def kill_source(sbx, attempts: int = 30, delay_s: float = 10.0) -> None:
 def prepare_source(*, adapter, task_dir: Path, bundle: Path, template: str, tag: str, state_dir: Path,
                    version: str | None = None, exec_cap: int = 1800, expected_fingerprint: str | None = None,
                    retain_on_gate_failure: bool = False, sandbox_timeout_s: int = 4 * 3600,
-                   base_snapshot: str | None = None, replay_policy: str = "strict") -> dict[str, Any]:
+                   base_snapshot: str | None = None, replay_policy: str = "strict",
+                   replay_deadline_s: int = REPLAY_DEADLINE_S) -> dict[str, Any]:
+    if replay_deadline_s <= 0:
+        raise ValueError("replay_deadline_s must be positive")
+    sandbox_timeout_s = max(sandbox_timeout_s, replay_deadline_s + 3600)
     Sandbox = _sandbox_cls()
     state_dir.mkdir(parents=True, exist_ok=True)
     out = state_dir / f"snapshot-{tag}.json"
@@ -256,7 +260,7 @@ def prepare_source(*, adapter, task_dir: Path, bundle: Path, template: str, tag:
                            "run_id": meta["run_id"], "resume_atif_step": meta["resume_atif_step"],
                            "cut_identity": snapshot_cut_identity(bundle),
                            "agent": adapter.name, "agent_version": version, "owner": owner,
-                           "replay_policy": replay_policy, "steps": []}
+                           "replay_policy": replay_policy, "replay_deadline_s": replay_deadline_s, "steps": []}
 
     def save():
         out.write_text(json.dumps(rec, indent=1, ensure_ascii=False) + "\n")
@@ -387,14 +391,14 @@ print(json.dumps({"killed": killed}))
             run(sbx, f"mkdir -p /logs/agent/sessions/projects/{slug}")
             _write_in_parts(sbx, sess_path, transcript_prefix(meta, bundle))
         cwd = meta.get("cwd") or "/app"
-        rec["replay_pid"] = dispatch_replay(sbx, cwd, exec_cap)
+        rec["replay_pid"] = dispatch_replay(sbx, cwd, exec_cap, replay_deadline_s)
         step("replay_dispatched_once", t, pid=rec["replay_pid"])
         while True:
             time.sleep(15)
             r = run(sbx, f"cat {REPLAY_DIR}/rc 2>/dev/null || true", timeout=60)
             if r.stdout.strip():
                 break
-            if time.time() - t > REPLAY_DEADLINE_S + 120:
+            if time.time() - t > replay_deadline_s + 120:
                 rec["source_retained_for_audit"] = True
                 save()
                 raise TimeoutError("replay completion not observed; finish later with --continue (never redispatch)")

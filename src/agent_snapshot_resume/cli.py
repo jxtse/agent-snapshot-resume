@@ -103,7 +103,7 @@ def cmd_prepare_snapshot(a):
                                     template=template, tag=a.tag, state_dir=Path(a.state_dir), version=a.version,
                                     exec_cap=a.exec_cap, expected_fingerprint=a.expected_fingerprint,
                                     retain_on_gate_failure=a.retain_on_gate_failure, base_snapshot=base,
-                                    replay_policy=a.replay_policy)
+                                    replay_policy=a.replay_policy, replay_deadline_s=a.replay_deadline_s)
     print(json.dumps({k: rec.get(k) for k in ("snapshot_id", "fingerprint_source", "replay_gate_passed",
                                               "base_snapshot")}))
     return 0 if rec.get("snapshot_id") else 1
@@ -193,7 +193,7 @@ def cmd_batch(a):
               prep_concurrency=a.prep_concurrency,
               launch_concurrency=a.launch_concurrency, only=a.only.split(",") if a.only else None,
               agent=a.agent, verifier=not a.no_verifier, replay_policy=a.replay_policy,
-              cost_alarm_usd=a.cost_alarm_usd)
+              cost_alarm_usd=a.cost_alarm_usd, replay_deadline_s=a.replay_deadline_s)
     if a.mode == "status":
         rows = b.status()
         if a.json:
@@ -365,6 +365,7 @@ def build_parser():
     p.add_argument("--agent", default="claude-code")
     p.add_argument("--version", help="agent version (default: adapter's pinned version)")
     p.add_argument("--state-dir", default="state")
+    p.add_argument("--replay-deadline-s", type=int, default=10800)
     p.add_argument("--exec-cap", type=int, default=1800, help="max seconds per replayed command")
     p.add_argument("--expected-fingerprint")
     p.add_argument("--retain-on-gate-failure", action="store_true")
@@ -451,6 +452,7 @@ def build_parser():
     p.add_argument("--prep-concurrency", type=int, default=6)
     p.add_argument("--launch-concurrency", type=int, default=20)
     p.add_argument("--only", help="comma-separated task names")
+    p.add_argument("--replay-deadline-s", type=int, default=10800)
     p.add_argument("--replay-policy", choices=["strict", "lenient"], default="strict")
     p.add_argument("--cost-alarm-usd", type=float, default=100.0,
                    help="status flags (never kills) a run whose cost_usd exceeds this")

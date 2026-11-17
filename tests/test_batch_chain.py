@@ -78,6 +78,7 @@ def test_stage_snapshot_starts_from_the_chained_base_snapshot(tmp_path, monkeypa
     from agent_snapshot_resume.sandbox import source
 
     b = make_batch(tmp_path)
+    b.replay_deadline_s = 20000
     ud, trial, row = chained_unit(tmp_path)
     bdir = ud / "bundles" / "t-s900-hint"
     bdir.mkdir(parents=True, exist_ok=True)
@@ -93,6 +94,7 @@ def test_stage_snapshot_starts_from_the_chained_base_snapshot(tmp_path, monkeypa
     b.stage_snapshot(row, row["cut_line"], bundled, "tmpl")
     assert seen["base_snapshot"] == "snap-1"
     assert seen["replay_policy"] == "lenient"
+    assert seen["replay_deadline_s"] == 20000
 
 
 def test_chain_spec_must_name_a_trial_and_a_snapshot(tmp_path, monkeypatch):

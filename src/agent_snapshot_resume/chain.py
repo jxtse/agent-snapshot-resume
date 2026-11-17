@@ -280,12 +280,19 @@ def tail_actions(actions: list[dict[str, Any]], session_line: int) -> list[dict[
     `session_line` is a *count* (the image holds lines 0..session_line-1) while `obs_line` is a 0-based index, so an
     observation at index == session_line is not in the image and must be replayed. An action's effect is complete
     once its observation is written, so every action observed before that line is in the snapshot's filesystem.
+    Background dispatch observations do not imply completion: retain jobs with completion at/after the base
+    (or unknown completion) for a foreground rerun after stopping cloned writers.
     Actions without a line (sub-agent calls) are replayed.
     """
     out = []
     for a in actions:
         line = a.get("obs_line")
-        if line is None or int(line) >= int(session_line):
+        if (a.get("side_effect") == "exec_background" and line is not None
+                and int(line) < int(session_line)
+                and (a.get("bg_finished_line") is None or int(a["bg_finished_line"]) >= int(session_line))):
+            a = dict(a, bg_inflight_at_snapshot=True)
+            out.append(a)
+        elif line is None or int(line) >= int(session_line):
             out.append(a)
     return out
 
