@@ -141,6 +141,10 @@ def content_reference(session_lines: list[dict[str, Any]], templates: list[str] 
             if isinstance(body, str) and body in leaves:
                 item["content_leaf"] = leaves.index(body)  # the file text rendered under its Read header
             attachments.append(item)
+            # The structured payload alone cannot explain all CC renderings (e.g.
+            # truncated background commands). Preserve the persisted renderer output.
+            item["rendered_texts"] = [r["content"] for r in d.get("rendered") or []
+                                      if isinstance(r.get("content"), str)]
     # `isMeta` user records are not part of blocks_from_session (they are not conversation turns), but Claude Code
     # does send them: e.g. the "[Your previous response had no visible output...]" nudge it writes after a turn with
     # no visible text. They are model-visible context, so the reference tolerates them once each instead of calling
