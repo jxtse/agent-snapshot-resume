@@ -366,6 +366,15 @@ class Batch:
             rec = json.loads(out.read_text())
             # a snapshot accepted under another policy was not gated the way this batch gates: never reuse it silently
             same_policy = (rec.get("replay_policy") or "strict") == self.replay_policy
+            # a snapshot replayed from a different plan (e.g. the bundle was rebuilt) restores a different state
+            hinted_dir = ((bundled.get("bundles") or {}).get("hinted") or {}).get("dir")
+            if rec.get("replay_gate_passed") and rec.get("snapshot_id") and hinted_dir and rec.get("cut_identity"):
+                from .bundle import cut_identity_diff, snapshot_cut_identity
+                if cut_identity_diff(snapshot_cut_identity(Path(hinted_dir)), rec["cut_identity"]):
+                    attempt += 1
+                    out.rename(out.with_name(out.name + f".plan-changed-{attempt}"))
+                    tag = f"{base_tag}-r{attempt}"
+                    continue
             if rec.get("replay_gate_passed") and rec.get("snapshot_id") and same_policy:
                 return rec
             if rec.get("replay_gate_passed") and rec.get("snapshot_id"):

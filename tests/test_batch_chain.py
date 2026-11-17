@@ -103,3 +103,35 @@ def test_chain_spec_must_name_a_trial_and_a_snapshot(tmp_path, monkeypatch):
     (ud / "chain.json").write_text(json.dumps({"trial_dir": str(trial)}))
     with pytest.raises(RuntimeError, match="needs trial_dir and base_snapshot"):
         b.stage_bundles(row, row["cut_line"])
+
+
+def test_snapshot_from_other_plan_is_not_reused(tmp_path, monkeypatch):
+    """A gate-passed snapshot whose cut identity differs from the rebuilt bundle gets a fresh tag."""
+    import json
+    from pathlib import Path
+    from agent_snapshot_resume import batch as batch_mod, bundle as bundle_mod
+
+    state = tmp_path / "state"; state.mkdir()
+    (state / "snapshot-t-s10.json").write_text(json.dumps({
+        "replay_gate_passed": True, "snapshot_id": "old", "replay_policy": "lenient",
+        "cut_identity": {"plan_sha256": "aaa"}}))
+    b = batch_mod.Batch.__new__(batch_mod.Batch)
+    b.state_dir, b.replay_policy = state, "lenient"
+    monkeypatch.setattr(bundle_mod, "snapshot_cut_identity", lambda d: {"plan_sha256": "bbb"})
+    monkeypatch.setattr(bundle_mod, "cut_identity_diff", lambda m, t: ["plan_sha256"] if m != t else [])
+    seen = {}
+
+    class Stop(Exception):
+        pass
+
+    def fake_prepare(**kw):
+        seen.update(kw)
+        raise Stop()
+    from agent_snapshot_resume.sandbox import source
+    monkeypatch.setattr(source, "prepare_source", fake_prepare, raising=False)
+    try:
+        b.stage_snapshot({"task": "t"}, 10, {"bundles": {"hinted": {"dir": str(tmp_path)}}}, tmpl_id="x")
+    except Exception:
+        pass
+    assert not (state / "snapshot-t-s10.json").exists()
+    assert (state / "snapshot-t-s10.json.plan-changed-1").exists()
