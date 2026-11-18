@@ -289,6 +289,123 @@ def lenient_divergence(action, result):
     return entry
 
 
+HARNESS_PATHS = ("/opt/tbs-proxy", "/opt/asr-proxy", "/logs/agent", "/tmp/.asr-resume")
+
+
+def harness_path_only(action, result, paths=HARNESS_PATHS):
+    """Only a terminal literal ls of a harness directory may disappear; preceding output is unchanged."""
+    import shlex
+    command = (action.get("args") or {}).get("command", "")
+    clean = re.sub(r"2>\s*/dev/null", "", command)
+    if re.search(r"[<>$`&()\n]", clean) or WRITES.search(clean):
+        return False
+    parts = clean.split(";")
+    try:
+        last = shlex.split(parts[-1])
+        if len(last) != 2 or last[0] != "ls" or last[1] not in paths:
+            return False
+        marker = shlex.split(parts[-2]) if len(parts) > 1 else []
+        if len(marker) != 2 or marker[0] != "echo" or not marker[1]:
+            return False
+        for part in parts[:-1]:
+            for stage in part.split("|"):
+                tokens = shlex.split(stage)
+                if not tokens or not (tokens[0] in ("echo", "head") or tokens[:2] == ["pip", "list"]):
+                    return False
+    except ValueError:
+        return False
+    if result.get("rc") != 2 or result.get("status") != "ran":
+        return False
+    err = result.get("stderr_full", "").strip()
+    if err and err != "ls: cannot access '" + last[1] + "': No such file or directory":
+        return False
+    old = (action.get("orig_text") or "").strip()
+    new = result.get("stdout_full", "").strip()
+    if not new.endswith("\n" + marker[1]) or not old.startswith(new + "\n"):
+        return False
+    tail = old[len(new):].strip()
+    return bool(tail and all(re.fullmatch(r"[\w. -]+", line) for line in tail.splitlines()))
+
+
+def _numeric_background_read(action, result, producer):
+    """Lenient-only numeric drift in a direct read of this failed task's log."""
+    from .replay_inside import NO_OUTPUT, numfree
+    path = producer.get("background_output_file")
+    if not path or result.get("status") != "ran" or result.get("rc") not in (None, 0):
+        return False
+    if result.get("pacing_unmet") or result.get("stderr_full"):
+        return False
+    args = action.get("args") or {}
+    if action.get("tool") == "Read":
+        if args.get("file_path") != path:
+            return False
+    elif action.get("tool") == "Bash":
+        # Only literal log reads, optionally delayed or piped through head/tail.
+        reader = r"(?:cat|head(?: -[0-9]+)?|tail(?: -[0-9]+)?)"
+        command = args.get("command", "").strip()
+        pattern = (r"(?:sleep [0-9]+;\s*)?" + reader + r" " + re.escape(path)
+                   + r"(?: 2>/dev/null)?(?: \| (?:head|tail)(?: -[0-9]+)?)?")
+        if not re.fullmatch(pattern, command):
+            return False
+    else:
+        return False
+    old = action.get("orig_text")
+    if old is None or "stdout_full" not in result:
+        return False
+    new = result["stdout_full"]
+    # Foreground reproduction exposes the recorded terminal trailer to earlier polls.
+    trailer = r"\n?\[exited with code " + str(producer["bg_exit_code"]) + r"\]\s*$"
+    old = re.sub(trailer, "", old)
+    new = re.sub(trailer, "", new)
+    if old == NO_OUTPUT:
+        old = ""
+    return numfree(old) == numfree(new)
+
+
+def background_failure_reasons(action, result, results, *, actions=(), lenient=False):
+    """Explain each failed equivalence condition without hiding later consumer failures."""
+    reasons = []
+    if action.get("bg_status") != "failed" or action.get("bg_exit_code") in (None, 0):
+        reasons.append({"condition": "unknown_terminal_failure"})
+    if result.get("status") != "ran" or result.get("rc") != action.get("bg_exit_code"):
+        reasons.append({"condition": "terminal_outcome", "expected_rc": action.get("bg_exit_code"),
+                        "actual_rc": result.get("rc"), "status": result.get("status")})
+    if "bg_original_output" in action:
+        from .replay_inside import numfree
+        original = numfree(re.sub(r"\n?\[exited with code \d+\]\s*$", "", action["bg_original_output"]))
+        actual = numfree(result.get("stdout_full", "") + result.get("stderr_full", ""))
+        if bool(original) != bool(actual) or not (original.startswith(actual) or actual.startswith(original)):
+            reasons.append({"condition": "output_prefix"})
+    by_id = {r.get("call_id"): r for r in results}
+    action_by_id = {a.get("call_id"): a for a in actions}
+    for cid in action.get("bg_output_read_later") or []:
+        read = by_id.get(cid)
+        if read and read.get("fidelity") in ("exact", "normalized"):
+            continue
+        if (lenient and read and action.get("bg_exit_code") in (124, 137, 143, 144)
+                and _numeric_background_read(action_by_id.get(cid, {}), read, action)):
+            continue
+        reasons.append({"condition": "consumer_not_exact", "call_id": cid,
+                        "fidelity": (read or {}).get("fidelity")})
+    return reasons
+
+
+def background_failure_equivalent(action, result, results, *, actions=(), lenient=False):
+    return not background_failure_reasons(action, result, results, actions=actions, lenient=lenient)
+
+
+def recorded_no_match(action, result, *, lenient=False):
+    """CC explicitly recorded grep's exit-1 convention; require unchanged complete output."""
+    from .replay_inside import numfree
+    same = numfree if lenient else lambda text: str(text).strip()
+    return (action.get("tool") == "Bash" and action.get("side_effect") == "exec"
+            and action.get("return_code_interpretation") == "No matches found"
+            and not action.get("is_error") and result.get("status") == "ran"
+            and result.get("rc") == 1 and not result.get("pacing_unmet")
+            and action.get("orig_text") is not None
+            and same(action["orig_text"]) == same(_replayed_text(dict(result, rc=0))))
+
+
 def lenient_blocks(plan, report, rc, post_cut=None):
     """Blocking findings of the lenient policy: the three classes named in the module-level comment."""
     blocks = []
@@ -305,6 +422,22 @@ def lenient_blocks(plan, report, rc, post_cut=None):
             blocks.append({"rule": "identity_mismatch", "call_id": cid})
             continue
         se, orig_ok = action.get("side_effect"), not action.get("is_error")
+        if recorded_no_match(action, result, lenient=True):
+            result["fidelity"] = result["automatic_equivalence"] = "recorded_no_match"
+            continue
+        if harness_path_only(action, result, plan.get("harness_owned_paths", HARNESS_PATHS)):
+            result["fidelity"] = result["automatic_equivalence"] = "harness_path_only"
+            continue
+        if se == "exec_background":
+            orig_ok = action.get("bg_status") == "completed"
+            if action.get("bg_status") == "failed":
+                reasons = background_failure_reasons(action, result, results, actions=actions, lenient=True)
+                if reasons:
+                    blocks.append({"rule": "background_failure_changed", "call_id": cid, "conditions": reasons})
+                else:
+                    result["automatic_equivalence"] = result["fidelity"] = (
+                        "bg_termination_reproduced" if action.get("bg_exit_code") in (124, 137, 143, 144)
+                        else "bg_failure_reproduced")
         if result.get("pacing_unmet"):
             blocks.append({"rule": "pacing_unmet", "call_id": cid,
                            "detail": "original pacing of a running background job could not be kept"})
@@ -394,6 +527,12 @@ def validate_replay(plan, report, rc, reviewed_exceptions=None, policy="strict",
         if result.get('pacing_unmet'):
             raise RuntimeError('Replay could not keep the original pacing of a running background job: '
                                + action['call_id'])
+        if recorded_no_match(action, result):
+            result["fidelity"] = result["automatic_equivalence"] = "recorded_no_match"
+            continue
+        if harness_path_only(action, result, plan.get("harness_owned_paths", HARNESS_PATHS)):
+            result["fidelity"] = result["automatic_equivalence"] = "harness_path_only"
+            continue
         fidelity=result.get('fidelity')
         exit_reviewed = False
         if action['side_effect']=='exec_background':
@@ -409,9 +548,10 @@ def validate_replay(plan, report, rc, reviewed_exceptions=None, policy="strict",
                          == hashlib.sha256((action.get('args') or {}).get('command', '').encode()).hexdigest()
                          and reviewed_exceptions[action['call_id']].get('background_output_sha256')
                          == result.get('background_output_sha256'))
+            failed_ok = failed_ok or background_failure_equivalent(action, result, report["results"])
             status_same = (action.get('bg_status') == 'completed' and result.get('rc') == 0) or failed_ok
             if not (action.get('bg_finished_before_k',True) and status_same
-                    and fidelity=='bg_rerun_foreground'
+                    and fidelity in ('bg_rerun_foreground', 'bg_termination_reproduced', 'bg_failure_reproduced')
                     and result.get('background_output_file')==action.get('background_output_file')
                     and result.get('background_output_sha256')):
                 raise RuntimeError('Completed background output not restored: '+action['call_id'])

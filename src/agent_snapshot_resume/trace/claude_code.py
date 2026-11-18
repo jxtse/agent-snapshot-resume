@@ -206,6 +206,7 @@ def load_trial(trial_dir, agent_timeout_s=None, task=None, reward=None):
                              "is_error": bool(b.get("is_error")), "text": txt, "n_chars": len(txt),
                              "n_images": n_img, "timestamp": d.get("timestamp")}
                         if isinstance(tur, dict):
+                            o["return_code_interpretation"] = tur.get("returnCodeInterpretation")
                             if tur.get("backgroundTaskId"):
                                 o["background_task_id"] = tur["backgroundTaskId"]
                             if tur.get("interrupted"):

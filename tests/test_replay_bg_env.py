@@ -1,0 +1,256 @@
+"""Offline regressions for background lifecycle, snapshot tails, and environment-only drift."""
+import json
+import sys
+from unittest.mock import MagicMock
+
+import pytest
+
+from agent_snapshot_resume import bundle, chain
+from agent_snapshot_resume.replay import gate, replay_inside as replay
+from agent_snapshot_resume.sandbox import source
+
+
+def execute(tmp_path, monkeypatch, actions, **fields):
+    plan = dict(actions=actions, initial_cwd=str(tmp_path), **fields)
+    pp, rp = tmp_path / 'plan.json', tmp_path / 'report.json'
+    pp.write_text(json.dumps(plan))
+    monkeypatch.setattr(sys, 'argv', ['replay', str(pp), str(rp)])
+    replay.main()
+    return plan, json.loads(rp.read_text())
+
+
+def bg(tmp_path, command, rc=124, duration=.1):
+    return dict(call_id='job', tool='Bash', side_effect='exec_background',
+                args={'command': command}, cwd=str(tmp_path), bg_status='failed', bg_exit_code=rc,
+                bg_duration_s=duration, duration_s=120, bg_finished_before_k=True,
+                background_output_file=str(tmp_path / 'job.output'), is_error=False)
+
+
+@pytest.mark.parametrize('code', [124, 137, 143, 144])
+def test_historical_termination(tmp_path, monkeypatch, code):
+    plan, report = execute(tmp_path, monkeypatch, [bg(tmp_path, "printf 'progress 1\\n'; sleep 5", code)],
+                           bg_output_trailer='\n[exited with code {rc}]\n')
+    r = report['results'][0]
+    assert r['rc'] == code and r['dur_s'] < 2
+    assert r['fidelity'] == 'bg_termination_reproduced'
+    assert 'progress 1' in (tmp_path / 'job.output').read_text()
+    for policy in ('strict', 'lenient'):
+        gate.validate_replay(plan, report, 0, policy=policy)
+
+
+def test_fast_failure_preserves_write_order(tmp_path, monkeypatch):
+    a = bg(tmp_path, 'bash missing.sh', 127, 0)
+    write = dict(call_id='write', tool='Write', side_effect='file_write',
+                 args=dict(file_path=str(tmp_path / 'missing.sh'), content='sleep 5'))
+    plan, report = execute(tmp_path, monkeypatch, [a, write])
+    assert report['results'][0]['rc'] == 127
+    gate.validate_replay(plan, report, 0, policy='lenient')
+
+
+def test_fast_failure_not_fabricated(tmp_path, monkeypatch):
+    plan, report = execute(tmp_path, monkeypatch, [bg(tmp_path, 'sleep 5', 2, 0)])
+    with pytest.raises(RuntimeError, match='background_failure_changed'):
+        gate.validate_replay(plan, report, 0, policy='lenient')
+
+
+def test_changed_consumed_output_blocks(tmp_path):
+    a = bg(tmp_path, 'x')
+    a['bg_output_read_later'] = ['read']
+    r = dict(call_id='job', status='ran', rc=124)
+    assert not gate.background_failure_equivalent(a, r, [r])
+    assert not gate.background_failure_equivalent(a, r, [dict(call_id='read', fidelity='numbers_differ')])
+    assert gate.background_failure_equivalent(a, r, [dict(call_id='read', fidelity='exact')])
+
+
+def test_snapshot_tail_retains_dispatched_job():
+    a = dict(call_id='job', side_effect='exec_background', obs_line=4, bg_finished_line=12)
+    assert chain.tail_actions([a], 10)[0]['bg_inflight_at_snapshot']
+    assert not chain.tail_actions([a], 13)
+    assert chain.tail_actions([a], 12)[0]['bg_inflight_at_snapshot']
+    assert 'bg_inflight_at_snapshot' not in a
+
+
+def test_snapshot_rerun_before_dependent_read(tmp_path, monkeypatch):
+    stopped = []
+    monkeypatch.setattr(replay, 'stop_snapshot_background', lambda a: stopped.append(a['call_id']) or [42])
+    a = bg(tmp_path, "echo saved > artifact; echo done", 0)
+    a.update(bg_status='completed', bg_inflight_at_snapshot=True)
+    read = dict(call_id='read', tool='Bash', side_effect='exec', args={'command': 'cat artifact'}, orig_text='saved')
+    _, report = execute(tmp_path, monkeypatch, [a, read])
+    assert stopped == ['job']
+    assert report['results'][0]['background_resume'] == 'rerun_from_snapshot'
+    assert report['results'][1]['fidelity'] in ('exact', 'normalized')
+
+
+def test_completed_background_uses_total_duration(tmp_path, monkeypatch):
+    seen = []
+    def run(cmd, cwd, timeout, **kw):
+        seen.append(timeout)
+        return dict(rc=0, stdout='', stderr='', dur=0, timeout=False)
+    monkeypatch.setattr(replay, 'run_bash', run)
+    a = bg(tmp_path, 'install', 0, 147.8)
+    a.update(bg_status='completed', orig_text='Exit code 143\nCommand timed out after 2m 0s')
+    execute(tmp_path, monkeypatch, [a])
+    assert seen == [325]
+
+
+def test_harness_listing_rule():
+    a = dict(args={'command': 'pip list 2>/dev/null | head -60; echo ---; ls /opt/tbs-proxy 2>/dev/null'},
+             orig_text='Package Version\n---\nproxy.py\nvenv')
+    r = dict(status='ran', rc=2, stdout_full='Package Version\n---\n', stderr_full='')
+    assert gate.harness_path_only(a, r)
+    assert not gate.harness_path_only(a, r, ['/different'])
+    for command in ('touch file; ls /opt/tbs-proxy', 'echo x > file; ls /opt/tbs-proxy',
+                    'pip install x; ls /opt/tbs-proxy', 'echo $(touch file); ls /opt/tbs-proxy'):
+        assert not gate.harness_path_only(dict(a, args={'command': command}), r)
+    assert not gate.harness_path_only(a, dict(r, stdout_full='changed\n---'))
+
+
+def test_deadline_forwarded_and_default():
+    sb = MagicMock()
+    source.dispatch_replay(sb, '/app', 1800, 25000)
+    assert '25000s' in sb.commands.run.call_args.args[0]
+    source.dispatch_replay(sb, '/app', 1800)
+    assert '10800s' in sb.commands.run.call_args.args[0]
+
+
+def test_captured_path_after_login(tmp_path):
+    directory = tmp_path / 'agent/sessions/shell-snapshots'
+    directory.mkdir(parents=True)
+    (directory / 'env.sh').write_text("export PATH='/custom/env/bin:/usr/bin:/bin'\nexport TOKEN='secret'\n")
+    env = bundle.captured_shell_env(tmp_path)
+    assert env == {'PATH': '/custom/env/bin:/usr/bin:/bin'}
+    r = replay.run_bash('printf %s "$PATH"', str(tmp_path), 2, shell_env=env)
+    assert r['stdout'] == env['PATH']
+    (directory / 'other.sh').write_text("export PATH='/different'\n")
+    assert bundle.captured_shell_env(tmp_path) == {}
+
+
+def test_background_output_prefix_and_numeric_drift(tmp_path):
+    a = bg(tmp_path, 'x')
+    a['bg_original_output'] = 'iteration 1 loss 2.0\niteration 2 loss 1.0'
+    r = dict(status='ran', rc=124, stdout_full='iteration 1 loss 2.1\n')
+    assert gate.background_failure_equivalent(a, r, [])
+    assert not gate.background_failure_equivalent(a, dict(r, stdout_full='different error'), [])
+    assert not gate.background_failure_equivalent(a, dict(r, stdout_full=''), [])
+
+
+def test_background_read_compares_actual_file(tmp_path, monkeypatch):
+    output = tmp_path / 'output'
+    output.write_text('value 7\n')
+    a = dict(call_id='reader', tool='Read', side_effect='read_only',
+             evidence_read_for='failed_background_output', args={'file_path': str(output)},
+             orig_text='     1→value 6')
+    _, report = execute(tmp_path, monkeypatch, [a])
+    assert report['results'][0]['fidelity'] == 'numbers_differ'
+
+
+def test_natural_signal_uses_shell_exit_convention(tmp_path):
+    result = replay.run_bash('kill -TERM $$', str(tmp_path), 2)
+    assert result['rc'] == 143
+    assert not result['timeout']
+
+
+def test_snapshot_ownership_check_fails_without_proc(tmp_path, monkeypatch):
+    monkeypatch.setattr(replay.os.path, 'isdir', lambda p: False)
+    with pytest.raises(RuntimeError, match='cannot identify'):
+        replay.stop_snapshot_background(bg(tmp_path, 'echo x'))
+
+
+def test_inherited_descriptors_do_not_timeout_launcher(tmp_path):
+    import signal
+    # The asynchronous AND-list shell inherits both capture fds despite its child's redirect.
+    r = replay.run_bash('true && sleep 5 >/dev/null 2>&1 & echo launched', str(tmp_path), .4)
+    try:
+        assert not r['timeout'] and r['rc'] == 0
+        assert r['stdout'].strip() == 'launched' and r['dur'] < 1
+        assert replay.group_alive(r['pgid'])
+    finally:
+        replay.signal_session(r['pgid'], signal.SIGKILL)
+
+
+def test_session_tracks_new_groups_and_ignores_zombies(tmp_path, monkeypatch):
+    import builtins
+    real_open = builtins.open
+    real_isdir = replay.os.path.isdir
+    # Linux stat fields: state, parent, process group, session. Names may contain ')'.
+    records = {'20': '20 (timeout) S 1 20 10 0',
+               '21': '21 (worker (x)) S 20 20 10 0',
+               '22': '22 (dead) Z 1 22 11 0',
+               '30': '30 (unrelated) S 1 30 30 0'}
+    for pid, value in records.items():
+        (tmp_path / pid).write_text(value)
+    monkeypatch.setattr(replay.os.path, 'isdir', lambda p: True if p == '/proc/self' else real_isdir(p))
+    monkeypatch.setattr(replay.os, 'listdir', lambda p: list(records))
+    monkeypatch.setattr(builtins, 'open', lambda p, *a, **kw: real_open(
+        tmp_path / p.split('/')[2] if str(p).startswith('/proc/') else p, *a, **kw))
+    assert replay.session_groups(10) == {20}
+    assert replay.group_alive(10)
+    assert not replay.group_alive(11)
+    killed = []
+    monkeypatch.setattr(replay.os, 'killpg', lambda pg, sig: killed.append(pg))
+    replay.signal_session(10, 9)
+    assert set(killed) == {10, 20}
+
+
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='Linux session/process-group integration')
+def test_regrouped_background_is_paced_before_read(tmp_path, monkeypatch):
+    import shlex
+    code = 'import os,time; os.setpgid(0,0); time.sleep(.5); open("ready","w").write("done")'
+    a = dict(call_id='launch', tool='Bash', side_effect='exec',
+             args={'command': shlex.quote(sys.executable) + ' -c ' + shlex.quote(code) + ' > job.log 2>&1 & sleep .1'},
+             timestamp='2026-01-01T00:00:00Z', orig_text='(Bash completed with no output)')
+    read = dict(call_id='read', tool='Bash', side_effect='exec', args={'command': 'cat ready'},
+                timestamp='2026-01-01T00:00:01Z', orig_text='done')
+    _, report = execute(tmp_path, monkeypatch, [a, read])
+    assert report['results'][0]['left_background_job']
+    assert report['results'][1]['paced_wait_s'] > 0
+    assert report['results'][1]['fidelity'] in ('exact', 'normalized')
+
+
+def test_recorded_no_match_requires_metadata_and_same_output():
+    a = dict(call_id='probe', tool='Bash', side_effect='exec', args={'command': 'grep x absent'},
+             orig_text='historical import failure', is_error=False,
+             return_code_interpretation='No matches found')
+    r = dict(call_id='probe', rc=1, status='ran', fidelity='differs',
+             stdout_full='historical import failure\n', stderr_full='')
+    for policy in ('strict', 'lenient'):
+        gate.validate_replay({'actions': [a]}, {'results': [dict(r)]}, 0, policy=policy)
+    for changed in (dict(r, stdout_full=''), dict(r, rc=2), dict(r, pacing_unmet=True),
+                    dict(r, status='timeout')):
+        assert not gate.recorded_no_match(a, changed)
+    assert not gate.recorded_no_match(dict(a, return_code_interpretation=None), r)
+
+
+def test_lenient_no_match_numeric_drift_only():
+    a = dict(call_id='grep', tool='Bash', side_effect='exec', is_error=False,
+             return_code_interpretation='No matches found', orig_text='STATUS optimal time 25.25\n===')
+    r = dict(call_id='grep', status='ran', rc=1, stdout_full='STATUS optimal time 25.17\n===', stderr_full='')
+    assert gate.recorded_no_match(a, r, lenient=True)
+    assert not gate.recorded_no_match(a, r)
+    assert not gate.recorded_no_match(a, dict(r, stdout_full='STATUS failed time 25.17\n==='), lenient=True)
+    assert not gate.recorded_no_match(a, dict(r, pacing_unmet=True), lenient=True)
+    assert not gate.recorded_no_match(dict(a, return_code_interpretation=None), r, lenient=True)
+
+
+def test_lenient_failed_log_read_and_diagnostics(tmp_path):
+    a = bg(tmp_path, 'job')
+    a['bg_output_read_later'] = ['reader']
+    reader = dict(call_id='reader', tool='Bash', args={'command': 'sleep 20; cat ' + a['background_output_file']},
+                  orig_text='iteration 1 loss 2.0')
+    r = dict(call_id='job', status='ran', rc=124)
+    read = dict(call_id='reader', status='ran', rc=0, fidelity='differs',
+                stdout_full='iteration 1 loss 2.1\n[exited with code 124]\n', stderr_full='')
+    def reasons(rd=read, ac=reader, job=r):
+        return gate.background_failure_reasons(a, job, [rd], actions=[ac], lenient=True)
+    assert not reasons()
+    assert not gate.background_failure_equivalent(a, r, [read])  # strict unchanged
+    assert reasons(dict(read, stdout_full='iteration 1 loss 2.1\niteration 2 loss 1.0'))
+    assert reasons(dict(read, stdout_full='Traceback: failed'))
+    assert reasons(dict(read, pacing_unmet=True))
+    assert reasons(dict(read, rc=1))
+    assert reasons(ac=dict(reader, args={'command': 'cat /app/final.npy'}))
+    assert reasons(ac=dict(reader, args={'command': reader['args']['command'] + '; touch final'}))
+    assert reasons(job=dict(r, rc=0))[0]['condition'] == 'terminal_outcome'
+    a['bg_original_output'] = 'different failure'
+    assert reasons()[0]['condition'] == 'output_prefix'

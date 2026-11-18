@@ -98,7 +98,8 @@ class Batch:
                  retry_failed: str = "off", prep_concurrency: int = 6,
                  launch_concurrency: int = 20, only: list[str] | None = None, agent: str = "claude-code",
                  verifier: bool = True, log=print, replay_policy: str = "strict",
-                 cost_alarm_usd: float = 100.0):
+                 cost_alarm_usd: float = 100.0, replay_deadline_s: int = 10800):
+        self.replay_deadline_s = replay_deadline_s
         self.name, self.work = name, Path(work_dir)
         self.batch_dir = self.work / "batch" / name
         self.manifest_path = Path(manifest)
@@ -365,6 +366,15 @@ class Batch:
             rec = json.loads(out.read_text())
             # a snapshot accepted under another policy was not gated the way this batch gates: never reuse it silently
             same_policy = (rec.get("replay_policy") or "strict") == self.replay_policy
+            # a snapshot replayed from a different plan (e.g. the bundle was rebuilt) restores a different state
+            hinted_dir = ((bundled.get("bundles") or {}).get("hinted") or {}).get("dir")
+            if rec.get("replay_gate_passed") and rec.get("snapshot_id") and hinted_dir and rec.get("cut_identity"):
+                from .bundle import cut_identity_diff, snapshot_cut_identity
+                if cut_identity_diff(snapshot_cut_identity(Path(hinted_dir)), rec["cut_identity"]):
+                    attempt += 1
+                    out.rename(out.with_name(out.name + f".plan-changed-{attempt}"))
+                    tag = f"{base_tag}-r{attempt}"
+                    continue
             if rec.get("replay_gate_passed") and rec.get("snapshot_id") and same_policy:
                 return rec
             if rec.get("replay_gate_passed") and rec.get("snapshot_id"):
@@ -380,7 +390,7 @@ class Batch:
         rec = source.prepare_source(adapter=self.adapter, task_dir=self.task_dir(row),
                                     bundle=Path(bundled["bundles"]["hinted"]["dir"]),
                                     template=str(tmpl_id), tag=tag, state_dir=self.state_dir,
-                                    replay_policy=self.replay_policy,
+                                    replay_policy=self.replay_policy, replay_deadline_s=self.replay_deadline_s,
                                     # a chained bundle's plan holds only the tail after its mid-run snapshot: the
                                     # replay must start from that snapshot, not from a fresh container
                                     base_snapshot=(json.loads((Path(bundled["bundles"]["hinted"]["dir"])

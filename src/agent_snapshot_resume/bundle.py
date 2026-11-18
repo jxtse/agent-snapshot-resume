@@ -198,22 +198,56 @@ def default_fingerprint_roots(plan: dict[str, Any]) -> list[str] | None:
     return [cwd] if cwd and not any(cwd == h or cwd.startswith(h + "/") for h in home_dirs) else None
 
 
+def captured_shell_env(trial_dir):
+    """Extract a stable literal PATH from CC snapshots, never source arbitrary archived shell code."""
+    values = set()
+    for path in (Path(trial_dir) / "agent" / "sessions" / "shell-snapshots").glob("*.sh"):
+        for line in path.read_text(errors="replace").splitlines():
+            match = re.fullmatch(r"(?:export|declare -x) PATH=(.+)", line.strip())
+            if match and not re.search(r"[$`\n]", match[1]):
+                try:
+                    parts = shlex.split(match[1])
+                except ValueError:
+                    continue
+                if len(parts) == 1:
+                    values.add(parts[0])
+    return {"PATH": values.pop()} if len(values) == 1 else {}
+
+
 def plan_with_observations(ir: dict[str, Any], k: int) -> dict[str, Any]:
     """Replay plan for steps < k with each action's original observation text attached (`orig_text`)."""
     plan = trace_ir.replay_plan(ir, k)
     obs: dict[str, Any] = {}
     obs_line: dict[str, Any] = {}
+    interpretations: dict[str, Any] = {}
     for s in ir["steps"][:k]:
         for e in s["events"]:
             if e["type"] == "observation":
                 obs[e["call_id"]] = e["text"]
                 obs_line[e["call_id"]] = e.get("line")
+                interpretations[e["call_id"]] = e.get("return_code_interpretation")
     for sc in ir["sidechains"]:
         for c in sc["tool_calls"]:
             obs.setdefault(c["call_id"], c.get("observation_text"))
     for a in plan["actions"]:
         a["orig_text"] = obs.get(a["call_id"])
         a["obs_line"] = obs_line.get(a["call_id"])
+        if interpretations.get(a["call_id"]):
+            a["return_code_interpretation"] = interpretations[a["call_id"]]
+        if a.get("side_effect") == "exec_background":
+            for step in ir["steps"][:k]:
+                for event in step["events"]:
+                    args = event.get("args") or {}
+                    if (event.get("type") == "tool_call" and event.get("tool") == "Read"
+                            and args.get("file_path") == a.get("background_output_file")
+                            and not args.get("offset") and not args.get("limit")
+                            and trace_ir._ts(event.get("timestamp")) is not None
+                            and a.get("bg_finished_ts")
+                            and trace_ir._ts(event["timestamp"]) >= trace_ir._ts(a["bg_finished_ts"])):
+                        text = obs.get(event["call_id"]) or ""
+                        rows = re.findall(r"(?m)^\s*\d+[→\t](.*)$", text)
+                        if rows:
+                            a["bg_original_output"] = "\n".join(rows)
     return plan
 
 
@@ -392,6 +426,7 @@ def build(*, adapter, trial_dir: Path, atif_step: int | None, out: Path, mode: s
         raise SystemExit("--base-snapshot needs a resumed trial dir (the tail is split on its own session lines)")
     plan["initial_cwd"] = next((json.loads(trace_ir._REDACT_RE.sub(r"\1null", l)).get("cwd")
                                 for l in raw_lines if '\"cwd\"' in l), None)
+    plan["shell_env"] = captured_shell_env(trial_dir)
     if base_snapshot:
         line = int(base_snapshot["session_line"])
         if line >= cut_orig:

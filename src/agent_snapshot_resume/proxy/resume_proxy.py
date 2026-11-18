@@ -414,6 +414,21 @@ def rendered_text_problems(text, attachments, templates, consumed=None):
         for a in attachments:
             if bound is not None and a is not bound:
                 continue
+            # CC coalesces reminders into system messages, removing only their
+            # outer wrapper. Match the complete recorded payload, never individual
+            # words, line permutations, or a new prose template.
+            for ri, value in enumerate(a.get("rendered_texts", ())):
+                key = (id(a), "rendered", ri)
+                if key in consumed:
+                    continue
+                forms = [value]
+                prefix, suffix = "<system-reminder>\n", "\n</system-reminder>"
+                if value.startswith(prefix) and value.endswith(suffix):
+                    forms.append(value[len(prefix):-len(suffix)])
+                for form in forms:
+                    f = form.split("\n")
+                    if f and lines[i:i + len(f)] == f and (best is None or len(f) > best[0]):
+                        best = (len(f), key)
             for li, v in enumerate(a.get("leaves", ())):
                 key = (id(a), li)
                 if key in consumed:
