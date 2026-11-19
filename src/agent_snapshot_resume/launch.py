@@ -18,7 +18,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from . import config
-from .agent_env import SECRET_NAME as _SECRET_RE, RESERVED_ENV as _RESERVED_ENV, native_agent_env
+from .agent_env import SECRET_NAME as _SECRET_RE, RESERVED_ENV as _RESERVED_ENV, native_agent_env, secret_value
 from .agents.base import load_bundle
 
 SNAPSHOT_ENV_IMPORT = "agent_snapshot_resume.sandbox.snapshot_env:SnapshotCloneEnvironment"
@@ -56,13 +56,15 @@ def original_agent_settings(trial_dir: str | None, *, native: str | None = None)
     agent = (json.loads((Path(trial_dir) / "config.json").read_text()).get("agent") or {})
     env = {}
     for k, v in (agent.get("env") or {}).items():
-        if _SECRET_RE.search(k) or k in _RESERVED_ENV:
+        if _SECRET_RE.search(k) or k in _RESERVED_ENV or secret_value(str(v)):
             continue
         if any(_SECRET_RE.search(ref[1]) for ref in _TEMPLATE_RE.finditer(str(v))):
             continue
         m = _TEMPLATE_RE.fullmatch(str(v))
         if m:  # "${VAR}" / "${VAR:-default}": resolve from this process (non-secret names only), else drop
             v = os.environ.get(m.group(1)) or m.group(2)
+            if v and secret_value(v):
+                continue
             if not v:
                 print(f"warning: {k}={agent['env'][k]} not set here; dropped", file=sys.stderr)
                 continue

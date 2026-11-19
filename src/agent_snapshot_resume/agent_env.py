@@ -31,6 +31,33 @@ _LITERAL_SOURCE = re.compile(
     r"""(?P<quote>['"])(?P<tag>\w+)(?P=quote)[ \t]*\n)[\s\S]*?^(?P=tag)$""")
 
 
+# A credential can sit in a value whose name looks harmless (DATABASE_URL, REDIS_DSN, ...).
+# Values that look like one are treated as unrecoverable: never written to plan.json/job.json
+# and never exported to replay or the resumed agent.
+_SECRET_VALUE = [
+    re.compile(r"[a-z][a-z0-9+.-]*://[^/?#\s@]+@", re.I),                  # URL/DSN userinfo
+    re.compile(r"(?:^|[\s;&?,])(?:password|passwd|pwd|secret|token|api[_-]?key|apikey|access[_-]?key"
+               r"|private[_-]?key|client[_-]?secret|auth)\s*[=:]\s*\S", re.I),  # key=value DSN / query
+    re.compile(r"\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}", re.I),        # auth header values
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+    re.compile(r"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{16,}|\bgh[pousr]_[A-Za-z0-9]{20,}|\bgithub_pat_\w{20,}"
+               r"|\bxox[abposr]-[A-Za-z0-9-]{10,}|\bAKIA[0-9A-Z]{16}\b|\bAIza[0-9A-Za-z_-]{30,}"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"),   # JWT
+]
+_OPAQUE = re.compile(r"[A-Za-z0-9+=_-]{32,}")
+
+
+def secret_value(value: str) -> bool:
+    """True when a value looks like a credential, whatever its variable name."""
+    if any(p.search(value) for p in _SECRET_VALUE):
+        return True
+    # A long opaque token mixing lower case, upper case and digits. Path segments, plain
+    # words and hex digests (lower case + digits) do not match.
+    # Split on _ and - so identifiers like RUN_SUMMARY_v2_final do not qualify.
+    words = (s for w in _OPAQUE.findall(value) for s in re.split(r"[_-]", w) if len(s) >= 24)
+    return any(all(re.search(c, w) for c in (r"[a-z]", r"[A-Z]", r"[0-9]")) for w in words)
+
+
 def native_agent_env(trial_dir, agent):
     reserved = RESERVED_ENV | _ROUTE_ENV | _SESSION_ENV[agent]
     path = Path(trial_dir) / "config.json" if trial_dir else None
@@ -38,7 +65,8 @@ def native_agent_env(trial_dir, agent):
     safe, unavailable = {}, set(reserved)
     for name, value in ((config.get("agent") or {}).get("env") or {}).items():
         if (SECRET_NAME.search(name) or name.upper() in reserved or not re.fullmatch(_NAME, name)
-                or not isinstance(value, str) or "\x00" in value or re.search(r"\$[\w{]", value)):
+                or not isinstance(value, str) or "\x00" in value or re.search(r"\$[\w{]", value)
+                or secret_value(value)):
             unavailable.add(name)
         else:
             safe[name] = value
