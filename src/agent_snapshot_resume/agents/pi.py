@@ -12,7 +12,7 @@ from harbor.agents.installed.pi import Pi, PiOptions
 
 from ..replay.replay_inside import pi_log_path
 from ..trace.ir import bash_is_read_only
-from .native import NativeAdapter, NativeOptions, NativeResumeMixin
+from .native import NativeAdapter, NativeOptions, NativeResumeMixin, mark_parallel_writes
 
 
 # Content pin over all published package files, independent of npm tar headers.
@@ -94,6 +94,10 @@ def resolve_pi_path(value, cwd, home=None):
     return "/" + posixpath.normpath(posixpath.join(cwd, value)).lstrip("/")
 
 
+def is_pi_edit(value):
+    return isinstance(value, dict) and all(isinstance(value.get(k), str) for k in ("oldText", "newText"))
+
+
 def tool_action(name, args, cwd, home=None):
     if name == "bash":
         command = args["command"]
@@ -112,12 +116,22 @@ def tool_action(name, args, cwd, home=None):
             return "Read", dict(file_path=path), "read_only"
         if name == "write":
             return "Write", dict(file_path=path, content=args["content"]), "file_write"
-        edits = args.get("edits") or [args]
+        edits = args.get("edits")
+        if isinstance(edits, str):
+            try:
+                edits = json.loads(edits)
+            except ValueError:
+                edits = None
+        if is_pi_edit(edits):
+            edits = [edits]
+        if is_pi_edit(args):
+            edits = [*(edits if isinstance(edits, list) else []), args]
+        if not isinstance(edits, list) or not edits or not all(map(is_pi_edit, edits)):
+            raise ValueError("invalid Pi edit replacements")
         if len(edits) == 1:
             return "Edit", dict(file_path=path, match_original=True, old_string=edits[0]["oldText"], new_string=edits[0]["newText"]), "file_write"
-        if all(isinstance(e, dict) and "oldText" in e and "newText" in e for e in edits):
-            return "MultiEdit", {"file_path": path, "match_original": True, "edits": [
-                {"old_string": e["oldText"], "new_string": e["newText"]} for e in edits]}, "file_write"
+        return "MultiEdit", {"file_path": path, "match_original": True, "edits": [
+            {"old_string": e["oldText"], "new_string": e["newText"]} for e in edits]}, "file_write"
     return name, args, "other"
 
 
@@ -164,10 +178,20 @@ def matched_tool_results(branch):
     return matched
 
 
-def missing_pi_variable(command, env):
+# A simple display of quoted environment values needs only their strings.
+# All other explicit references may open the transcript or pass it to another program.
+_PI_DISPLAY = re.compile(
+    r"""[ \t]*(?:echo|printf[ \t]+(?:"%s(?:\\n)?"|'%s(?:\\n)?'))"""
+    r"""(?:[ \t]+"\$(?:PI_[A-Z_]+|\{PI_[A-Z_]+\})")+(?:[ \t]+>>?[ \t]*[A-Za-z0-9_./-]+)?[ \t]*"""
+)
+
+
+def pi_command_refusal(command, env, session_file):
     for name in re.findall(r"\$\{?[!#]?(PI_\w*)", command):
         if name not in env:
             return f"unrecorded Pi Bash environment variable {name}"
+    if session_file in command or ("PI_SESSION_FILE" in command and not _PI_DISPLAY.fullmatch(command)):
+        return "Pi command references PI_SESSION_FILE; its execution-time contents cannot be reconstructed"
     return None
 
 
@@ -233,17 +257,23 @@ class PiAdapter(NativeAdapter):
                 steps.append(dict(source="agent" if role == "assistant" else "user", timestamp=row["timestamp"],
                                   line_range=[i], cut_parent=row["parentId"], message_id=row["id"], events=[]))
             if role == "bashExecution":
-                steps.append(dict(source="user", timestamp=row["timestamp"], line_range=[i],
-                                  events=[dict(type="tool_call", tool="Bash", side_effect="exec",
-                                               call_id=row["id"], cwd=header["cwd"], args={"command": msg["command"]},
-                                               timestamp=row["timestamp"], line=i, is_error=bool(msg.get("exitCode"))),
-                                          dict(type="observation", call_id=row["id"], text=msg.get("output", ""),
-                                               line=i, is_error=bool(msg.get("exitCode")))]))
-                action = steps[-1]["events"][0]
-                issue = ("cancelled Pi bashExecution has no reproducible termination point"
-                         if msg.get("cancelled") else missing_pi_variable(msg["command"], {}))
+                rc = msg.get("exitCode")
+                command = msg["command"]
+                output = msg.get("output", "")
+                args = {"command": command, "pi_manual_exit_code": rc, "pi_bash": True}
+                action = dict(type="tool_call", tool="Bash", side_effect="exec", call_id=row["id"],
+                              cwd=header["cwd"], args=args, timestamp=row["timestamp"], line=i, is_error=bool(rc))
+                issue = pi_command_refusal(command, {}, session_file)
+                if msg.get("cancelled"):
+                    issue = "cancelled Pi bashExecution has no reproducible termination point"
+                elif msg.get("fullOutputPath") or msg.get("truncated"):
+                    issue = "Pi manual Bash full output cannot be restored from the recorded text"
+                elif type(rc) is not int:
+                    issue = "Pi manual Bash exitCode is unconfirmed"
                 if issue:
                     action["replay_refusal"] = issue
+                observation = dict(type="observation", call_id=row["id"], text=output, line=i, is_error=bool(rc))
+                steps.append(dict(source="user", timestamp=row["timestamp"], line_range=[i], events=[action, observation]))
                 continue
             events = steps[-1]["events"]
             if role == "toolResult":
@@ -306,7 +336,7 @@ class PiAdapter(NativeAdapter):
                             if thinking_level is not None:
                                 env["PI_REASONING_LEVEL"] = thinking_level
                             args["pi_env"] = env
-                            issue = missing_pi_variable(args["command"], env)
+                            issue = pi_command_refusal(args["command"], env, session_file)
                         event = dict(type="tool_call", tool=tool, args=args, side_effect=effect, cwd=header["cwd"],
                                      call_id=cid, timestamp=row["timestamp"], line=i, is_error=None,
                                      result_line=result_line)
@@ -323,6 +353,7 @@ class PiAdapter(NativeAdapter):
                                            text=block[block["type"]]))
             elif role == "user":
                 events.append(dict(type="user_text", text=msg["content"]))
+        mark_parallel_writes(steps, "Pi")
         version_file = trial / "agent/pi/version.txt"
         result_file = trial / "result.json"
         version = version_file.read_text().strip() if version_file.is_file() else None

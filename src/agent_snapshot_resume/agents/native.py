@@ -8,7 +8,17 @@ from ..trace.ir import _sha256, _ts
 from .base import AgentAdapter, SnapshotResumeAgentMixin, bounded_remote_command
 
 
-NATIVE_REPLAY_REVISION = 4
+NATIVE_REPLAY_REVISION = 5
+
+
+def mark_parallel_writes(steps, agent):
+    for step in steps:
+        writers = [e for e in step["events"] if e["type"] == "tool_call" and e["side_effect"] != "read_only"]
+        if len(writers) > 1:
+            lines = ", ".join(str(e["line"]) for e in writers)
+            reason = f"parallel {agent} calls may write (lines {lines}); final workspace order is unknown"
+            prior = writers[0].get("replay_refusal")
+            writers[0]["replay_refusal"] = f"{prior}; {reason}" if prior else reason
 
 
 class NativeAdapter(AgentAdapter):

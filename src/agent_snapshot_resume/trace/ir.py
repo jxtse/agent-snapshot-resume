@@ -119,7 +119,7 @@ def replay_plan(ir, k_index, include_read_only=False):
                     reason = e["missing_result_reason"]
             if reason:
                 refusals.append(f"{e['call_id']} (line {e['line']}): {reason}")
-            if e["type"] != "tool_call":
+            if e["type"] != "tool_call" or e.get("execution_rejected"):
                 continue
             if e["side_effect"] == "read_only" and not include_read_only:
                 continue

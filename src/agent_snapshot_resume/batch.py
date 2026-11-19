@@ -354,18 +354,24 @@ class Batch:
         if self.agent_name == "codex":
             inputs["sandbox_policy_source"] = "turn_context"
         cached = {}
-        if (ud / "bundles.json").is_file():
+        manifest = ud / "bundles.json"
+        if manifest.is_file():
             try:
-                cached = json.loads((ud / "bundles.json").read_text())
+                cached = json.loads(manifest.read_text())
             except ValueError:
                 cached = {}
         rebuild = bool(cached) and cached.get("inputs") != inputs
+        if rebuild:
+            # A failed rebuild may already have replaced one kind's directory.
+            # Invalidate the old manifest before replacing any of its members.
+            manifest.unlink()
         out: dict[str, Any] = {"cut_line": cut, "inputs": inputs, "bundles": {},
                                "rebuilt_for_input_change": rebuild}
         for kind, spec in specs.items():
             bdir = ud / "bundles" / spec["run_id"]
-            if bdir.is_dir() and (bdir / "bundle.json").is_file() and not rebuild and (
-                    cached or not getattr(self.adapter, "wire", None)):
+            entry = (cached.get("bundles") or {}).get(kind) or {}
+            if (not rebuild and cached.get("inputs") == inputs and entry.get("run_id") == spec["run_id"]
+                    and (bdir / "bundle.json").is_file()):
                 meta = json.loads((bdir / "bundle.json").read_text())
             else:
                 bdir, meta = bundle_mod.build(adapter=self.adapter, trial_dir=trial_dir,
@@ -397,7 +403,9 @@ class Batch:
             if not meta.get("orig_request_at_k"):
                 raise RuntimeError(f"{kind} bundle has no original request at the cut: "
                                    f"{meta.get('orig_request_locate_error')}")
-        (ud / "bundles.json").write_text(json.dumps(out, indent=1))
+        tmp = manifest.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(out, indent=1))
+        tmp.replace(manifest)
         return out
 
     # ------------------------------------------------------------------ stage: template

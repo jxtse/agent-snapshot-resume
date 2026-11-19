@@ -617,6 +617,9 @@ def main():
                                     else "historical_sha256" if "sha256" in historical else
                                     "historical_dimensions" if historical else "replay_hash_only")
                                 new = pi_truncated_view(a.get("orig_text"), new)
+                            elif "pi_manual_exit_code" in args:
+                                # Manual Pi records the combined body and numeric exitCode separately.
+                                comparison_rc = None
                             elif r["rc"] and not args.get("pi_timeout_status"):
                                 # The IR canonicalizes Pi's exit trailer to the Bash error prefix.
                                 new = new.rstrip("\n") or "(no output)"

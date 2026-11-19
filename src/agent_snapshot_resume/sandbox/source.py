@@ -145,7 +145,7 @@ def native_user_refusal(agent, task_dir, plan, policy):
     if agent not in ("pi", "codex") or policy != "strict" or not plan["actions"]:
         return None
     user = tomllib.loads((task_dir / "task.toml").read_text()).get("agent", {}).get("user")
-    if user is not None and user != "root":
+    if user is not None and str(user) not in ("root", "0"):
         return f"strict {agent} workspace replay cannot reproduce task user {user!r}, group and HOME"
     return None
 

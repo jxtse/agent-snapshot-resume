@@ -408,6 +408,9 @@ def recorded_no_match(action, result, *, lenient=False):
 
 def native_replay_problem(action, result):
     args = action.get("args") or {}
+    if "pi_manual_exit_code" in args and (
+            result.get("status") != "ran" or result.get("rc") != args["pi_manual_exit_code"]):
+        return "pi_manual_exit_code_changed"
     if "codex_exit_code" in args and result.get("rc") != args["codex_exit_code"]:
         return "codex_exit_code_changed"
     path = args.get("pi_output_file")
@@ -427,7 +430,7 @@ def native_replay_problem(action, result):
 
 def lenient_blocks(plan, report, rc, post_cut=None):
     """Blocking findings of the lenient policy: the three classes named in the module-level comment."""
-    blocks = []
+    blocks = [{"rule": "unreplayable_action", "detail": reason} for reason in (plan or {}).get("replay_refusals", [])]
     if str(rc).strip() != "0":
         blocks.append({"rule": "replayer_failed", "detail": f"replay process exited rc={rc}"})
     results = list((report or {}).get("results") or [])

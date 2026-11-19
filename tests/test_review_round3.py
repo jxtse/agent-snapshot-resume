@@ -80,8 +80,9 @@ def test_pi_bash_environment(tmp_path, monkeypatch):
     call = rows[2]["message"]["content"][0]
     call.update(name="bash", arguments={"command":
         'printf "%s\\n" "$PI_SESSION_FILE" "$PI_SESSION_ID" "$PI_PROVIDER" "$PI_MODEL" "$PI_REASONING_LEVEL" > env.txt'})
-    actions = plan(pi_trial(tmp_path, rows), 2)["actions"]
-    replay_actions(tmp_path, actions, monkeypatch)
+    resolved = plan(pi_trial(tmp_path, rows), 2)
+    assert not resolved.get("replay_refusals")
+    replay_actions(tmp_path, resolved["actions"], monkeypatch)
     assert (tmp_path/"env.txt").read_text().splitlines() == [
         "/logs/agent/pi/sessions/session.jsonl", "session", "local", "fixture", "low"]
     del rows[2]["message"]["thinkingLevel"]
@@ -135,7 +136,7 @@ def test_codex_parallel(tmp_path, monkeypatch, commands, blocked):
     calls, results = [], []
     for i, cmd in enumerate(commands):
         calls.append(dict(rows[3], payload=dict(rows[3]["payload"], call_id=str(i), arguments=json.dumps(dict(cmd=cmd)))))
-        results.append(dict(rows[4], payload=dict(rows[4]["payload"], call_id=str(i), output="done")))
+        results.append(dict(rows[4], payload=dict(rows[4]["payload"], call_id=str(i), output="Chunk ID: 1\nProcess exited with code 0\nOutput:\ndone")))
     adapter = codex.CodexAdapter()
     write_lines(adapter.find_session(tmp_path), rows[:3] + calls + results + [rows[5], rows[-2]])
     ir = adapter.load_trace(tmp_path, 60)
@@ -274,12 +275,12 @@ def test_codex_separate_responses(tmp_path, monkeypatch):
     rows, _ = codex_trial(tmp_path, monkeypatch)
     rows[1]["payload"].update(FULL)
     rows[3]["payload"]["arguments"] = json.dumps(dict(cmd="echo a > first"))
-    rows[4]["payload"]["output"] = "done"
+    rows[4]["payload"]["output"] = "Chunk ID: 1\nProcess exited with code 0\nOutput:\ndone"
     second = dict(rows[3], payload=dict(rows[3]["payload"], call_id="second"))
     end = dict(rows[-1], payload=dict(rows[-1]["payload"], response_id="second"))
     adapter = codex.CodexAdapter()
     write_lines(adapter.find_session(tmp_path),
-                rows[:4] + [rows[-1], rows[4], second, end, rows[-2]])
+                rows[:4] + [rows[-1], rows[4], second, end, dict(rows[4], payload=dict(rows[4]["payload"], call_id="second")), rows[-2]])
     ir = adapter.load_trace(tmp_path, 60)
     assert len(ir["steps"]) == 4
     p = plan(ir, 3)

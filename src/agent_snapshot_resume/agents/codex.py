@@ -13,7 +13,7 @@ from harbor.models.trajectories import FinalMetrics
 from ..proxy.native_wire import digest
 from ..proxy.runtime import fetch
 from ..trace.ir import _ts, bash_is_read_only
-from .native import align_atif_step_ids, NativeAdapter, NativeOptions, NativeResumeMixin
+from .native import NativeAdapter, NativeOptions, NativeResumeMixin, align_atif_step_ids, mark_parallel_writes
 
 
 CATALOG_SHA256 = "b7d04bd6ed29640ac4a80cd6ffbda125d94dd5f8ccb95d29721099d4118ec873"
@@ -109,27 +109,36 @@ def recorded_sandbox_mode(context):
 _SED_PRINT = re.compile(r"""(?:/usr/bin/|/bin/)?sed -n '(?:[0-9]+,)?[0-9]+p' [a-zA-Z0-9_./][a-zA-Z0-9_./-]*""")
 
 
-def tool_action(payload, cwd):
+_JUSTIFICATION_REJECTION = (
+    '`justification` requires an explicit `sandbox_permissions`; use `sandbox_permissions: '
+    '"require_escalated"` for unsandboxed execution, or omit `justification`.'
+)
+
+
+def tool_action(payload, cwd, args=None):
     name = payload["name"]
     if payload["type"] == "custom_tool_call":
         if name == "apply_patch":
             # The pinned executable provides the patch implementation, including moves and contextual hunks.
             return "Bash", {"command": shlex.join(["codex", "--codex-run-as-apply-patch", payload["input"]])}, "exec", cwd
         return name, {"input": payload["input"]}, "other", cwd
-    args = json.loads(payload["arguments"])
+    if args is None:
+        args = json.loads(payload["arguments"])
     if name in ("exec_command", "shell", "shell_command"):
         cmd = args.get("cmd", args.get("command"))
-        if isinstance(cmd, list):
+        if isinstance(cmd, list) and all(isinstance(arg, str) for arg in cmd):
             cmd = shlex.join(cmd)
         shell = args.get("shell")
-        if isinstance(cmd, str) and not args.get("tty") and (shell is None or isinstance(shell, str)):
+        workdir = args.get("workdir") or cwd
+        if (isinstance(cmd, str) and not args.get("tty") and isinstance(workdir, str)
+                and (shell is None or isinstance(shell, str))):
             standard_shell = shell in (None, "bash", "/bin/bash", "sh", "/bin/sh")
             read_only = standard_shell and (bash_is_read_only(cmd) or _SED_PRINT.fullmatch(cmd))
             effect = "read_only" if read_only else "exec"
             if shell or args.get("login") is False:
                 cmd = shlex.join([shell or "bash", "-lc" if args.get("login", True) else "-c", cmd])
             return ("Bash", {"command": cmd}, effect,
-                    posixpath.join(cwd, args.get("workdir") or cwd))
+                    posixpath.join(cwd, workdir))
     return name, args, "other", cwd
 
 
@@ -218,11 +227,19 @@ class CodexAdapter(NativeAdapter):
             if subtype in ("function_call_output", "custom_tool_call_output"):
                 event, step = calls[p["call_id"]]
                 text, rc, session_id, duration = decode_output(p["output"], custom=subtype == "custom_tool_call_output")
+                rejected = isinstance(p["output"], str) and (
+                    (event.get("invalid_justification") and p["output"].strip() == _JUSTIFICATION_REJECTION)
+                    or (event.get("invalid_arguments") and p["output"].startswith("failed to parse function arguments: ")))
+                if rejected:
+                    event.update(side_effect="read_only", execution_rejected=True, result_line=i)
+                    event.pop("replay_refusal", None)
+                elif rc is not None or session_id is not None:
+                    event["result_line"] = i
                 if subtype == "custom_tool_call_output" and event["tool"] == "Bash" and rc is not None:
                     event["args"]["codex_exit_code"] = rc
                 if rc not in (None, 0) and event["tool"] == "Bash":
                     text = f"Exit code {rc}\n" + text
-                event.update(is_error=rc != 0 if rc is not None else None, duration_s=duration)
+                event.update(is_error=True if rejected else (rc != 0 if rc is not None else None), duration_s=duration)
                 if session_id and event["tool"] == "Bash":
                     # A PTY session cannot be revived by executing a fresh foreground command.
                     event.update(tool="unified_exec", side_effect="exec_background", background_task_id=session_id)
@@ -243,11 +260,26 @@ class CodexAdapter(NativeAdapter):
                                native_sandbox_mode=recorded_sandbox_mode(context))
                 steps.append(current)
             if subtype in ("function_call", "custom_tool_call"):
-                tool, args, effect, workdir = tool_action(p, cwd)
+                try:
+                    raw_args = json.loads(p["arguments"]) if subtype == "function_call" else {}
+                except (ValueError, TypeError):
+                    raw_args = None
+                invalid_args = not isinstance(raw_args, dict)
+                if invalid_args:
+                    raw_args = {}
+                    tool, args, effect, workdir = p["name"], {}, "other", cwd
+                else:
+                    tool, args, effect, workdir = tool_action(p, cwd, raw_args)
                 event = dict(type="tool_call", tool=tool, args=args, side_effect=effect, cwd=workdir,
                              call_id=p["call_id"], line=i, timestamp=ts)
-                permissions = (json.loads(p["arguments"]).get("sandbox_permissions")
-                               if subtype == "function_call" else None)
+                permissions = raw_args.get("sandbox_permissions")
+                if effect != "read_only":
+                    event["missing_result_reason"] = "unconfirmed Codex tool execution before cut"
+                if p["name"] == "exec_command":
+                    if raw_args.get("justification") is not None and permissions is None:
+                        event["invalid_justification"] = True
+                    if invalid_args:
+                        event["invalid_arguments"] = True
                 policy = recorded_sandbox_mode(context)
                 if effect != "read_only" and (policy != "danger-full-access" or permissions not in (None, "use_default")):
                     event["replay_refusal"] = f"Codex sandbox policy {policy or 'unrecorded'} cannot be reproduced"
@@ -260,12 +292,7 @@ class CodexAdapter(NativeAdapter):
             else:
                 raise ValueError(f"unsupported Codex response item {subtype!r}")
             current["events"].append(event)
-        for st in steps:
-            writers = [e for e in st["events"] if e["type"] == "tool_call" and e["side_effect"] != "read_only"]
-            if len(writers) > 1:
-                lines = ", ".join(str(e["line"]) for e in writers)
-                reason = f"parallel Codex calls may write (lines {lines}); final workspace order is unknown"
-                writers[0]["replay_refusal"] = "; ".join(filter(None, [writers[0].get("replay_refusal"), reason]))
+        mark_parallel_writes(steps, "Codex")
         flags = align_atif_step_ids(
             trial, steps, [[e["call_id"] for e in st["events"] if e["type"] == "tool_call"] for st in steps],
             [st.get("atif_source", st["source"]) for st in steps])
@@ -439,27 +466,38 @@ class CodexSnapshotResume(NativeResumeMixin, Codex):
             calls = []
             seen = {}
             pending_output = False
+            provisional = None  # index of the last_token_usage estimate for the current response
             model = meta.get("native_model")
             for line in stream:
                 row = json.loads(line)
                 payload = row["payload"]
                 kind = row["type"]
                 if kind == "turn_context":
+                    provisional = None
                     model = payload.get("model", model)
+                elif kind == "compacted":
+                    provisional = None
                 elif kind == "response_item":
                     if (payload.get("role") == "assistant"
                             or payload.get("type") in {"function_call", "custom_tool_call", "reasoning"}):
+                        provisional = None
                         pending_output = True
+                    elif payload.get("type") == "message":
+                        provisional = None
                 elif kind == "token_usage_record":
                     usage = payload["usage"]
                     rid = payload.get("response_id")
                     if rid and rid in seen:
                         if seen[rid] != usage:
                             return trajectory
-                    else:
+                        continue
+                    if provisional is None:
                         calls.append((model, usage))
-                        if rid:
-                            seen[rid] = usage
+                    else:
+                        calls[provisional] = (calls[provisional][0], usage)
+                        provisional = None
+                    if rid:
+                        seen[rid] = usage
                     pending_output = False
                 elif kind == "event_msg" and payload.get("type") == "token_count" and pending_output:
                     # Some exports carry only Harbor's last-call counter. Bind it to
@@ -467,6 +505,7 @@ class CodexSnapshotResume(NativeResumeMixin, Codex):
                     usage = (payload.get("info") or {}).get("last_token_usage")
                     if not usage:
                         return trajectory
+                    provisional = len(calls)
                     calls.append((model, usage))
                     pending_output = False
         if not calls or pending_output:
@@ -498,8 +537,8 @@ def resolve_polled_commands(plan, steps):
         if event["tool"] != "unified_exec":
             continue
         start = by_call[event["call_id"]]
-        start["side_effect"] = "other"
         if not start.get("bg_finished_before_k"):
+            plan.setdefault("replay_refusals", []).append(f"{event['call_id']}: Codex process still running at cut")
             continue
         polls = []
         for next_event in events[i+1:]:
@@ -510,6 +549,7 @@ def resolve_polled_commands(plan, steps):
                 break
             polls.append(by_call[next_event["call_id"]])
         if not polls or polls[-1]["obs_line"] != start["bg_finished_line"]:
+            plan.setdefault("replay_refusals", []).append(f"{event['call_id']}: cannot merge Codex process polls")
             continue
         start.update(tool="Bash", side_effect="exec", duration_s=start.get("bg_duration_s"),
                      is_error=polls[-1]["is_error"], orig_text="".join(a["orig_text"] for a in [start, *polls]))
