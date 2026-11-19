@@ -139,6 +139,8 @@ def replay_plan(ir, k_index, include_read_only=False):
     plan = {"trial": ir["trial"], "resume_step_atif": ir["steps"][k]["atif_step_id"], "resume_step_index": k,
             "actions": actions}
     if "native_replay_revision" in ir:
+        if ir.get("native_agent"):
+            plan["native_agent"] = ir["native_agent"]
         plan["native_replay_revision"] = ir["native_replay_revision"]
         if refusals:
             plan["replay_refusals"] = refusals

@@ -52,7 +52,8 @@ def probe_post_cut(sbx, run, plan: dict, state_dir: Path, tag: str) -> dict:
         return {"n": 0, "present": 0, "missing": []}
     sbx.files.write(f"{REPLAY_DIR}/postcut_paths.json", json.dumps(paths).encode())
     sbx.files.write(f"{REPLAY_DIR}/postcut_probe.py", POSTCUT_SCRIPT.encode())
-    run(sbx, f"python3 {REPLAY_DIR}/postcut_probe.py {REPLAY_DIR}/postcut_paths.json "
+    python = runtime.RUNTIME if plan.get("native_agent") == "codex" else "python3"
+    run(sbx, f"{python} {REPLAY_DIR}/postcut_probe.py {REPLAY_DIR}/postcut_paths.json "
              f"{REPLAY_DIR}/postcut_presence.json")
     raw = json.loads(bytes(sbx.files.read(f"{REPLAY_DIR}/postcut_presence.json", format="bytes")).decode())
     missing = sorted(p for p, ok in raw.items() if not ok)
@@ -111,7 +112,7 @@ def _write_in_parts(sbx, remote: str, data: bytes, part: int = 8 * 1024 * 1024) 
         raise RuntimeError(f"part upload of {remote} produced an empty file")
 
 
-def dispatch_replay(sbx, cwd: str, exec_cap: int, replay_deadline_s: int = REPLAY_DEADLINE_S, pi_user=None) -> int:
+def dispatch_replay(sbx, cwd: str, exec_cap: int, replay_deadline_s: int = REPLAY_DEADLINE_S, pi_user=None, python="python3") -> int:
     """Start the replay exactly once in SDK background mode; completion is signalled by an atomic rc file.
 
     The replay runs in a LOGIN shell, as the original agent's shell did (Harbor's task healthcheck installs the
@@ -120,7 +121,7 @@ def dispatch_replay(sbx, cwd: str, exec_cap: int, replay_deadline_s: int = REPLA
     wrong interpreter (e.g. /opt/conda/bin/python3 without numpy instead of /opt/conda/envs/stereo/bin/python3)."""
     user_arg = "" if pi_user is None else " --pi-user " + shlex.quote(str(pi_user))
     command = (f'cd {shlex.quote(cwd)} && timeout -s TERM -k 10s {int(replay_deadline_s)}s '
-               f'python3 {REPLAY_DIR}/replay_inside.py {REPLAY_DIR}/plan.json '
+               f'{shlex.quote(python)} {REPLAY_DIR}/replay_inside.py {REPLAY_DIR}/plan.json '
                f'{REPLAY_DIR}/replay_report.json --exec-cap {int(exec_cap)}{user_arg} '
                f'> {REPLAY_DIR}/replay_stdout.log 2>&1; rc=$?; '
                f'printf "%s\\n" "$rc" > {REPLAY_DIR}/rc.tmp; '
@@ -138,7 +139,8 @@ def retain_for_audit(requested: bool, plan: dict, report: dict, rc) -> bool:
 
 def fingerprint_command_for(meta: dict[str, Any]) -> str:
     roots = meta.get("fingerprint_roots") or list(DEFAULT_ROOTS)
-    return build_fingerprint_command(roots, meta.get("fingerprint_optional_roots", []))
+    python = runtime.RUNTIME if meta.get("agent") == "codex" else "python3"
+    return build_fingerprint_command(roots, meta.get("fingerprint_optional_roots", []), python=python)
 
 
 def native_user_refusal(agent, task_dir, plan, policy):
@@ -374,7 +376,9 @@ for _ in range(12):
 print(json.dumps({"killed": killed}))
 """
             cleanup_python = "python3"
-            if adapter.name == "pi":
+            if adapter.name == "codex":
+                cleanup_python = runtime.RUNTIME
+            elif adapter.name == "pi":
                 # Reuse the pinned interpreter already present on a prepared base snapshot.
                 cleanup_python = f'$(command -v python3 || echo {runtime.RUNTIME})'
             kill_cmd = "echo " + __import__("base64").b64encode(kill.encode()).decode() + f" | base64 -d | {cleanup_python} -"
@@ -433,7 +437,7 @@ print(json.dumps({"killed": killed}))
             run(sbx, "mkdir -p " + shlex.quote(str(Path(sess_path).parent)))
             _write_in_parts(sbx, sess_path, transcript_prefix(meta, bundle))
         cwd = meta.get("initial_cwd") or meta.get("cwd") or "/app"
-        replay_options = {}
+        replay_options = {"python": runtime.RUNTIME} if adapter.name == "codex" else {}
         if meta.get("agent") == "pi":
             agent_settings = tomllib.loads((task_dir / "task.toml").read_text()).get("agent", {})
             replay_options["pi_user"] = agent_settings.get("user", "root")

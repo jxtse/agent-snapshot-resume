@@ -8,7 +8,7 @@ from ..trace.ir import _sha256, _ts
 from .base import AgentAdapter, SnapshotResumeAgentMixin, bounded_remote_command
 
 
-NATIVE_REPLAY_REVISION = 7
+NATIVE_REPLAY_REVISION = 8
 
 
 def mark_parallel_writes(steps, agent):
@@ -73,7 +73,7 @@ class NativeAdapter(AgentAdapter):
             step.update(index=i, elapsed_s=elapsed, remaining_s=timeout-elapsed)
             step.setdefault("atif_step_id", i+1)
             step["line_range"].append(steps[i+1]["line_range"][0] if i+1 < len(steps) else len(records))
-        return dict(native_replay_revision=NATIVE_REPLAY_REVISION, trial=trial.name, session_id=sid, cwd=cwd, project_slug=cwd.replace("/", "-"),
+        return dict(native_agent=self.name, native_replay_revision=NATIVE_REPLAY_REVISION, trial=trial.name, session_id=sid, cwd=cwd, project_slug=cwd.replace("/", "-"),
                     cc_version=version, start_ts=start, flags=flags, sidechains=[], steps=steps,
                     sources=dict(session_jsonl=str(path.relative_to(trial)), session_sha256=_sha256(path)),
                     **fields)

@@ -113,10 +113,10 @@ def load_bundle(path: str | os.PathLike) -> tuple[Path, dict[str, Any]]:
     return b, json.loads((b / "bundle.json").read_text())
 
 
-def seed_hash_command(paths: list[str]) -> str:
+def seed_hash_command(paths: list[str], python="python3") -> str:
     code = ("import pathlib,hashlib,json; print(json.dumps({p:hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest() "
             "for p in " + repr(list(paths)) + "}))")
-    return "python3 -c " + shlex.quote(code)
+    return shlex.quote(python) + " -c " + shlex.quote(code)
 
 
 class SnapshotResumeAgentMixin:
@@ -267,7 +267,9 @@ class SnapshotResumeAgentMixin:
     async def _verify_seeded(self, environment, seeded: dict[str, Path], env: dict[str, str]) -> None:
         """Fail closed unless every seeded remote file has the exact local bytes."""
         expected = {remote: hashlib.sha256(local.read_bytes()).hexdigest() for remote, local in seeded.items()}
-        result = await self.exec_as_agent(environment, command=seed_hash_command(list(seeded)), env=env)
+        from ..proxy import runtime
+        python = runtime.RUNTIME if getattr(getattr(self, "adapter", None), "name", None) == "codex" else "python3"
+        result = await self.exec_as_agent(environment, command=seed_hash_command(list(seeded), python), env=env)
         actual = json.loads(result.stdout or "{}")
         (self._resume_logs() / "session_aux_hashes.json").write_text(
             json.dumps({"expected": expected, "actual": actual}, indent=1))

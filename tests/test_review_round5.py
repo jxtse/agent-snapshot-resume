@@ -31,13 +31,13 @@ def test_native_job_env(tmp_path, monkeypatch, name):
         pi_trial(tmp_path, pi_rows())
     else:
         codex_trial(tmp_path, monkeypatch)
-    dest, _ = bundle.build(adapter=adapter, trial_dir=tmp_path, agent_timeout=60,
-                           atif_step=3, out=tmp_path/"out")
     (tmp_path/"task.toml").write_text("[agent]\n")
     env = dict(DATA_ROOT="/task/data", APP_TOKEN="synthetic", SECOND="${APP_TOKEN}",
                OPENAI_BASE_URL="old", https_proxy="old", ASR_UPSTREAM_URL="old")
     monkeypatch.setenv("APP_TOKEN", "synthetic")
     (tmp_path/"config.json").write_text(json.dumps({"agent": {"env": env, "kwargs": {"obsolete": True}}}))
+    dest, _ = bundle.build(adapter=adapter, trial_dir=tmp_path, agent_timeout=60,
+                           atif_step=3, out=tmp_path/"out")
     cfg = launch.build_job_config(adapter=adapter, bundle=dest, task_dir=tmp_path, job_name="j", jobs_dir=tmp_path,
                                   original_trial_dir=str(tmp_path), snapshot_id="fixture", fake=True)
     agent, = cfg["agents"]
@@ -115,7 +115,7 @@ def test_pi_cut_output_manifest(tmp_path, monkeypatch, change):
     (tmp_path/"long").write_bytes(data)
     filename = Path(recorded).name
     obs = "\n".join(["x"]*2000) + "\n\n[Showing lines 2-2001 of 2001. Full output: "+recorded+"]"
-    actions = bash_plan(tmp_path, "cat long", obs)
+    actions = bash_plan(tmp_path, "cat long", obs, details={"fullOutputPath": recorded})
     commands = {"delete": "rm "+filename, "rename": "mv "+filename+" moved", "rewrite": "printf new > "+filename}
     if change in commands:
         actions.append(dict(tool="Bash", args={"command": commands[change]}, cwd=str(tmp_path),

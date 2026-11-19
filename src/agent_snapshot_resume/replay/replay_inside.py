@@ -145,7 +145,8 @@ def run_bash(cmd, cwd, timeout, merge_stderr=False, termination_code=None, shell
         if pi_output_file:
             proof = restore_pi_log(pi_output_file, out_file, pi_user)
         rc = termination_code if timed_out else (128 - p.returncode if p.returncode < 0 else p.returncode)
-        return {**proof, "rc": rc, "stdout": read_capture(out_file), "stderr": "" if merge_stderr else read_capture(err_file),
+        stdout = proof.pop("pi_display") if pi_output_file else read_capture(out_file)
+        return {**proof, "rc": rc, "stdout": stdout, "stderr": "" if merge_stderr else read_capture(err_file),
                 "dur": round(time.time() - t0, 2), "timeout": timed_out and termination_code is None,
                 "termination_reproduced": timed_out and termination_code is not None, "pgid": p.pid}
 
@@ -251,7 +252,7 @@ def cc_bash_text(r):
 PI_LOG_DIR = "/tmp"
 PI_TRUNC_RE = re.compile(
     r"\n\n\[Showing (?:lines \d+-\d+ of \d+(?: \(50\.0KB limit\))?|last [\d.]+KB of line \d+ "
-    r"\(line is [\d.]+[KM]B\))\. Full output: (/tmp/pi-bash-[0-9a-f]+\.log)\]"
+    r"\(line is (?:\d+B|[\d.]+[KM]B)\))\. Full output: (/tmp/pi-bash-[0-9a-f]+\.log)\]"
     r"(?=(?:\n\nCommand (?:timed out after [\d.]+ seconds|exited with code \d+|aborted))?\s*\Z)")
 
 
@@ -268,18 +269,23 @@ def restore_pi_log(recorded, capture, user=None):
     target = os.path.join(PI_LOG_DIR, os.path.basename(recorded))
     owner = pwd.getpwuid(os.geteuid()) if user is None else (
         pwd.getpwuid(int(user)) if str(user).isdecimal() else pwd.getpwnam(user))
+    import codecs
+    decoder = codecs.getincrementaldecoder("utf-8-sig")(errors="replace")
+    tail = _PiTail()
     digest = hashlib.sha256()
     with tempfile.NamedTemporaryFile(dir=PI_LOG_DIR, delete=False) as part:
         try:
             offset = 0
             size = os.fstat(capture.fileno()).st_size
             while offset < size:
-                chunk = os.pread(capture.fileno(), min(1024 * 1024, size - offset), offset)
+                chunk = os.pread(capture.fileno(), min(64 * 1024, size - offset), offset)
                 if not chunk:
                     raise IOError("short Pi output capture")
                 digest.update(chunk)
+                tail.append(decoder.decode(chunk))
                 part.write(chunk)
                 offset += len(chunk)
+            tail.append(decoder.decode(b"", final=True))
             part.flush()
             if os.geteuid() != owner.pw_uid or os.fstat(part.fileno()).st_gid != owner.pw_gid:
                 os.fchown(part.fileno(), owner.pw_uid, owner.pw_gid)
@@ -298,7 +304,8 @@ def restore_pi_log(recorded, capture, user=None):
                            preexec_fn=assume_owner if os.geteuid() != owner.pw_uid else None)
     if check.stdout.split()[0].decode() != digest.hexdigest():
         raise IOError("Pi output readback mismatch")
-    return {"pi_output_file": recorded, "pi_output_sha256": digest.hexdigest(), "pi_output_reader_uid": owner.pw_uid}
+    return {"pi_output_file": recorded, "pi_output_sha256": digest.hexdigest(), "pi_output_reader_uid": owner.pw_uid,
+            "pi_display": tail.display(recorded), "pi_output_dimensions": tail.dimensions()}
 
 
 def pi_cut_manifest(paths):
@@ -323,38 +330,84 @@ def pi_cut_manifest(paths):
     return manifest
 
 
+def _pi_size(length):
+    if length < 1024:
+        return f"{length}B"
+    unit, divisor = ("KB", 1024) if length < 1024**2 else ("MB", 1024**2)
+    # JavaScript toFixed(1) rounds exact ties up.
+    tenths = (10 * length + divisor // 2) // divisor
+    return f"{tenths // 10}.{tenths % 10}{unit}"
+
+
+class _PiTail:
+    """Pi OutputAccumulator's decoded counters and bounded UTF-8 rolling tail."""
+    limit = 50 * 1024
+
+    def __init__(self):
+        self.tail = b""
+        self.at_boundary = True
+        self.total = self.completed = self.open_bytes = 0
+
+    def append(self, text):
+        data = text.encode()
+        self.total += len(data)
+        self.completed += data.count(b"\n")
+        last = data.rfind(b"\n")
+        self.open_bytes = self.open_bytes + len(data) if last < 0 else len(data) - last - 1
+        self.tail += data
+        if len(self.tail) > 4 * self.limit:
+            start = len(self.tail) - 2 * self.limit
+            while self.tail[start] & 0xc0 == 0x80:
+                start += 1
+            self.at_boundary = self.tail[start - 1] == 10
+            self.tail = self.tail[start:]
+
+    def dimensions(self):
+        return {"totalBytes": self.total, "totalLines": self.completed + bool(self.open_bytes)}
+
+    def display(self, path):
+        data = self.tail
+        if not self.at_boundary and b"\n" in data:
+            data = data.partition(b"\n")[2]
+        total = self.completed + bool(self.open_bytes)
+        if total <= 2000 and self.total <= self.limit:
+            return data.decode()
+        lines = (data[:-1] if data.endswith(b"\n") else data).split(b"\n") if data else []
+        kept, size = [], 0
+        by_bytes = False
+        if len(lines) <= 2000 and len(data) <= self.limit:
+            # The rolling buffer itself did not need further truncation.
+            content = data.decode()
+            count = len(lines)
+            by_bytes = self.total > self.limit
+        else:
+            for line in reversed(lines):
+                if len(kept) == 2000:
+                    break
+                cost = len(line) + bool(kept)
+                if size + cost > self.limit:
+                    if not kept:
+                        partial = line[-self.limit:].decode(errors="ignore")
+                        return (partial + f"\n\n[Showing last {_pi_size(len(partial.encode()))} of line {total} "
+                                f"(line is {_pi_size(self.open_bytes)}). Full output: {path}]")
+                    by_bytes = True
+                    break
+                kept.append(line)
+                size += cost
+            content = b"\n".join(reversed(kept)).decode()
+            count = len(kept)
+        note = " (50.0KB limit)" if by_bytes else ""
+        return ((content or "(no output)") + f"\n\n[Showing lines {total - count + 1}-{total} of {total}"
+                f"{note}. Full output: {path}]")
+
+
 def pi_truncated_view(orig, new):
-    """Render Pi's observed tail from the full replay capture."""
     path = pi_log_path(orig)
     if not path:
         return new
-    lines = (new[:-1] if new.endswith("\n") else new).split("\n")
-    limit = 50 * 1024
-    if len(lines) <= 2000 and len(new.encode()) <= limit:
-        return new
-    kept, size = [], 0
-    by_bytes = False
-    for line in reversed(lines):
-        if len(kept) == 2000:
-            break
-        data = line.encode()
-        cost = len(data) + bool(kept)
-        if size + cost > limit:
-            if not kept:
-                tail = data[-limit:].decode(errors="ignore")
-                total_bytes = len(data)
-                unit = "KB" if total_bytes < 1024 ** 2 else "MB"
-                divisor = 1024 if unit == "KB" else 1024 ** 2
-                return (tail + f"\n\n[Showing last {len(tail.encode()) / 1024:.1f}KB of line {len(lines)} "
-                        f"(line is {total_bytes / divisor:.1f}{unit}). Full output: {path}]")
-            by_bytes = True
-            break
-        kept.append(line)
-        size += cost
-    total = len(lines)
-    limit_note = " (50.0KB limit)" if by_bytes else ""
-    return ("\n".join(reversed(kept)) + f"\n\n[Showing lines {total - len(kept) + 1}-{total} of {total}"
-            f"{limit_note}. Full output: {path}]")
+    tail = _PiTail()
+    tail.append(new)
+    return tail.display(path)
 
 
 def stop_snapshot_background(action):
@@ -603,10 +656,11 @@ def main():
                         rec["snapshot_background_groups_stopped"] = stop_snapshot_background(a)
                         rec["background_resume"] = "rerun_from_snapshot"
                     capture = {"pi_bash": True, "pi_user": pi_user, "pi_output_file": pi_log} if pi_bash else {}
-                    r = run_bash(cmd, cwd, to, merge_stderr=(se == "exec_background" or pi_bash),
+                    r = run_bash(cmd, cwd, to, merge_stderr=(se == "exec_background" or pi_bash or args.get("codex_unified_exec")),
                                  termination_code=termination_code, shell_env={
                                      **(plan.get("shell_env") or {}), **(args.get("pi_env") or {})}, **capture)
-                    rec["shell_environment"] = ("captured_path" if plan.get("shell_env") else
+                    rec["shell_environment"] = ("recorded_agent_env" if plan.get("agent_env_sha256") else
+                                                "captured_path" if plan.get("shell_env") else
                                                 "nonlogin_shell" if pi_bash else "login_shell")
                     if r.get("termination_reproduced"):
                         rec["termination_reproduced"] = True
@@ -617,7 +671,10 @@ def main():
                         live.append({"pgid": r["pgid"], "replay_t": time.time() - r["dur"],
                                      "orig_t": iso_ts(a.get("timestamp")), "call_id": a["call_id"]})
                         rec["left_background_job"] = True
-                    rec["stdout_full"] = r["stdout"]
+                    if pi_log:
+                        rec["pi_displayed_output"] = r["stdout"]
+                    else:
+                        rec["stdout_full"] = r["stdout"]
                     rec["stderr_full"] = r["stderr"]
                     rec["orig_full"] = a.get("orig_text")
                     if se == "exec":
@@ -625,20 +682,18 @@ def main():
                         comparison_rc = r["rc"]
                         if pi_bash:
                             new = r["stdout"]
-                            if new.startswith("\ufeff"):
+                            if not pi_log and new.startswith("\ufeff"):
                                 new = new[1:]  # Pi's streaming TextDecoder strips the first BOM.
                             if pi_log:
                                 rec.update(pi_output_file=r["pi_output_file"], pi_output_sha256=r["pi_output_sha256"],
                                            pi_output_reader_uid=r["pi_output_reader_uid"])
-                                rec["pi_output_dimensions"] = {"totalBytes": len(new.encode()),
-                                                               "totalLines": new.count("\n") + int(bool(new) and not new.endswith("\n"))}
+                                rec["pi_output_dimensions"] = r["pi_output_dimensions"]
                                 historical = args.get("pi_historical_output") or {}
                                 actual = dict(rec["pi_output_dimensions"], sha256=rec["pi_output_sha256"])
                                 rec["pi_output_evidence"] = (
                                     "historical_mismatch" if any(actual[k] != v for k, v in historical.items())
                                     else "historical_sha256" if "sha256" in historical else
                                     "historical_dimensions" if historical else "replay_hash_only")
-                                new = pi_truncated_view(a.get("orig_text"), new)
                             elif "pi_manual_exit_code" in args:
                                 # Manual Pi records the combined body and numeric exitCode separately.
                                 comparison_rc = None

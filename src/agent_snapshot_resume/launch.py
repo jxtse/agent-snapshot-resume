@@ -18,16 +18,11 @@ from typing import Any
 from urllib.parse import urlparse
 
 from . import config
+from .agent_env import SECRET_NAME as _SECRET_RE, RESERVED_ENV as _RESERVED_ENV, native_agent_env
 from .agents.base import load_bundle
 
 SNAPSHOT_ENV_IMPORT = "agent_snapshot_resume.sandbox.snapshot_env:SnapshotCloneEnvironment"
 _TEMPLATE_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
-_SECRET_RE = re.compile(r"(KEY|SECRET|TOKEN(?!S)|PASSWORD|CREDENTIAL|AUTH)", re.I)
-# Agent env keys that must come from this tool, never from the original run.
-_RESERVED_ENV = {"ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_BASE_URL",
-                 "OPENAI_API_KEY", "CLAUDE_CONFIG_DIR"}
-
-
 # Packed inputs a task image unpacks during its build and then drops (round 1b: a task's `tests/data/*.tar.gz`
 # population archives). They are never verifier runtime files, and a task's own corpus gate treats a restored copy
 # as an "extra" file, so they are not part of the /tests identity the gate asserts.
@@ -52,23 +47,16 @@ _RESUME_KWARGS = {"resume_bundle", "upstream_fake", "upstream_url", "parity_gate
                   "passthrough_script_sha256", "allow_incomplete_evidence", "parity_verdict", "fake_parity_verdict"}
 
 
-_NATIVE_ROUTE_ENV = {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "ASR_UPSTREAM_URL",
-                     "ASR_MODEL", "OPENAI_API_BASE",
-                     "OPENAI_MODEL", "OPENAI_ORG_ID", "OPENAI_PROJECT_ID", "ANTHROPIC_MODEL"}
-
-
-_NATIVE_SESSION_ENV = {"codex": {"CODEX_HOME"}, "pi": {"PI_CODING_AGENT_DIR", "PI_OFFLINE"}}
-
-
 def original_agent_settings(trial_dir: str | None, *, native: str | None = None) -> tuple[dict[str, str], dict[str, Any]]:
     """Non-secret env and kwargs of the original run's agent (from <trial>/config.json), to reproduce its setup."""
+    if native:
+        return native_agent_env(trial_dir, native)[0], {}
     if not trial_dir or not (Path(trial_dir) / "config.json").is_file():
         return {}, {}
     agent = (json.loads((Path(trial_dir) / "config.json").read_text()).get("agent") or {})
-    reserved = _RESERVED_ENV | _NATIVE_ROUTE_ENV | _NATIVE_SESSION_ENV.get(native, set()) if native else _RESERVED_ENV
     env = {}
     for k, v in (agent.get("env") or {}).items():
-        if _SECRET_RE.search(k) or (k.upper() if native else k) in reserved:
+        if _SECRET_RE.search(k) or k in _RESERVED_ENV:
             continue
         if any(_SECRET_RE.search(ref[1]) for ref in _TEMPLATE_RE.finditer(str(v))):
             continue
@@ -79,8 +67,6 @@ def original_agent_settings(trial_dir: str | None, *, native: str | None = None)
                 print(f"warning: {k}={agent['env'][k]} not set here; dropped", file=sys.stderr)
                 continue
         env[k] = str(v)
-    if native:
-        return env, {}
     kwargs = {k: v for k, v in (agent.get("kwargs") or {}).items()
               if k not in _RESUME_KWARGS and k != "version" and not _SECRET_RE.search(k)}
     return env, kwargs
@@ -241,7 +227,14 @@ def build_job_config(*, adapter, bundle: Path, task_dir: Path, job_name: str, jo
         raise SystemExit("need --snapshot-state (recommended) or --snapshot-id")
     # Native adapters reconstruct the original provider settings from their session and pinned auxiliary data.
     native = adapter.name if getattr(adapter, "wire", None) else None
-    orig_env, orig_kwargs = original_agent_settings(original_trial_dir, native=native)
+    plan_file = bundle / "plan.json"
+    plan = json.loads(plan_file.read_bytes()) if native and plan_file.is_file() else {}
+    if "agent_env_sha256" in plan:
+        orig_env, orig_kwargs = plan["shell_env"], {}
+        if any(k in orig_env and v != orig_env[k] for k, v in (extra_env or {}).items()):
+            raise ValueError("native environment override differs from the replay plan")
+    else:
+        orig_env, orig_kwargs = original_agent_settings(original_trial_dir, native=native)
     from .proxy.runtime import verified_script
     script = verified_script(passthrough_script, passthrough_script_sha256)
     if allow_incomplete_evidence and parity_gate != "require":

@@ -251,7 +251,7 @@ def plan_with_observations(ir: dict[str, Any], k: int) -> dict[str, Any]:
                         rows = re.findall(r"(?m)^\s*\d+[→\t](.*)$", text)
                         if rows:
                             a["bg_original_output"] = "\n".join(rows)
-    if any(a["tool"] == "unified_exec" for a in plan["actions"]):
+    if ir.get("native_agent") == "codex" or any(a["tool"] == "unified_exec" for a in plan["actions"]):
         from .agents.codex import resolve_polled_commands
         resolve_polled_commands(plan, ir["steps"][:k])
     return plan
@@ -341,7 +341,22 @@ def resolved_replay_plan(trial_dir, ir, k, raw_lines):
     plan["post_cut_paths"] = post_cut_referenced_files(ir, k)
     plan["initial_cwd"] = ir.get("cwd") or next((json.loads(trace_ir._REDACT_RE.sub(r"\1null", line)).get("cwd")
                                                  for line in raw_lines if '"cwd"' in line), None)
-    plan["shell_env"] = captured_shell_env(trial_dir)
+    native = ir.get("native_agent")
+    if native:
+        from .agent_env import native_agent_env, unavailable_references
+        env, unavailable = native_agent_env(trial_dir, native)
+        plan["shell_env"] = env
+        plan["agent_env_sha256"] = {name: hashlib.sha256(value.encode()).hexdigest() for name, value in env.items()}
+        for action in plan["actions"]:
+            args = action["args"]
+            if action["tool"] == "Bash" and not args.get("codex_patch") and isinstance(args.get("command"), str):
+                known = env.keys() | args.get("pi_env", {}).keys()
+                missing = unavailable_references(args["command"], known, unavailable)
+                if missing:
+                    plan.setdefault("replay_refusals", []).append(
+                        f"{action['call_id']}: unavailable historical environment: {', '.join(missing)}")
+    else:
+        plan["shell_env"] = captured_shell_env(trial_dir)
     return plan
 
 

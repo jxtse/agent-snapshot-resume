@@ -230,7 +230,8 @@ class PiAdapter(NativeAdapter):
             msg = row.get("message") or {}
             if msg.get("role") == "toolResult" and (
                     (msg.get("details") or {}).get("fullOutputPath")
-                    or any(pi_log_path(b.get("text")) for b in msg["content"])):
+                    or (msg.get("toolName") == "bash" and (msg.get("details") or {}).get("truncation"))
+                    or (msg.get("isError") and any(pi_log_path(b.get("text")) for b in msg["content"]))):
                 abandoned_effects.append(i)
             if msg.get("role") == "bashExecution":
                 abandoned_effects.append(i)
@@ -287,12 +288,13 @@ class PiAdapter(NativeAdapter):
                 text = "\n".join(b["text"] for b in msg["content"] if b["type"] == "text")
                 if call["args"].get("pi_bash"):
                     log = pi_log_path(text)
-                    recorded_log = (msg.get("details") or {}).get("fullOutputPath")
-                    if recorded_log and recorded_log != log:
+                    details = msg.get("details") or {}
+                    recorded_log = details.get("fullOutputPath")
+                    needs_log = recorded_log or details.get("truncation") or (log and call["is_error"])
+                    if needs_log and not (recorded_log and recorded_log == log):
                         call["replay_refusal"] = "unsupported or inconsistent Pi full output path"
-                    if log:
-                        call["args"]["pi_output_file"] = log
-                        details = msg.get("details") or {}
+                    if recorded_log and log == recorded_log:
+                        call["args"]["pi_output_file"] = recorded_log
                         truncation = details.get("truncation") or {}
                         expected = {key: truncation[key] for key in ("totalBytes", "totalLines") if key in truncation}
                         if details.get("fullOutputSha256"):
@@ -301,6 +303,8 @@ class PiAdapter(NativeAdapter):
                             call["args"]["pi_historical_output"] = expected
                         call.update(side_effect="exec", missing_result_reason="no matching Pi toolResult before cut")
                     timeout = re.search(r"(?:^|\n\n)Command timed out after (\d+(?:\.\d+)?) seconds\s*\Z", text)
+                    if call["is_error"] and re.search(r"(?:^|\n\n)Command aborted\s*\Z", text):
+                        call["replay_refusal"] = "Pi Bash command aborted at an unknown execution point"
                     if call["is_error"] and timeout:
                         seconds = float(timeout[1])
                         if seconds <= 0 or seconds * 1000 != call["args"].get("timeout"):

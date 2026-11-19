@@ -120,7 +120,7 @@ def tool_action(payload, cwd, args=None):
     if payload["type"] == "custom_tool_call":
         if name == "apply_patch":
             # The pinned executable provides the patch implementation, including moves and contextual hunks.
-            return "Bash", {"command": shlex.join(["codex", "--codex-run-as-apply-patch", payload["input"]])}, "exec", cwd
+            return "Bash", {"command": shlex.join(["codex", "--codex-run-as-apply-patch", payload["input"]]), "codex_patch": True}, "exec", cwd
         return name, {"input": payload["input"]}, "other", cwd
     if args is None:
         args = json.loads(payload["arguments"])
@@ -137,8 +137,10 @@ def tool_action(payload, cwd, args=None):
             effect = "read_only" if read_only else "exec"
             if shell or args.get("login") is False:
                 cmd = shlex.join([shell or "bash", "-lc" if args.get("login", True) else "-c", cmd])
-            return ("Bash", {"command": cmd}, effect,
-                    posixpath.join(cwd, workdir))
+            mapped = {"command": cmd}
+            if name == "exec_command":
+                mapped["codex_unified_exec"] = True
+            return "Bash", mapped, effect, posixpath.join(cwd, workdir)
     return name, args, "other", cwd
 
 
@@ -550,6 +552,12 @@ def resolve_polled_commands(plan, steps):
     actions = plan["actions"]
     events = sorted((e for step in steps for e in step["events"] if e["type"] == "tool_call"),
                     key=lambda e: e["line"])
+    # Joining a reused ID can misattribute observations and process completions.
+    counts = Counter(e["call_id"] for e in events)
+    ambiguous = sorted({a["call_id"] for a in actions if counts[a["call_id"]] > 1})
+    if ambiguous:
+        plan.setdefault("replay_refusals", []).append("duplicate Codex call_id: " + ", ".join(ambiguous))
+        return
     by_call = {a["call_id"]: a for a in actions}
     consumed = set()
     for i, event in enumerate(events):

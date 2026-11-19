@@ -34,11 +34,11 @@ def replay_actions(root, actions, monkeypatch):
     return json.loads(report.read_text())["results"]
 
 
-def bash_plan(root, command, observation, error=False, **args):
+def bash_plan(root, command, observation, error=False, details=None, **args):
     rows = pi_rows()
     rows[2]["message"]["content"] = [dict(type="toolCall", name="bash", id="call",
                                           arguments=dict(command=command, **args))]
-    rows[3]["message"].update(isError=error, content=[dict(type="text", text=observation)])
+    rows[3]["message"].update(isError=error, details=details, content=[dict(type="text", text=observation)])
     rows[0]["cwd"] = str(root)
     return bundle.plan_with_observations(pi_trial(root, rows), 2)["actions"]
 
@@ -48,7 +48,7 @@ def test_truncated_read_only_restores_bytes(tmp_path, monkeypatch):
     data = b"\xff\n" + b"x\n" * 2000
     (tmp_path / "long").write_bytes(data)
     obs = "\n".join(["x"] * 2000) + "\n\n[Showing lines 2-2001 of 2001. Full output: " + path + "]"
-    actions = bash_plan(tmp_path, "cat long", obs)
+    actions = bash_plan(tmp_path, "cat long", obs, details={"fullOutputPath": path})
     assert len(actions) == 1
     # Redirect only the guest log directory during this unit test.
     monkeypatch.setattr(replay, "PI_LOG_DIR", str(tmp_path))
