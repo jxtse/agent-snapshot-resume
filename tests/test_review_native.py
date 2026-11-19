@@ -64,11 +64,12 @@ def test_truncated_read_only_restores_bytes(tmp_path, monkeypatch):
     rec = {}
     files = Mock()
     files.read.return_value = data
-    _collect_gate_evidence(SimpleNamespace(files=files), rec, {"results": [result]}, Mock())
+    report = json.loads((tmp_path / "report.json").read_bytes())
+    _collect_gate_evidence(SimpleNamespace(files=files), rec, report, Mock())
     assert rec["auxiliary_hashes"] == {path: result["pi_output_sha256"]}
     files.read.return_value = b"changed"
     with pytest.raises(RuntimeError, match="hash mismatch"):
-        _collect_gate_evidence(SimpleNamespace(files=files), rec, {"results": [result]}, Mock())
+        _collect_gate_evidence(SimpleNamespace(files=files), rec, report, Mock())
 
 
 @pytest.mark.parametrize("receipt", [True, False])

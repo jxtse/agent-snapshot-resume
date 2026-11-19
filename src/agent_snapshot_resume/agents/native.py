@@ -8,7 +8,7 @@ from ..trace.ir import _sha256, _ts
 from .base import AgentAdapter, SnapshotResumeAgentMixin, bounded_remote_command
 
 
-NATIVE_REPLAY_REVISION = 5
+NATIVE_REPLAY_REVISION = 6
 
 
 def mark_parallel_writes(steps, agent):
@@ -130,14 +130,21 @@ class NativeResumeMixin(SnapshotResumeAgentMixin):
         self.adapter.sanity_check_bundle(bundle, meta)
         if self.adapter.name == "pi":
             plan = json.loads((bundle / "plan.json").read_bytes())
-            for action in plan["actions"]:
-                path = action["args"].get("pi_output_file")
-                if path:
-                    quoted = shlex.quote(path)
-                    # The source records the digest and the clone gate checks it as root.
-                    # Also prove this exact private file can be opened by Harbor's actual agent user.
-                    await self.exec_as_agent(environment, command=(
-                        f'test "$(stat -c %u:%a {quoted})" = "$(id -u):600" && sha256sum {quoted} >/dev/null'))
+            paths = {a["args"]["pi_output_file"] for a in plan["actions"] if a["args"].get("pi_output_file")}
+            manifest = getattr(getattr(self, "options", None), "pi_output_manifest", None) or {}
+            if set(manifest) != paths:
+                raise RuntimeError("missing Pi cut output manifest for this plan")
+            for path, info in manifest.items():
+                quoted = shlex.quote(path)
+                if info is None:
+                    command = f"test ! -e {quoted} && test ! -L {quoted}"
+                else:
+                    ownership = f"{int(info['uid'])}:{int(info['gid'])}:{int(info['mode']):o}"
+                    expected = shlex.quote(info["sha256"] + "  " + path)
+                    command = (f'test ! -L {quoted} && test -f {quoted} && '
+                               f'test "$(stat -c %u:%g:%a {quoted})" = {ownership} && '
+                               f'test "$(sha256sum {quoted})" = {expected}')
+                await self.exec_as_agent(environment, command=command)
         env, remote, args, config_path, config = self.adapter.resume_setup(meta, self._resume_base_url(meta["run_id"]))
         dirs = {str(Path(remote).parent), str(Path(config_path).parent)}
         await self.exec_as_agent(environment, command="mkdir -p " + shlex.join(sorted(dirs)), env=env)
@@ -159,6 +166,7 @@ class NativeResumeMixin(SnapshotResumeAgentMixin):
 
 
 class NativeOptions:
+    pi_output_manifest: dict | None = None
     resume_bundle: str | None = None
     upstream_fake: bool = False
     upstream_url: str | None = None

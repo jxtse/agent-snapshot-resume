@@ -52,14 +52,25 @@ _RESUME_KWARGS = {"resume_bundle", "upstream_fake", "upstream_url", "parity_gate
                   "passthrough_script_sha256", "allow_incomplete_evidence", "parity_verdict", "fake_parity_verdict"}
 
 
-def original_agent_settings(trial_dir: str | None) -> tuple[dict[str, str], dict[str, Any]]:
+_NATIVE_ROUTE_ENV = {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "ASR_UPSTREAM_URL",
+                     "ASR_MODEL", "OPENAI_API_BASE",
+                     "OPENAI_MODEL", "OPENAI_ORG_ID", "OPENAI_PROJECT_ID", "ANTHROPIC_MODEL"}
+
+
+_NATIVE_SESSION_ENV = {"codex": {"CODEX_HOME"}, "pi": {"PI_CODING_AGENT_DIR", "PI_OFFLINE"}}
+
+
+def original_agent_settings(trial_dir: str | None, *, native: str | None = None) -> tuple[dict[str, str], dict[str, Any]]:
     """Non-secret env and kwargs of the original run's agent (from <trial>/config.json), to reproduce its setup."""
     if not trial_dir or not (Path(trial_dir) / "config.json").is_file():
         return {}, {}
     agent = (json.loads((Path(trial_dir) / "config.json").read_text()).get("agent") or {})
+    reserved = _RESERVED_ENV | _NATIVE_ROUTE_ENV | _NATIVE_SESSION_ENV.get(native, set()) if native else _RESERVED_ENV
     env = {}
     for k, v in (agent.get("env") or {}).items():
-        if k in _RESERVED_ENV or _SECRET_RE.search(k):
+        if _SECRET_RE.search(k) or (k.upper() if native else k) in reserved:
+            continue
+        if any(_SECRET_RE.search(ref[1]) for ref in _TEMPLATE_RE.finditer(str(v))):
             continue
         m = _TEMPLATE_RE.fullmatch(str(v))
         if m:  # "${VAR}" / "${VAR:-default}": resolve from this process (non-secret names only), else drop
@@ -68,6 +79,8 @@ def original_agent_settings(trial_dir: str | None) -> tuple[dict[str, str], dict
                 print(f"warning: {k}={agent['env'][k]} not set here; dropped", file=sys.stderr)
                 continue
         env[k] = str(v)
+    if native:
+        return env, {}
     kwargs = {k: v for k, v in (agent.get("kwargs") or {}).items()
               if k not in _RESUME_KWARGS and k != "version" and not _SECRET_RE.search(k)}
     return env, kwargs
@@ -227,7 +240,8 @@ def build_job_config(*, adapter, bundle: Path, task_dir: Path, job_name: str, jo
     else:
         raise SystemExit("need --snapshot-state (recommended) or --snapshot-id")
     # Native adapters reconstruct the original provider settings from their session and pinned auxiliary data.
-    orig_env, orig_kwargs = ({}, {}) if getattr(adapter, "wire", None) else original_agent_settings(original_trial_dir)
+    native = adapter.name if getattr(adapter, "wire", None) else None
+    orig_env, orig_kwargs = original_agent_settings(original_trial_dir, native=native)
     from .proxy.runtime import verified_script
     script = verified_script(passthrough_script, passthrough_script_sha256)
     if allow_incomplete_evidence and parity_gate != "require":
@@ -236,6 +250,8 @@ def build_job_config(*, adapter, bundle: Path, task_dir: Path, job_name: str, jo
     upstream_url = upstream_url or config.upstream_url()
     kwargs = {**orig_kwargs, **(extra_kwargs or {}), "version": meta.get("agent_version_orig") or adapter.version,
               "resume_bundle": str(bundle), "upstream_fake": bool(fake), "parity_gate": parity_gate}
+    if adapter.name == "pi" and snapshot_state and source.get("pi_output_manifest") is not None:
+        kwargs["pi_output_manifest"] = source["pi_output_manifest"]
     if script:
         kwargs.update(passthrough_script=str(script), passthrough_script_sha256=passthrough_script_sha256)
     if parity_gate == "require":

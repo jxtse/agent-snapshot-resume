@@ -190,15 +190,24 @@ def _collect_gate_evidence(sbx, rec, rep, save):
     rec["reviewed_replay_exceptions"] = [{"call_id": x["call_id"], "reason": x["reviewed_exception"]}
                                          for x in rep["results"] if x.get("reviewed_exception")]
     rec["auxiliary_hashes"] = {}
-    for item in rep["results"]:
-        for kind in ("background_output", "pi_output"):
-            fp = item.get(kind + "_file")
-            if not fp:
-                continue
-            h = hashlib.sha256(bytes(sbx.files.read(fp, format="bytes"))).hexdigest()
-            if h != item[kind + "_sha256"]:
-                raise RuntimeError(f"Restored {kind} hash mismatch")
-            rec["auxiliary_hashes"][fp] = h
+    pi_paths = {r["pi_output_file"] for r in rep["results"] if r.get("pi_output_file")}
+    manifest = rep.get("pi_output_manifest", {})
+    if pi_paths != set(manifest):
+        raise RuntimeError("missing Pi cut output manifest")
+    expected = [(r["background_output_file"], r["background_output_sha256"]) for r in rep["results"]
+                if r.get("background_output_file")]
+    for path, info in manifest.items():
+        if info is None:
+            quoted = shlex.quote(path)
+            sbx.commands.run(f"test ! -e {quoted} && test ! -L {quoted}", user="root")
+        else:
+            expected.append((path, info["sha256"]))
+    for path, digest in expected:
+        if hashlib.sha256(bytes(sbx.files.read(path, format="bytes"))).hexdigest() != digest:
+            raise RuntimeError("Restored auxiliary file hash mismatch")
+        rec["auxiliary_hashes"][path] = digest
+    if pi_paths:
+        rec["pi_output_manifest"] = manifest
     rec["replay_gate_passed"] = True
     save()
 
@@ -364,7 +373,11 @@ for _ in range(12):
     time.sleep(0.5)
 print(json.dumps({"killed": killed}))
 """
-            kill_cmd = "echo " + __import__("base64").b64encode(kill.encode()).decode() + " | base64 -d | python3 -"
+            cleanup_python = "python3"
+            if adapter.name == "pi":
+                # Reuse the pinned interpreter already present on a prepared base snapshot.
+                cleanup_python = f'$(command -v python3 || echo {runtime.RUNTIME})'
+            kill_cmd = "echo " + __import__("base64").b64encode(kill.encode()).decode() + f" | base64 -d | {cleanup_python} -"
 
             def survivors(tag: str) -> list[str]:
                 ps = run(sbx, "ps -eo pid=,ppid=,args=").stdout.splitlines()
@@ -439,7 +452,7 @@ print(json.dumps({"killed": killed}))
         for name in ("replay_report.json", "replay_stdout.log"):
             (state_dir / f"{tag}-{name}").write_bytes(bytes(sbx.files.read(f"{REPLAY_DIR}/{name}", format="bytes")))
         rep = json.loads((state_dir / f"{tag}-replay_report.json").read_text())
-        step("replay", t, rc=rc, summary={k: v for k, v in rep.items() if k != "results"})
+        step("replay", t, rc=rc, summary={k: v for k, v in rep.items() if k not in ("results", "pi_output_manifest")})
         plan = json.loads((bundle / "plan.json").read_text())
         t = time.time()
         post_cut = probe_post_cut(sbx, run, plan, state_dir, tag)
@@ -462,7 +475,6 @@ print(json.dumps({"killed": killed}))
                 save()
             raise
         (state_dir / f"{tag}-replay_report.json").write_text(json.dumps(rep, ensure_ascii=False, indent=1))
-        rec["replay_gate_passed"] = True
         if replay_policy == "lenient" and isinstance(gate_result, dict):
             # Per-task divergence report: travels with the bundle and the state so results can quote it.
             rec["divergence_report"] = gate_result
@@ -569,7 +581,6 @@ def finish_prepared_source(state_path: Path, *, observe_timeout_s: int = 10800,
         save()
         raise
     rec.pop("replay_gate_error", None)
-    rec["replay_gate_passed"] = True
     rec["replay_policy"] = policy
     if policy == "lenient" and isinstance(gate_result, dict):
         rec["divergence_report"] = gate_result

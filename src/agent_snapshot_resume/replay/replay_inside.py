@@ -301,6 +301,28 @@ def restore_pi_log(recorded, capture, user=None):
     return {"pi_output_file": recorded, "pi_output_sha256": digest.hexdigest(), "pi_output_reader_uid": owner.pw_uid}
 
 
+def pi_cut_manifest(paths):
+    """Record the state of each restored Pi log name after all workspace actions."""
+    import stat
+    manifest = {}
+    for path in sorted(paths):
+        local = os.path.join(PI_LOG_DIR, os.path.basename(path))
+        try:
+            fd = os.open(local, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            manifest[path] = None
+            continue
+        with os.fdopen(fd, "rb") as stream:
+            st = os.fstat(stream.fileno())
+            if not stat.S_ISREG(st.st_mode):
+                raise ValueError("Pi output at cut is not a regular file")
+            digest = hashlib.sha256()
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+            manifest[path] = dict(sha256=digest.hexdigest(), uid=st.st_uid, gid=st.st_gid, mode=stat.S_IMODE(st.st_mode))
+    return manifest
+
+
 def pi_truncated_view(orig, new):
     """Render Pi's observed tail from the full replay capture."""
     path = pi_log_path(orig)
@@ -381,7 +403,7 @@ def stop_snapshot_background(action):
 def edit_original_spans(path, edits, originally_failed):
     """Pi matches each old text against the same input before writing any replacement."""
     try:
-        with open(path, encoding="utf-8", newline="") as stream:
+        with open(path, encoding="utf-8", errors="replace", newline="") as stream:
             source = stream.read()
     except FileNotFoundError:
         return "edit_failed", "error_reproduced" if originally_failed else "edit_target_missing"
@@ -688,9 +710,12 @@ def main():
            "file_write_total": sum(r["side_effect"] == "file_write" for r in results),
            "file_write_ok": sum(r["side_effect"] == "file_write" and r.get("fidelity") in ("exact", "error_reproduced", "orig_error_not_applied") for r in results),
            "results": results}
+    paths = {r["pi_output_file"] for r in results if r.get("pi_output_file")}
+    if paths:
+        rep["pi_output_manifest"] = pi_cut_manifest(paths)
     with open(rep_p, "w") as f:
         json.dump(rep, f, indent=1)
-    print(json.dumps({k: v for k, v in rep.items() if k != "results"}))
+    print(json.dumps({k: v for k, v in rep.items() if k not in ("results", "pi_output_manifest")}))
 
 
 if __name__ == "__main__":

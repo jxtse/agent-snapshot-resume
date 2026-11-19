@@ -5,6 +5,7 @@ import math
 import posixpath
 import re
 import shlex
+from collections import Counter
 from pathlib import Path
 
 from harbor.agents.installed.codex import Codex, CodexOptions
@@ -186,6 +187,7 @@ class CodexAdapter(NativeAdapter):
     def load_trace(self, trial_dir, agent_timeout_s, task=None, reward=None):
         trial = Path(trial_dir)
         path = self.find_session(trial)
+        session_file = self.replay_session_path({"session_relpath": str(path.relative_to(trial))})
         with path.open("rb") as stream:
             rows = [json.loads(line) for line in stream]
         header = rows[0]["payload"]
@@ -283,6 +285,16 @@ class CodexAdapter(NativeAdapter):
                 policy = recorded_sandbox_mode(context)
                 if effect != "read_only" and (policy != "danger-full-access" or permissions not in (None, "use_default")):
                     event["replay_refusal"] = f"Codex sandbox policy {policy or 'unrecorded'} cannot be reproduced"
+                if tool == "Bash":
+                    # The guest seeds /logs/agent/sessions before replay. Include common shell spellings
+                    # and relative reads from a workdir inside the seeded tree.
+                    command = args["command"].replace('"', "").replace("'", "")
+                    session_root = "/logs/agent/sessions"
+                    if (posixpath.basename(session_file) in command or session_root in command
+                            or re.search(r"(?:\$\{?CODEX_HOME\}?|\.codex)/sessions\b", command)
+                            or workdir == session_root or workdir.startswith(session_root + "/")
+                            or (workdir == "/logs/agent" and re.search(r"\bsessions\b", command))):
+                        event["replay_refusal"] = "Codex session contents at execution time cannot be reconstructed"
                 calls[p["call_id"]] = event, current
             elif subtype in ("message", "reasoning"):
                 if subtype == "message":
@@ -297,10 +309,8 @@ class CodexAdapter(NativeAdapter):
             trial, steps, [[e["call_id"] for e in st["events"] if e["type"] == "tool_call"] for st in steps],
             [st.get("atif_source", st["source"]) for st in steps])
         records = self.request_records(trial)
-        for st in steps:
-            if st["source"] != "agent":
-                continue
-            hits, _ = self.match_records(records, st, header["id"])
+        matches = self.trace_record_matches(records, steps, header["id"])
+        for st, (hits, _) in zip(steps, matches):
             if len(hits) == 1 and hits[0][1].get("ts"):
                 value = hits[0][1]["ts"]
                 try:
@@ -351,11 +361,21 @@ class CodexAdapter(NativeAdapter):
                 all(usage.get(key) is not None and usage[key] == (r.get("usage") or {}).get(key) for key in keys)]
         return hits, False
 
+    def trace_record_matches(self, records, steps, session_id):
+        candidates = [self.match_records(records, step, session_id) if step["source"] == "agent" else ([], False)
+                      for step in steps]
+        owners = Counter(i for hits, _ in candidates for i, _ in hits)
+        return [(hits if len(hits) == 1 and owners[hits[0][0]] == 1 else [], captured)
+                for hits, captured in candidates]
+
     def native_reference(self, trial, ir, k, prefix):
         if (trial / "agent/model-proxy/native-reference.jsonl").exists():
+            entry = ir["steps"][k].get("message_id")
+            if sum(s.get("message_id") == entry for s in ir["steps"] if s["source"] == "agent") != 1:
+                return None, "ambiguous captured Codex request"
             return super().native_reference(trial, ir, k, prefix)
         model = ir["steps"][k]["native_model"]
-        hits, captured = self.match_records(self.request_records(trial), ir["steps"][k], ir["session_id"])
+        hits, captured = self.trace_record_matches(self.request_records(trial), ir["steps"], ir["session_id"])[k]
         if captured:
             if len(hits) != 1:
                 return None, "ambiguous captured Codex request"

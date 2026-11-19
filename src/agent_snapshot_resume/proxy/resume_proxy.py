@@ -970,15 +970,29 @@ async def handle(request):
         wlog(app, run_id, "requests.jsonl", rec)
         return web.json_response({"type": "error", "error": {"type": "api_error", "message": "resume proxy upstream error"}}, status=529)
     resp = web.StreamResponse(status=up.status, headers={k: v for k, v in up.headers.items() if k.lower() not in HOP | {"content-encoding"}})
-    await resp.prepare(request)
     nbytes = 0
-    async for chunk in up.content.iter_any():
-        nbytes += len(chunk)
-        await resp.write(chunk)
-    await resp.write_eof()
-    up.release()
-    rec.update({"status": up.status, "latency_s": round(time.time() - t0, 2), "resp_bytes": nbytes})
-    wlog(app, run_id, "requests.jsonl", rec)
+    try:
+        try:
+            await resp.prepare(request)
+        except ConnectionError:
+            rec["client_closed_before_eof"] = True
+            return resp
+        async for chunk in up.content.iter_any():
+            nbytes += len(chunk)
+            try:
+                await resp.write(chunk)
+            except ConnectionError:
+                rec["client_closed_before_eof"] = True
+                break
+        else:
+            try:
+                await resp.write_eof()
+            except ConnectionError:
+                rec["client_closed_before_eof"] = True
+    finally:
+        up.release()
+        rec.update(status=up.status, latency_s=round(time.time() - t0, 2), resp_bytes=nbytes)
+        wlog(app, run_id, "requests.jsonl", rec)
     return resp
 
 

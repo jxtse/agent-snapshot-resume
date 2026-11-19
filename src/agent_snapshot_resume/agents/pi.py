@@ -405,7 +405,7 @@ class PiAdapter(NativeAdapter):
         url = "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-1.4.0.tgz"
         archive = "/tmp/asr-pi-1.4.0.tgz"
         # Tarball sha256 (matches npm dist.integrity sha512 for 1.4.0); checked with coreutils so the image needs
-        # no python3. VERIFY_PACKAGE/PI_TREE_SHA256 remain for host-side fixture checks.
+        # no Python packages for this step. VERIFY_PACKAGE/PI_TREE_SHA256 remain for host-side fixture checks.
         from ..proxy.runtime import fetch as _fetch
         command = (f"{_fetch(url, archive, PI_TARBALL_SHA256)} && "
                    f"npm install --prefix /opt/asr-pi --ignore-scripts --no-audit --no-fund {archive} && "
@@ -417,10 +417,12 @@ class PiAdapter(NativeAdapter):
                   " && ln -sf /opt/asr-node/bin/node /usr/local/bin/node"
                   " && ln -sf /opt/asr-node/bin/npm /usr/local/bin/npm"
                 + f' && test "$(node --version)" = "v{NODE_VERSION}"')
-        # Minimal task images may have neither curl nor python3; install curl with the image's own package manager.
-        bootstrap = ("command -v curl >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1 || "
+        # Replay, fingerprint and seed verification all use the image's python3.
+        check_python = "python3 -c 'import sys; sys.exit(sys.version_info < (3, 8))'"
+        bootstrap = (f"{check_python} 2>/dev/null || "
                      "(export DEBIAN_FRONTEND=noninteractive; for i in 1 2 3; do "
-                     "apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && exit 0; "
+                     "apt-get update && apt-get install -y --no-install-recommends python3 curl ca-certificates "
+                     f"&& {check_python} && exit 0; "
                      "sleep 5; done; exit 1)")
         return [("downloader", bootstrap, 600), ("node", node, 300),
                 ("pi", command + f' && test "$(pi --version)" = "{self.version}"', 600)]

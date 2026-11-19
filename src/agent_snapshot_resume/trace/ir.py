@@ -50,9 +50,14 @@ def bash_is_read_only(cmd: str) -> bool:
         name = os.path.basename(exe)
         if exe not in (name, "/bin/" + name, "/usr/bin/" + name):
             return False
-        if name not in _RO_CMDS and any(re.search(r"[*?\[]", arg) for arg in args):
+        if name != "date" and name not in _RO_CMDS and any(re.search(r"[*?\[]", arg) for arg in args):
             return False
-        if name == "sort":
+        if name == "date":
+            formats = [arg for arg in args if arg.startswith("+")]
+            if len(formats) > 1 or any(not (arg.startswith("+") or re.fullmatch(
+                    r"-[uR]+|-I(?:date|hours|minutes|seconds|ns)?", arg)) for arg in args):
+                return False
+        elif name == "sort":
             if any(v.startswith("-") and not re.fullmatch(r"--?|-[bdfghinMnrRsuV]+", v) for v in args):
                 return False
         elif name == "uniq":
