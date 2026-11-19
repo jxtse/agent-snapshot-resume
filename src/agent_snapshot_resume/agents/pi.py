@@ -1,12 +1,16 @@
 """Pi session tree adapter for the openai-completions provider."""
 import json
+import math
 import posixpath
 import re
 import shlex
+from collections import Counter
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 from harbor.agents.installed.pi import Pi, PiOptions
 
+from ..replay.replay_inside import pi_log_path
 from ..trace.ir import bash_is_read_only
 from .native import NativeAdapter, NativeOptions, NativeResumeMixin
 
@@ -67,20 +71,42 @@ def active_branch(records):
     return reversed(chain)
 
 
-def tool_action(name, args, cwd):
+def resolve_pi_path(value, cwd, home=None):
+    """Match resolveToCwd on the POSIX guest. Home must come from the recording."""
+    value = re.sub(r"[\u00a0\u2000-\u200a\u202f\u205f\u3000]", " ", value).removeprefix("@")
+    if value == "~" or value.startswith("~/"):
+        if not home or not posixpath.isabs(home):
+            raise ValueError("Pi home-relative path has no recorded home directory")
+        value = home + value[1:]
+    elif value.startswith("file://"):
+        url = urlsplit(value.replace("\\", "/"))
+        if url.netloc.lower() not in ("", "localhost") or re.search(r"%2f|%(?![\da-f]{2})", url.path, re.I):
+            raise ValueError("invalid POSIX file URL")
+        value = unquote(url.path or "/", errors="strict")
+    return "/" + posixpath.normpath(posixpath.join(cwd, value)).lstrip("/")
+
+
+def tool_action(name, args, cwd, home=None):
     if name == "bash":
         command = args["command"]
-        return "Bash", {"command": command, **({"timeout": 1000*args["timeout"]} if args.get("timeout") else {})}, (
+        mapped = {"command": command, "pi_bash": True}
+        if "timeout" in args:
+            seconds = args["timeout"]
+            if (type(seconds) not in (int, float) or not math.isfinite(seconds)
+                    or not 0 < seconds * 1000 <= 2_147_483_647):
+                raise ValueError("invalid Pi Bash timeout")
+            mapped["timeout"] = 1000 * seconds
+        return "Bash", mapped, (
             "read_only" if bash_is_read_only(command) else "exec")
     if name in {"read", "write", "edit"}:
-        path = posixpath.normpath(posixpath.join(cwd, args["path"]))
+        path = resolve_pi_path(args["path"], cwd, home)
         if name == "read":
             return "Read", dict(file_path=path), "read_only"
         if name == "write":
             return "Write", dict(file_path=path, content=args["content"]), "file_write"
         edits = args.get("edits") or [args]
         if len(edits) == 1:
-            return "Edit", dict(file_path=path, old_string=edits[0]["oldText"], new_string=edits[0]["newText"]), "file_write"
+            return "Edit", dict(file_path=path, match_original=True, old_string=edits[0]["oldText"], new_string=edits[0]["newText"]), "file_write"
         if all(isinstance(e, dict) and "oldText" in e and "newText" in e for e in edits):
             return "MultiEdit", {"file_path": path, "match_original": True, "edits": [
                 {"old_string": e["oldText"], "new_string": e["newText"]} for e in edits]}, "file_write"
@@ -102,6 +128,11 @@ class PiAdapter(NativeAdapter):
         header = records[0]
         if header["type"] != "session" or header.get("version") != 3:
             raise ValueError("unsupported Pi session schema")
+        home_file = trial / "agent/pi/home.txt"
+        home = home_file.read_text().rstrip("\n") if home_file.is_file() else None
+        messages = (r.get("message") or {} for r in records)
+        response_owners = Counter(m["responseId"] for m in messages if m.get("role") == "assistant"
+                                  and m.get("responseId"))
         steps, calls = [], {}
         model = provider = None
         branch = list(active_branch(records))
@@ -111,8 +142,12 @@ class PiAdapter(NativeAdapter):
             if i in included:
                 continue
             msg = row.get("message") or {}
+            if msg.get("role") == "toolResult" and (
+                    (msg.get("details") or {}).get("fullOutputPath")
+                    or any(pi_log_path(b.get("text")) for b in msg["content"])):
+                abandoned_effects.append(i)
             if msg.get("role") == "bashExecution" or (msg.get("role") == "assistant" and any(
-                    b.get("type") == "toolCall" and tool_action(b["name"], b["arguments"], header["cwd"])[2] != "read_only"
+                    b.get("type") == "toolCall" and tool_action(b["name"], b["arguments"], header["cwd"], home)[2] != "read_only"
                     for b in msg["content"])):
                 abandoned_effects.append(i)
         for i, row in branch:
@@ -141,6 +176,20 @@ class PiAdapter(NativeAdapter):
                 call["duration_s"] = msg.get("durationMs", 0) / 1000
                 text = "\n".join(b["text"] for b in msg["content"] if b["type"] == "text")
                 if call["tool"] == "Bash":
+                    log = pi_log_path(text)
+                    recorded_log = (msg.get("details") or {}).get("fullOutputPath")
+                    if recorded_log and recorded_log != log:
+                        raise ValueError("unsupported or inconsistent Pi full output path")
+                    if log:
+                        call["args"]["pi_output_file"] = log
+                        call["side_effect"] = "exec"
+                    timeout = re.search(r"(?:^|\n\n)Command timed out after (\d+(?:\.\d+)?) seconds\s*\Z", text)
+                    if call["is_error"] and timeout:
+                        seconds = float(timeout[1])
+                        if seconds <= 0 or seconds * 1000 != call["args"].get("timeout"):
+                            raise ValueError("Pi timeout differs from recorded tool arguments")
+                        call["args"]["pi_timeout_status"] = timeout[1]
+                        call["side_effect"] = "exec"
                     status = re.search(r"(?:^|\n+)Command exited with code (\d+)\s*\Z", text)
                     if call["is_error"] and status:
                         text = f"Exit code {status[1]}\n" + text[:status.start()]
@@ -150,12 +199,17 @@ class PiAdapter(NativeAdapter):
                                    text=text, line=i))
             elif role == "assistant":
                 steps[-1].update(native_provider=msg["provider"], native_model=msg["model"])
+                if isinstance(msg.get("timestamp"), (int, float)):
+                    steps[-1]["request_start_s"] = msg["timestamp"] / 1000
+                rid = msg.get("responseId")
+                if rid and response_owners[rid] == 1 and msg.get("stopReason") not in {"error", "aborted"}:
+                    steps[-1]["native_response_id"] = rid
                 if msg.get("api") != "openai-completions":
                     raise ValueError("Pi adapter requires openai-completions")
                 model, provider = msg["model"], msg["provider"]
                 for block in msg["content"]:
                     if block["type"] == "toolCall":
-                        tool, args, effect = tool_action(block["name"], block["arguments"], header["cwd"])
+                        tool, args, effect = tool_action(block["name"], block["arguments"], header["cwd"], home)
                         event = dict(type="tool_call", tool=tool, args=args, side_effect=effect, cwd=header["cwd"],
                                      call_id=block["id"], timestamp=row["timestamp"], line=i, is_error=None)
                         calls[block["id"]] = event
@@ -167,9 +221,9 @@ class PiAdapter(NativeAdapter):
                 events.append(dict(type="user_text", text=msg["content"]))
         version_file = trial / "agent/pi/version.txt"
         result_file = trial / "result.json"
-        version = (json.loads(result_file.read_text()).get("agent_info") or {}).get("version") if result_file.is_file() else None
-        if version_file.is_file():
-            version = version_file.read_text().strip()
+        version = version_file.read_text().strip() if version_file.is_file() else None
+        if version is None and result_file.is_file():
+            version = (json.loads(result_file.read_text()).get("agent_info") or {}).get("version")
         if version != self.version:
             raise ValueError("record the pinned Pi CLI version in agent/pi/version.txt")
         from .native import align_atif_step_ids
@@ -179,6 +233,25 @@ class PiAdapter(NativeAdapter):
         return self.trace(path, trial, records, header["id"], header["cwd"], version, steps, agent_timeout_s,
                           flags=flags, task=task, reward=reward, model=model, provider=provider,
                           abandoned_effects=abandoned_effects)
+
+    def native_reference(self, trial, ir, k, prefix):
+        logdir = trial / "agent/model-proxy"
+        if (logdir / "native-reference.jsonl").is_file():
+            return super().native_reference(trial, ir, k, prefix)
+        rid = ir["steps"][k].get("native_response_id")
+        matches = []
+        if rid:
+            for log in sorted(logdir.glob("requests-*.jsonl")):
+                with log.open() as stream:
+                    for line in stream:
+                        row = json.loads(line)
+                        if (row.get("response_id") == rid and row.get("status") == 200
+                                and row.get("path") == "/v1/chat/completions"):
+                            matches.append(row.get("native_reference") or {})
+        if (len(matches) == 1 and matches[0].get("wire") == self.wire and matches[0].get("complete") is True
+                and matches[0].get("raw_sha256")):
+            return dict(content=matches[0], method="captured-response-id", index=k), None
+        return None, "no unique complete receipt for this Pi response"
 
     def cut_line(self, raw_lines, ir, k_index):
         parent = ir["steps"][k_index]["cut_parent"]
@@ -265,13 +338,14 @@ class PiBaseline(Pi):
 
     async def run(self, instruction, environment, context):
         from ..proxy import runtime
-        model = (self.model_name or "").split("/")[-1]
+        model = (self.model_name or "").removeprefix(REASONING_PROVIDER + "/")
         if not model:
             raise ValueError("baseline needs a model name")
         home = "/logs/agent/pi"
         session = home + "/sessions/baseline.jsonl"
         env = {"PI_CODING_AGENT_DIR": home + "/config", "PI_OFFLINE": "1"}
         await self.exec_as_agent(environment, command=f"mkdir -p {home}/sessions {home}/config && "
+                                                     f'printf "%s\\n" "$HOME" > {home}/home.txt && '
                                                      f"pi --version > {home}/version.txt")
         models = pi_models(f"http://127.0.0.1:{runtime.PASSTHROUGH_PORT}/v1", model, REASONING_PROVIDER)
         await self._upload_config_text(environment, content=json.dumps(models),

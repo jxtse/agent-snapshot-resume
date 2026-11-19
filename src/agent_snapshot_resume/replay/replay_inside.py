@@ -103,7 +103,7 @@ def original_timeout(text):
     return int(match[1]) * 60 + int(match[2]) if match else None
 
 
-def run_bash(cmd, cwd, timeout, merge_stderr=False, termination_code=None, shell_env=None):
+def run_bash(cmd, cwd, timeout, merge_stderr=False, termination_code=None, shell_env=None, pi_output_file=None):
     """merge_stderr: one capture file for both streams, in write order (how Claude Code captures a background task's
     output file); stderr is then empty."""
     t0 = time.time()
@@ -135,8 +135,11 @@ def run_bash(cmd, cwd, timeout, merge_stderr=False, termination_code=None, shell
         def read_capture(f):
             # pread does not change the shared open-file offset used by surviving writers.
             return os.pread(f.fileno(), os.fstat(f.fileno()).st_size, 0).decode(errors="replace")
+        proof = {}
+        if pi_output_file:
+            proof = restore_pi_log(pi_output_file, out_file)
         rc = termination_code if timed_out else (128 - p.returncode if p.returncode < 0 else p.returncode)
-        return {"rc": rc, "stdout": read_capture(out_file), "stderr": "" if merge_stderr else read_capture(err_file),
+        return {**proof, "rc": rc, "stdout": read_capture(out_file), "stderr": "" if merge_stderr else read_capture(err_file),
                 "dur": round(time.time() - t0, 2), "timeout": timed_out and termination_code is None,
                 "termination_reproduced": timed_out and termination_code is not None, "pgid": p.pid}
 
@@ -239,33 +242,81 @@ def cc_bash_text(r):
     return out or err
 
 
-PI_TRUNC_RE = re.compile(r"\n\n\[Showing lines (\d+)-(\d+) of (\d+)(?: \(50\.0KB limit\))?\. Full output: (/tmp/pi-bash-[0-9a-f]+\.log)\]\Z")
+PI_LOG_DIR = "/tmp"
+PI_TRUNC_RE = re.compile(
+    r"\n\n\[Showing (?:lines \d+-\d+ of \d+(?: \(50\.0KB limit\))?|last [\d.]+KB of line \d+ "
+    r"\(line is [\d.]+[KM]B\))\. Full output: (/tmp/pi-bash-[0-9a-f]+\.log)\]"
+    r"(?=(?:\n\nCommand (?:timed out after [\d.]+ seconds|exited with code \d+|aborted))?\s*\Z)")
+
+
+def pi_log_path(orig):
+    match = PI_TRUNC_RE.search(orig or "")
+    return match[1] if match else None
+
+
+def restore_pi_log(recorded, capture):
+    import tempfile
+    if not re.fullmatch(r"/tmp/pi-bash-[0-9a-f]+\.log", recorded):
+        raise ValueError("invalid Pi output path")
+    target = os.path.join(PI_LOG_DIR, os.path.basename(recorded))
+    digest = hashlib.sha256()
+    with tempfile.NamedTemporaryFile(dir=PI_LOG_DIR, delete=False) as part:
+        try:
+            offset = 0
+            size = os.fstat(capture.fileno()).st_size
+            while offset < size:
+                chunk = os.pread(capture.fileno(), min(1024 * 1024, size - offset), offset)
+                if not chunk:
+                    raise IOError("short Pi output capture")
+                digest.update(chunk)
+                part.write(chunk)
+                offset += len(chunk)
+            part.flush()
+            os.replace(part.name, target)
+        finally:
+            if os.path.exists(part.name):
+                os.unlink(part.name)
+    checked = hashlib.sha256()
+    with open(target, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            checked.update(chunk)
+    if checked.digest() != digest.digest():
+        raise IOError("Pi output readback mismatch")
+    return {"pi_output_file": recorded, "pi_output_sha256": digest.hexdigest()}
 
 
 def pi_truncated_view(orig, new):
-    """Pi 1.4.0 keeps the tail of a Bash result (2000 lines / 50 KiB) and appends a footer naming a random temp file.
-    If the original observation carries that footer, render the replayed output the same way (same limits, same
-    footer, the recorded temp path substituted) so the comparison sees what the model saw. Otherwise return new."""
-    m = PI_TRUNC_RE.search(orig or "")
-    if not m:
+    """Render Pi's observed tail from the full replay capture."""
+    path = pi_log_path(orig)
+    if not path:
         return new
-    max_lines, max_bytes = 2000, 50 * 1024
-    lines = new.split("\n")
-    if new.endswith("\n"):
-        lines.pop()
-    kept, size, by_bytes = [], 0, False
+    lines = (new[:-1] if new.endswith("\n") else new).split("\n")
+    limit = 50 * 1024
+    if len(lines) <= 2000 and len(new.encode()) <= limit:
+        return new
+    kept, size = [], 0
+    by_bytes = False
     for line in reversed(lines):
-        if len(kept) >= max_lines:
+        if len(kept) == 2000:
             break
-        b = len(line.encode()) + (1 if kept else 0)
-        if size + b > max_bytes:
+        data = line.encode()
+        cost = len(data) + bool(kept)
+        if size + cost > limit:
+            if not kept:
+                tail = data[-limit:].decode(errors="ignore")
+                total_bytes = len(data)
+                unit = "KB" if total_bytes < 1024 ** 2 else "MB"
+                divisor = 1024 if unit == "KB" else 1024 ** 2
+                return (tail + f"\n\n[Showing last {len(tail.encode()) / 1024:.1f}KB of line {len(lines)} "
+                        f"(line is {total_bytes / divisor:.1f}{unit}). Full output: {path}]")
             by_bytes = True
             break
-        kept.insert(0, line)
-        size += b
-    start, total = len(lines) - len(kept) + 1, len(lines)
-    limit = " (50.0KB limit)" if by_bytes else ""
-    return "\n".join(kept) + f"\n\n[Showing lines {start}-{total} of {total}{limit}. Full output: {m[4]}]"
+        kept.append(line)
+        size += cost
+    total = len(lines)
+    limit_note = " (50.0KB limit)" if by_bytes else ""
+    return ("\n".join(reversed(kept)) + f"\n\n[Showing lines {total - len(kept) + 1}-{total} of {total}"
+            f"{limit_note}. Full output: {path}]")
 
 
 def stop_snapshot_background(action):
@@ -318,13 +369,20 @@ def edit_original_spans(path, edits, originally_failed):
             source = stream.read()
     except FileNotFoundError:
         return "edit_failed", "error_reproduced" if originally_failed else "edit_target_missing"
+    bom = "\ufeff" if source.startswith("\ufeff") else ""
+    source = source[len(bom):]
+    first_lf = source.find("\n")
+    crlf = first_lf > 0 and source[first_lf-1] == "\r"
+    def lf(text):
+        return text.replace("\r\n", "\n").replace("\r", "\n")
+    source = lf(source)
     spans = []
     for edit in edits:
-        old = edit["old_string"]
+        old = lf(edit["old_string"])
         start = source.find(old)
         if not old or start == -1 or source.find(old, start+1) != -1:
             return "edit_failed", "error_reproduced" if originally_failed else "edit_target_missing"
-        spans.append((start, start+len(old), edit["new_string"]))
+        spans.append((start, start+len(old), lf(edit["new_string"])))
     spans.sort()
     if any(a[1] > b[0] for a, b in zip(spans, spans[1:])):
         return "edit_failed", "error_reproduced" if originally_failed else "edit_ambiguous"
@@ -332,8 +390,12 @@ def edit_original_spans(path, edits, originally_failed):
         return "skipped_orig_error", "orig_error_now_applicable"
     for start, end, replacement in reversed(spans):
         source = source[:start] + replacement + source[end:]
-    with open(path, "w", encoding="utf-8", newline="") as stream:
-        stream.write(source)
+    payload = (bom + (source.replace("\n", "\r\n") if crlf else source)).encode()
+    with open(path, "wb") as stream:
+        stream.write(payload)
+    with open(path, "rb") as stream:
+        if stream.read() != payload:
+            raise IOError("Pi edit readback mismatch")
     return "applied", "exact"
 
 
@@ -375,8 +437,8 @@ def main():
                     f.write(args.get("content", ""))
                 rec["status"] = "applied"
                 rec["fidelity"] = "exact" if not a.get("is_error") else "orig_error_but_applied"
-            elif tool == "MultiEdit" and args.get("match_original"):
-                rec["status"], rec["fidelity"] = edit_original_spans(args["file_path"], args["edits"], a.get("is_error"))
+            elif tool in ("Edit", "MultiEdit") and args.get("match_original"):
+                rec["status"], rec["fidelity"] = edit_original_spans(args["file_path"], args.get("edits", [args]), a.get("is_error"))
             elif tool == "Edit":
                 fp = args["file_path"]
                 old, new = args.get("old_string", ""), args.get("new_string", "")
@@ -438,13 +500,21 @@ def main():
                         to = min(cap, max(0.1, od + 0.25))
                     if termination_code and to < od:
                         termination_code = None  # the execution cap cannot masquerade as the historical kill
+                    pi_bash = args.get("pi_bash")
+                    pi_log = args.get("pi_output_file")
+                    if pi_bash and args.get("timeout"):
+                        original_limit = args["timeout"] / 1000
+                        to = min(cap, original_limit)
+                        if to == original_limit:
+                            termination_code = 137
                     if scripts_measure_time(cmd, cwd):
                         rec["scripts_measure_time"] = True
                     if a.get("bg_inflight_at_snapshot"):
                         rec["snapshot_background_groups_stopped"] = stop_snapshot_background(a)
                         rec["background_resume"] = "rerun_from_snapshot"
-                    r = run_bash(cmd, cwd, to, merge_stderr=(se == "exec_background"),
-                                 termination_code=termination_code, shell_env=plan.get("shell_env"))
+                    capture = {"pi_output_file": pi_log} if pi_log else {}
+                    r = run_bash(cmd, cwd, to, merge_stderr=(se == "exec_background" or pi_bash),
+                                 termination_code=termination_code, shell_env=plan.get("shell_env"), **capture)
                     rec["shell_environment"] = "captured_path" if plan.get("shell_env") else "login_shell"
                     if r.get("termination_reproduced"):
                         rec["termination_reproduced"] = True
@@ -459,8 +529,23 @@ def main():
                     rec["stderr_full"] = r["stderr"]
                     rec["orig_full"] = a.get("orig_text")
                     if se == "exec":
-                        new = pi_truncated_view(a.get("orig_text"), cc_bash_text(r))
-                        rec["fidelity"] = compare(a.get("orig_text"), new, r["rc"])
+                        new = cc_bash_text(r)
+                        comparison_rc = r["rc"]
+                        if pi_bash:
+                            new = r["stdout"]
+                            if new.startswith("\ufeff"):
+                                new = new[1:]  # Pi's streaming TextDecoder strips the first BOM.
+                            if pi_log:
+                                rec.update(pi_output_file=r["pi_output_file"], pi_output_sha256=r["pi_output_sha256"])
+                                new = pi_truncated_view(a.get("orig_text"), new)
+                            elif r["rc"] and not args.get("pi_timeout_status"):
+                                # The IR canonicalizes Pi's exit trailer to the Bash error prefix.
+                                new = new.rstrip("\n") or "(no output)"
+                            if args.get("pi_timeout_status") and r.get("termination_reproduced"):
+                                new = (new + "\n\n" if new else "") + (
+                                    f"Command timed out after {args['pi_timeout_status']} seconds")
+                                comparison_rc = None
+                        rec["fidelity"] = compare(a.get("orig_text"), new, comparison_rc)
                         if rec["fidelity"] in ("differs", "numbers_differ"):
                             rec["orig_head"] = (a.get("orig_text") or "")[:400]
                             rec["new_head"] = new[:400]

@@ -406,6 +406,18 @@ def recorded_no_match(action, result, *, lenient=False):
             and same(action["orig_text"]) == same(_replayed_text(dict(result, rc=0))))
 
 
+def pi_replay_problem(action, result):
+    args = action.get("args") or {}
+    path = args.get("pi_output_file")
+    if path and (result.get("pi_output_file") != path or not result.get("pi_output_sha256")):
+        return "pi_output_missing"
+    if args.get("pi_bash") and (args.get("pi_timeout_status") or result.get("termination_reproduced")):
+        if (not args.get("pi_timeout_status") or not result.get("termination_reproduced")
+                or result.get("timeout_s") != float(args["pi_timeout_status"])
+                or result.get("rc") != 137 or result.get("fidelity") not in {"exact", "normalized"}):
+            return "pi_timeout_changed"
+
+
 def lenient_blocks(plan, report, rc, post_cut=None):
     """Blocking findings of the lenient policy: the three classes named in the module-level comment."""
     blocks = []
@@ -422,6 +434,9 @@ def lenient_blocks(plan, report, rc, post_cut=None):
             blocks.append({"rule": "identity_mismatch", "call_id": cid})
             continue
         se, orig_ok = action.get("side_effect"), not action.get("is_error")
+        if problem := pi_replay_problem(action, result):
+            blocks.append({"rule": problem, "call_id": cid})
+            continue
         if recorded_no_match(action, result, lenient=True):
             result["fidelity"] = result["automatic_equivalence"] = "recorded_no_match"
             continue
@@ -527,6 +542,8 @@ def validate_replay(plan, report, rc, reviewed_exceptions=None, policy="strict",
         if result.get('pacing_unmet'):
             raise RuntimeError('Replay could not keep the original pacing of a running background job: '
                                + action['call_id'])
+        if problem := pi_replay_problem(action, result):
+            raise RuntimeError(f"{problem}: {action['call_id']}")
         if recorded_no_match(action, result):
             result["fidelity"] = result["automatic_equivalence"] = "recorded_no_match"
             continue

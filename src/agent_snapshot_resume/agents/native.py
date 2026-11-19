@@ -1,4 +1,5 @@
 """Common IR bookkeeping and sandbox seeding for line-oriented native sessions."""
+from collections import Counter, defaultdict
 import json
 import shlex
 from pathlib import Path
@@ -50,7 +51,7 @@ class NativeAdapter(AgentAdapter):
             # No Harbor ATIF export: the 1-based position of each step is its id (as for Claude Code).
             flags.append("atif_missing_step_ids_positional")
         for i, step in enumerate(steps):
-            elapsed = round(_ts(step["timestamp"]) - _ts(start), 3)
+            elapsed = round(step.get("request_start_s", _ts(step["timestamp"])) - _ts(start), 3)
             step.update(index=i, elapsed_s=elapsed, remaining_s=timeout-elapsed)
             step.setdefault("atif_step_id", i+1)
             step["line_range"].append(steps[i+1]["line_range"][0] if i+1 < len(steps) else len(records))
@@ -70,19 +71,25 @@ def align_atif_step_ids(trial, steps, call_ids, sources):
     if not atif.is_file():
         return []
     exported = json.loads(atif.read_text()).get("steps") or []
-    by_call = {c["tool_call_id"]: s["step_id"] for s in exported for c in s.get("tool_calls") or []}
+    by_call = defaultdict(set)
+    for s in exported:
+        for call in s.get("tool_calls") or []:
+            by_call[call["tool_call_id"]].add(s["step_id"])
     by_message = {}
     for s in exported:
         by_message.setdefault((s.get("source"), s.get("timestamp")), []).append(s["step_id"])
-    unbound = 0
+    candidates = []
     for step, calls, source in zip(steps, call_ids, sources):
-        ids = {by_call[c] for c in calls if c in by_call}
+        ids = set().union(*(by_call[c] for c in calls))
         if not ids:
             matches = by_message.get((source, step["timestamp"])) or []
-            if len(matches) == 1:
-                ids = {matches[0]}
-        step["atif_step_id"] = ids.pop() if len(ids) == 1 else None
-        unbound += step["atif_step_id"] is None
+            ids.update(matches)
+        candidates.append(ids)
+    owners = Counter(i for ids in candidates for i in ids)
+    for step, ids in zip(steps, candidates):
+        candidate = next(iter(ids)) if len(ids) == 1 else None
+        step["atif_step_id"] = candidate if owners[candidate] == 1 else None
+    unbound = sum(step["atif_step_id"] is None for step in steps)
     return [f"atif_unbound_steps:{unbound}"] if unbound else []
 
 
@@ -111,10 +118,7 @@ class NativeResumeMixin(SnapshotResumeAgentMixin):
             src = bundle / "aux/model-catalog.json"
             seeded[str(Path(config_path).parent / src.name)] = src
         for dst, src in seeded.items():
-            await environment.upload_file(src, dst)
-            user = getattr(environment, "default_user", None)
-            if user is not None:
-                await self.exec_as_root(environment, command=shlex.join(["chown", str(user), dst]))
+            await self._upload_session_file(environment, src, dst)
         await self._verify_seeded(environment, seeded, env)
         output = self.environment_logs_dir / self._OUTPUT_FILENAME
         command = f"cd {shlex.quote(meta['cwd'])} && {shlex.join(args)} </dev/null >{shlex.quote(str(output))} 2>&1"

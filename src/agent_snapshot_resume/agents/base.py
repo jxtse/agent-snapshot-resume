@@ -31,11 +31,23 @@ import json
 import math
 import os
 import shlex
+import tempfile
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
 
+
+# One API write per part: a provider request that carries more than this can exceed its write timeout (both the
+# seeded session and a persisted tool-result file can be tens of MB of base64 images).
+UPLOAD_PART_BYTES = 8 * 1024 * 1024
+
+
+def upload_part_ranges(size: int, part: int = UPLOAD_PART_BYTES) -> list[tuple[int, int]]:
+    """[start, end) ranges to upload size bytes in; a single range when the file fits in one request."""
+    if size <= part:
+        return [(0, size)]
+    return [(lo, min(lo + part, size)) for lo in range(0, size, part)]
 
 class AgentAdapter(ABC):
     name: str = ""
@@ -116,6 +128,32 @@ class SnapshotResumeAgentMixin:
 
     RESUME_PORT = 4031
     PASSTHROUGH_PORT = 4013
+
+    async def _upload_session_file(self, environment, source: Path, target: str) -> None:
+        """Bound each provider write. Publish a complete seed before its hash check."""
+        ranges = upload_part_ranges(source.stat().st_size)
+        if len(ranges) == 1:
+            await environment.upload_file(source, target)
+        else:
+            # A local private directory also gives concurrent uploads distinct remote part names.
+            with tempfile.TemporaryDirectory(prefix="asr-seed-") as tmp, source.open("rb") as stream:
+                part = Path(tmp) / "part"
+                parts = []
+                staging = shlex.quote(f"{target}.{Path(tmp).name}.joined")
+                try:
+                    for index, (start, end) in enumerate(ranges):
+                        part.write_bytes(stream.read(end - start))
+                        remote = f"{target}.{Path(tmp).name}.{index}"
+                        parts.append(shlex.quote(remote))
+                        await environment.upload_file(part, remote)
+                    joined = " ".join(parts)
+                    await self.exec_as_root(environment, command=(
+                        f"cat {joined} > {staging} && mv {staging} {shlex.quote(target)}"))
+                finally:
+                    await self.exec_as_root(environment, command="rm -f " + " ".join([staging, *parts]))
+        user = getattr(environment, "default_user", None)
+        if user is not None:
+            await self.exec_as_root(environment, command=shlex.join(["chown", str(user), target]))
 
     def _bundle(self):
         return load_bundle(self.options.resume_bundle)

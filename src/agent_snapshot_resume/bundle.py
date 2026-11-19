@@ -473,7 +473,10 @@ def build(*, adapter, trial_dir: Path, atif_step: int | None, out: Path, mode: s
     if evidence:
         elapsed_run = None
         if (evidence.get("run_start") or {}).get("t") and st.get("timestamp"):
-            elapsed_run = chain.ts_seconds(st["timestamp"]) - float(evidence["run_start"]["t"])
+            inference_start = st.get("request_start_s")
+            if inference_start is None:
+                inference_start = chain.ts_seconds(st["timestamp"])
+            elapsed_run = inference_start - float(evidence["run_start"]["t"])
         budget, budget_source = chain.remaining_budget(evidence, elapsed_run, budget)
     if budget <= 0:
         raise SystemExit(f"no agent budget left at step {atif_step} (elapsed {st['elapsed_s']} s >= {timeout} s)")
@@ -530,6 +533,8 @@ def build(*, adapter, trial_dir: Path, atif_step: int | None, out: Path, mode: s
                     native_provider=st.get("native_provider") or ir.get("provider"), native_model=st.get("native_model") or ir.get("model"),
                     native_effort=st.get("native_effort"),
                     session_relpath=ir["sources"]["session_jsonl"])
+    if st.get("native_cwd"):
+        meta.update(initial_cwd=plan["initial_cwd"], cwd=st["native_cwd"])
     if st.get("native_sandbox_mode"):
         meta["native_sandbox_mode"] = st["native_sandbox_mode"]
     if chain_audit is not None:

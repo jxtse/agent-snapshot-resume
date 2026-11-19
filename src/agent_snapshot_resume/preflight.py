@@ -78,15 +78,30 @@ def request_matches(reference: Path, observed: Path, hint: dict | None):
     try:
         original = body_from(reference)
         candidate = body_from(observed)
-        if not isinstance(original, dict) or not all(original.get(k) for k in ("model", "messages", "tools", "system")):
+        if not isinstance(original, dict) or not isinstance(candidate, dict) or not original.get("model"):
+            return False
+        if ("input" in original) == ("messages" in original):
+            return False
+        responses = "input" in original
+        history = "input" if responses else "messages"
+        if not isinstance(original[history], list) or not original[history]:
             return False
         if hint is not None:
             mi, bi, text = hint["message"], hint["block"], hint["text"]
             if not (type(mi) is int and type(bi) is int and min(mi, bi) >= 0 and isinstance(text, str) and text):
                 return False
-            message = candidate["messages"][mi]
-            if message["role"] != "user" or message["content"].pop(bi) != {"type": "text", "text": text}:
+            from .proxy.native_wire import user_item
+            messages = candidate[history]
+            message = messages[mi]
+            if message.get("role") != "user":
                 return False
+            if not ("system" in original and not responses) and bi == 0 and message == user_item(
+                    "responses" if responses else "chat", text):
+                messages.pop(mi)
+            else:
+                block_type = "input_text" if responses else "text"
+                if message["content"].pop(bi) != {"type": block_type, "text": text}:
+                    return False
         return json.dumps(original, sort_keys=True, allow_nan=False) == json.dumps(candidate, sort_keys=True, allow_nan=False)
     except (ValueError, TypeError, KeyError, IndexError, AttributeError):
         return False

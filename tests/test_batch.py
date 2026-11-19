@@ -82,6 +82,7 @@ def fake_launch(launches):
         trial = Path(kw["jobs_dir"]) / kw["job_name"] / "sum-task__t1"
         proxy = trial / "agent" / "resume-proxy" / "run-1"
         proxy.mkdir(parents=True, exist_ok=True)
+        (trial / "result.json").write_text(json.dumps(dict(finished_at="2026-01-01T00:00:05Z", exception_info=None)))
         (proxy / "first_request_rewritten.json").write_text(json.dumps({"body": {"messages": []}, "actions": []}))
         (proxy / "first_request_parity.json").write_text(json.dumps({"ok": True, "request_sha256": "x"}))
         return 0

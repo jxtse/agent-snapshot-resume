@@ -292,6 +292,9 @@ class Batch:
                   "chain": {"base_snapshot": (chain_spec.get("base_snapshot") or {}).get("snapshot_id"),
                             "prior_hints_sha256": hashlib.sha256("\n\n".join(
                                 chain_spec.get("prior_hints") or []).encode()).hexdigest()} if chain_spec else None}
+        if getattr(self.adapter, "wire", None):
+            # Older native bundles can omit Pi file effects or use the initial Codex cwd at the cut.
+            inputs["native_bundle_revision"] = 2
         if self.agent_name == "codex":
             inputs["sandbox_policy_source"] = "turn_context"
         cached = {}
@@ -305,7 +308,8 @@ class Batch:
                                "rebuilt_for_input_change": rebuild}
         for kind, spec in specs.items():
             bdir = ud / "bundles" / spec["run_id"]
-            if bdir.is_dir() and (bdir / "bundle.json").is_file() and not rebuild:
+            if bdir.is_dir() and (bdir / "bundle.json").is_file() and not rebuild and (
+                    cached or not getattr(self.adapter, "wire", None)):
                 meta = json.loads((bdir / "bundle.json").read_text())
             else:
                 bdir, meta = bundle_mod.build(adapter=self.adapter, trial_dir=trial_dir,
@@ -414,6 +418,14 @@ class Batch:
             raise RuntimeError("prepare-snapshot produced no snapshot id")
         return rec
 
+    @staticmethod
+    def _fake_completed(trial: Path) -> bool:
+        try:
+            result = json.loads((trial / "result.json").read_bytes())
+        except (OSError, ValueError):
+            return False
+        return isinstance(result, dict) and bool(result.get("finished_at")) and result.get("exception_info") is None
+
     # ------------------------------------------------------------------ stage: fake parity
     def stage_fake(self, row: dict[str, Any], cut: int, bundled: dict[str, Any], snap_path: Path) -> dict[str, Any]:
         from .launch import launch_one
@@ -432,7 +444,8 @@ class Batch:
                 from .bundle import cut_identity_diff, snapshot_cut_identity
                 ident = Path(cached["first_request"]).parent.parent.parent / "resume" / "bundle_identity.json"
                 theirs = (json.loads(ident.read_text()).get("cut") if ident.is_file() else None) or {}
-                if not cut_identity_diff(snapshot_cut_identity(Path(b["dir"])), theirs):
+                if (self._fake_completed(Path(cached["first_request"]).parents[3])
+                        and not cut_identity_diff(snapshot_cut_identity(Path(b["dir"])), theirs)):
                     from .launch import frozen_first_request_digest
                     try:
                         frozen_first_request_digest(Path(cached["first_request"]), Path(b["dir"]), self.passthrough_args,
@@ -471,7 +484,7 @@ class Batch:
             (ud / f"fake-parity-{kind}.json").write_text(parity.read_text())  # record for the batch, not for freezing
             self.state.update(task, allow_incomplete_evidence=self.route_options["allow_incomplete_evidence"],
                               parity_verdict=report.get("verdict", "ok" if ok else "mismatch"))
-            if not ok or rc or not first.is_file():
+            if not ok or rc or not first.is_file() or not self._fake_completed(trial):
                 raise RuntimeError(f"fake parity or job execution failed for {kind}: {parity}")
             # --freeze-first-request resolves the parity report and the bundle identity *next to* this file, so pass
             # the request where the fake run wrote it (inside the trial's resume-proxy log), never a copy.

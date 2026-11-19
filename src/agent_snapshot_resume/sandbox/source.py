@@ -166,11 +166,13 @@ def _collect_gate_evidence(sbx, rec, rep, save):
                                          for x in rep["results"] if x.get("reviewed_exception")]
     rec["auxiliary_hashes"] = {}
     for item in rep["results"]:
-        if item.get("background_output_file"):
-            fp = item["background_output_file"]
+        for kind in ("background_output", "pi_output"):
+            fp = item.get(kind + "_file")
+            if not fp:
+                continue
             h = hashlib.sha256(bytes(sbx.files.read(fp, format="bytes"))).hexdigest()
-            if h != item["background_output_sha256"]:
-                raise RuntimeError("Restored background output hash mismatch")
+            if h != item[kind + "_sha256"]:
+                raise RuntimeError(f"Restored {kind} hash mismatch")
             rec["auxiliary_hashes"][fp] = h
     rec["replay_gate_passed"] = True
     save()
@@ -391,7 +393,7 @@ print(json.dumps({"killed": killed}))
                          else f"/logs/agent/sessions/projects/{slug}/{sid}.jsonl")
             run(sbx, "mkdir -p " + shlex.quote(str(Path(sess_path).parent)))
             _write_in_parts(sbx, sess_path, transcript_prefix(meta, bundle))
-        cwd = meta.get("cwd") or "/app"
+        cwd = meta.get("initial_cwd") or meta.get("cwd") or "/app"
         rec["replay_pid"] = dispatch_replay(sbx, cwd, exec_cap, replay_deadline_s)
         step("replay_dispatched_once", t, pid=rec["replay_pid"])
         while True:

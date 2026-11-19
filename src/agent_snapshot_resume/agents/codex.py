@@ -8,6 +8,7 @@ import shlex
 from pathlib import Path
 
 from harbor.agents.installed.codex import Codex, CodexOptions
+from harbor.models.trajectories import FinalMetrics
 
 from ..proxy.native_wire import digest
 from ..proxy.runtime import fetch
@@ -215,7 +216,7 @@ class CodexAdapter(NativeAdapter):
                 continue
             if current is None:
                 current = dict(source="agent", timestamp=ts, line_range=[i], events=[],
-                               native_model=model, native_effort=context.get("effort"),
+                               native_model=model, native_cwd=cwd, native_effort=context.get("effort"),
                                native_sandbox_mode=recorded_sandbox_mode(context))
                 steps.append(current)
             if subtype in ("function_call", "custom_tool_call"):
@@ -277,7 +278,13 @@ class CodexAdapter(NativeAdapter):
         records = [json.loads(line) for p in sorted((trial/"agent/model-proxy").glob("requests-*.jsonl"))
                    for line in p.read_text().splitlines()]
         entry = ir["steps"][k].get("message_id")
-        captured = [(i, r["native_reference"]) for i, r in enumerate(records)
+        model = ir["steps"][k]["native_model"]
+        identities = {"session": ir["session_id"], "session_id": ir["session_id"], "thread_id": ir["session_id"],
+                      "response_id": entry, "entry_id": entry, "model": model}
+        records = [(i, row) for i, row in enumerate(records)
+                   if all(not row.get(key) or expected is None or row[key] == expected
+                          for key, expected in identities.items())]
+        captured = [(i, r["native_reference"]) for i, r in records
                     if entry and r.get("entry_id") == entry and r.get("session_id") == ir["session_id"]
                     and r.get("status") == 200 and r.get("native_reference")]
         if captured:
@@ -288,7 +295,7 @@ class CodexAdapter(NativeAdapter):
                 return None, "invalid captured Codex reference"
             return dict(index=i, method="captured-entry-id", content=ref), None
         keys = ("input_tokens", "output_tokens")
-        hits = [(i, r) for i, r in enumerate(records) if r.get("status") == 200 and
+        hits = [(i, r) for i, r in records if r.get("status") == 200 and
                 all(usage.get(key) is not None and usage[key] == (r.get("usage") or {}).get(key) for key in keys)]
         if len(hits) != 1:
             return None, "no unique Codex usage match"
@@ -298,7 +305,7 @@ class CodexAdapter(NativeAdapter):
         history = codex_history(rows, limit)
         instructions = rows[0]["payload"]["base_instructions"]["text"]
         content = dict(wire=self.wire, complete=False, items=[digest(item) for item in history],
-                       fields={"instructions": digest(instructions), "model": digest(record["model"])},
+                       fields={"instructions": digest(instructions), "model": digest(record.get("model") or model)},
                        projection="codex_rollout_tokens", missing_evidence=["original_request_envelope"], logged_item_count=record.get("n_items"))
         return dict(index=index, method="unique-usage", content=content,
                     metadata={k: record.get(k) for k in ("req_bytes", "n_items", "n_tools", "effort", "n_msgs",
@@ -316,12 +323,17 @@ class CodexAdapter(NativeAdapter):
         read_catalog(bundle_dir / "aux/model-catalog.json", meta["native_model"])
         session = bundle_dir / "session_trunc.jsonl"
         if session.is_file():
-            policy = None
+            policy = cwd = initial_cwd = None
             with session.open() as stream:
                 for line in stream:
                     row = json.loads(line)
-                    if row["type"] == "turn_context":
+                    if row["type"] == "session_meta":
+                        initial_cwd = cwd = row["payload"]["cwd"]
+                    elif row["type"] == "turn_context":
+                        cwd = row["payload"]["cwd"]
                         policy = recorded_sandbox_mode(row["payload"])
+            if cwd != meta.get("cwd") or initial_cwd != meta.get("initial_cwd", initial_cwd):
+                raise ValueError("stale Codex working directory; rebuild the bundle")
             if policy == "unsupported" or policy != meta.get("native_sandbox_mode"):
                 raise ValueError("unsupported or stale Codex sandbox policy; rebuild the bundle")
 
@@ -369,6 +381,70 @@ class CodexSnapshotResumeOptions(NativeOptions, CodexOptions):
 class CodexSnapshotResume(NativeResumeMixin, Codex):
     options_model = CodexSnapshotResumeOptions
     adapter = CodexAdapter()
+
+    def _convert_events_to_trajectory(self, session_dir):
+        trajectory = super()._convert_events_to_trajectory(session_dir)
+        if trajectory is None:
+            return None
+        # Harbor persists all steps and bills FinalMetrics. Replace only the latter.
+        trajectory.final_metrics = None
+        bundle, meta = self._bundle()
+        session = session_dir / Path(meta["session_relpath"]).name
+        if not session.is_file() or session != max(session_dir.glob("*.jsonl")):
+            return trajectory
+        with session.open("rb") as stream, (bundle / "session_trunc.jsonl").open("rb") as seed:
+            for block in iter(lambda: seed.read(1024 * 1024), b""):
+                if stream.read(len(block)) != block:
+                    return trajectory
+            calls = []
+            seen = {}
+            pending_output = False
+            model = meta.get("native_model")
+            for line in stream:
+                row = json.loads(line)
+                payload = row["payload"]
+                kind = row["type"]
+                if kind == "turn_context":
+                    model = payload.get("model", model)
+                elif kind == "response_item":
+                    if (payload.get("role") == "assistant"
+                            or payload.get("type") in {"function_call", "custom_tool_call", "reasoning"}):
+                        pending_output = True
+                elif kind == "token_usage_record":
+                    usage = payload["usage"]
+                    rid = payload.get("response_id")
+                    if rid and rid in seen:
+                        if seen[rid] != usage:
+                            return trajectory
+                    else:
+                        calls.append((model, usage))
+                        if rid:
+                            seen[rid] = usage
+                    pending_output = False
+                elif kind == "event_msg" and payload.get("type") == "token_count" and pending_output:
+                    # Some exports carry only Harbor's last-call counter. Bind it to
+                    # new model output, since token_count can also repeat the previous usage.
+                    usage = (payload.get("info") or {}).get("last_token_usage")
+                    if not usage:
+                        return trajectory
+                    calls.append((model, usage))
+                    pending_output = False
+        if not calls or pending_output:
+            return trajectory
+        costs = [self._compute_cost_from_pricing(
+            prompt_tokens=u["input_tokens"], completion_tokens=u["output_tokens"],
+            cached_tokens=u.get("cached_input_tokens"), cache_write_tokens=u.get("cache_write_input_tokens"),
+            model_name=m) for m, u in calls]
+        trajectory.final_metrics = FinalMetrics(
+            total_prompt_tokens=sum(u["input_tokens"] for _, u in calls),
+            total_completion_tokens=sum(u["output_tokens"] for _, u in calls),
+            total_cached_tokens=sum(u.get("cached_input_tokens", 0) for _, u in calls),
+            total_cost_usd=sum(costs) if all(cost is not None for cost in costs) else None,
+            total_steps=len(trajectory.steps),
+            extra={"resumed_calls": len(calls),
+                   "reasoning_output_tokens": sum(u.get("reasoning_output_tokens", 0) for _, u in calls),
+                   "total_cache_write_input_tokens": sum(u.get("cache_write_input_tokens", 0) for _, u in calls)})
+        return trajectory
 
 
 def resolve_polled_commands(plan, steps):
