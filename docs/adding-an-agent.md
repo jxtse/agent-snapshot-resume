@@ -202,3 +202,10 @@ The Codex adapter reads the selected turn's sandbox policy. A recorded unrestric
 with approval policy `never` and a disabled inner permission profile resumes with that
 same policy inside the task sandbox. The proxy verifies the exact pinned CLI context for
 that mode. A bundle whose seed records different permissions must be rebuilt.
+
+## Known limitations
+
+- Pi and Codex strict replay refuses workspace actions for tasks that specify a non-root agent user. The source replayer runs as root. A cut with no workspace actions can still be used.
+- Codex refuses a prefix containing a potentially writing call under a restricted or unrecorded sandbox policy, or with an unverified permission override. It also refuses a response containing multiple calls that may write. Read-only parallel calls are supported.
+- Pi refuses prefixes containing an unconfirmed write or edit, a cancelled manual command, or a Bash command that references a Pi variable whose value cannot be recovered. A uniquely matched argument-validation failure with a missing required field has no replay action.
+- Native bundles can still be built to inspect their prefix and compare a captured request. A reason in `plan.json` under `replay_refusals` blocks workspace execution under both replay policies. Rebuild older native plans from the source trial before preparing a snapshot.

@@ -109,8 +109,16 @@ def replay_plan(ir, k_index, include_read_only=False):
         raise ValueError("resume step must be an agent step after the instruction")
     cut_ts = _ts(ir["steps"][k]["timestamp"])
     actions = []
+    refusals = []
     for st in ir["steps"][:k]:
         for e in st["events"]:
+            reason = e.get("replay_refusal")
+            if e.get("missing_result_reason"):
+                result_line = e.get("result_line")
+                if result_line is None or result_line >= ir["steps"][k]["line_range"][0]:
+                    reason = e["missing_result_reason"]
+            if reason:
+                refusals.append(f"{e['call_id']} (line {e['line']}): {reason}")
             if e["type"] != "tool_call":
                 continue
             if e["side_effect"] == "read_only" and not include_read_only:
@@ -173,8 +181,13 @@ def replay_plan(ir, k_index, include_read_only=False):
                                 "background_output_file": None, "cwd": e.get("cwd"), "auto_backgrounded": False,
                                 "evidence_read_for": "failed_background_output"})
     actions.sort(key=lambda a: (_ts(a["timestamp"]) or 0))
-    return {"trial": ir["trial"], "resume_step_atif": ir["steps"][k]["atif_step_id"], "resume_step_index": k,
+    plan = {"trial": ir["trial"], "resume_step_atif": ir["steps"][k]["atif_step_id"], "resume_step_index": k,
             "actions": actions}
+    if "native_replay_revision" in ir:
+        plan["native_replay_revision"] = ir["native_replay_revision"]
+        if refusals:
+            plan["replay_refusals"] = refusals
+    return plan
 
 
 def resume_points(ir):

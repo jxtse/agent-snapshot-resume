@@ -141,6 +141,29 @@ def fingerprint_command_for(meta: dict[str, Any]) -> str:
     return build_fingerprint_command(roots, meta.get("fingerprint_optional_roots", []))
 
 
+def native_user_refusal(agent, task_dir, plan, policy):
+    if agent not in ("pi", "codex") or policy != "strict" or not plan["actions"]:
+        return None
+    user = tomllib.loads((task_dir / "task.toml").read_text()).get("agent", {}).get("user")
+    if user is not None and user != "root":
+        return f"strict {agent} workspace replay cannot reproduce task user {user!r}, group and HOME"
+    return None
+
+
+def check_native_replay(agent, task_dir, bundle, policy):
+    if agent not in ("pi", "codex"):
+        return
+    from ..agents.native import NATIVE_REPLAY_REVISION
+    plan = json.loads((bundle / "plan.json").read_bytes())
+    issue = native_user_refusal(agent, task_dir, plan, policy)
+    if issue:
+        raise ValueError(issue)
+    if plan.get("native_replay_revision") != NATIVE_REPLAY_REVISION:
+        raise ValueError("rebuild the native bundle to check its historical workspace actions")
+    if plan.get("replay_refusals"):
+        raise ValueError("; ".join(plan["replay_refusals"]))
+
+
 def task_healthcheck(task_dir: Path) -> str | None:
     cfg = tomllib.loads((task_dir / "task.toml").read_text())
     return ((cfg.get("environment") or {}).get("healthcheck") or {}).get("command")
@@ -246,6 +269,7 @@ def prepare_source(*, adapter, task_dir: Path, bundle: Path, template: str, tag:
                    replay_deadline_s: int = REPLAY_DEADLINE_S) -> dict[str, Any]:
     if replay_deadline_s <= 0:
         raise ValueError("replay_deadline_s must be positive")
+    check_native_replay(adapter.name, task_dir, bundle, replay_policy)
     sandbox_timeout_s = max(sandbox_timeout_s, replay_deadline_s + 3600)
     Sandbox = _sandbox_cls()
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -492,6 +516,8 @@ def finish_prepared_source(state_path: Path, *, observe_timeout_s: int = 10800,
     def run(sbx, cmd, timeout=900):
         return sbx.commands.run(cmd, user="root", timeout=timeout)
 
+    if meta.get("agent") in ("pi", "codex"):
+        check_native_replay(meta["agent"], Path(rec["task_dir"]), bundle, replay_policy or rec.get("replay_policy", "strict"))
     sb = Sandbox.connect(rec["source_sandbox_id"])
     info = sb.get_info()
     if info.metadata.get("owner") != rec.get("owner", owner_tag()) or info.metadata.get("role") != "source" \

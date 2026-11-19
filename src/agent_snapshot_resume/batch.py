@@ -335,17 +335,22 @@ class Batch:
                                 chain_spec.get("prior_hints") or []).encode()).hexdigest()} if chain_spec else None}
         if getattr(self.adapter, "wire", None):
             # Older native bundles can omit Pi file effects or use the initial Codex cwd at the cut.
-            inputs["native_bundle_revision"] = 3
+            from .agents.native import NATIVE_REPLAY_REVISION
+            inputs["native_bundle_revision"] = NATIVE_REPLAY_REVISION
             if hasattr(self.adapter, "native_reference"):
                 timeout = bundle_mod.resolve_agent_timeout(trial_dir, task_dir=self.task_dir(row))
                 ir = self.adapter.load_trace(trial_dir, agent_timeout_s=timeout)
-                raw = (trial_dir / ir["sources"]["session_jsonl"]).read_text().splitlines()
+                _, raw = bundle_mod.native_session_lines(trial_dir / ir["sources"]["session_jsonl"])
                 trim = lambda i: self.adapter.cut_line(raw, ir, i)
                 sid = bundle_mod.step_for_cut_line(ir, cut, trim)
                 k = bundle_mod.trace_ir.step_index(ir, sid)
                 ref, error = self.adapter.native_reference(trial_dir, ir, k, raw[:trim(k)])
-                evidence = json.dumps([ref, error, ir["steps"][k]["elapsed_s"]], sort_keys=True).encode()
-                inputs["cut_request_sha256"] = hashlib.sha256(evidence).hexdigest()
+                step = ir["steps"][k]
+                plan = bundle_mod.resolved_replay_plan(trial_dir, ir, k, raw)
+                resolved = dict(plan=plan, sources=ir["sources"], step=sid, prefix_lines=trim(k), timeout=timeout,
+                                elapsed=step["elapsed_s"], remaining=step["remaining_s"], reference=ref, error=error)
+                evidence = json.dumps(resolved, sort_keys=True).encode()
+                inputs["native_cut_sha256"] = hashlib.sha256(evidence).hexdigest()
         if self.agent_name == "codex":
             inputs["sandbox_policy_source"] = "turn_context"
         cached = {}
@@ -469,10 +474,13 @@ class Batch:
             raise RuntimeError("prepare-snapshot produced no snapshot id")
         return rec
 
-    @staticmethod
-    def _fake_completed(trial: Path) -> bool:
+    def _fake_completed(self, trial: Path) -> bool:
         try:
             result = json.loads((trial / "result.json").read_bytes())
+            if self.agent_name == "pi":
+                from .agents.pi import PiBaseline
+                from .proxy.pi_receipts import check_output
+                check_output(trial / "agent" / PiBaseline._OUTPUT_FILENAME)
         except (OSError, ValueError):
             return False
         return isinstance(result, dict) and bool(result.get("finished_at")) and result.get("exception_info") is None

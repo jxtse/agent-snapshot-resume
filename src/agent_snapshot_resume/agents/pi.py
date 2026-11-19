@@ -4,7 +4,7 @@ import math
 import posixpath
 import re
 import shlex
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -48,11 +48,19 @@ def pi_models(endpoint, model, provider):
                                      "apiKey": "dummy", "models": [descriptor]}}}
 
 
-def pi_args(session, model, provider, prompt):
-    thinking = ["--thinking", "max"] if provider == REASONING_PROVIDER else []
+def pi_args(session, model, provider, prompt, *, thinking_level=...):
+    if thinking_level is ...:
+        thinking_level = "max" if provider == REASONING_PROVIDER else None
+    thinking = ["--thinking", thinking_level] if thinking_level is not None else []
     return [*thinking, "--offline", "--no-extensions", "--no-mcp", "--no-skills", "--no-context-files",
             "--no-prompt-templates", "--no-themes", "--no-approve", "--tools", "read,bash,edit,write",
             "--session", str(session), "--provider", provider, "--model", model, "--mode", "json", "--print", "--", prompt]
+
+
+def check_output_command(output, *, resumed=False):
+    from ..proxy import runtime
+    directory = "resume" if resumed else "src"
+    return shlex.join([runtime.RUNTIME, f"{runtime.PROXY_DIR}/{directory}/pi_receipts.py", "--check-output", str(output)])
 
 
 def active_branch(records):
@@ -113,6 +121,56 @@ def tool_action(name, args, cwd, home=None):
     return name, args, "other"
 
 
+def session_tool(block, cwd, home, result):
+    """Only a uniquely matched error can prove that validation rejected a call before execution."""
+    name, args = block["name"], block.get("arguments")
+    failed = result is not None and result.get("isError") is True
+    required = {"read": ("path",), "edit": ("path",), "write": ("path", "content"), "bash": ("command",)}
+    if name in required and (not isinstance(args, dict) or any(key not in args for key in required[name])):
+        if failed:
+            return name, {}, "read_only", None
+        return name, {}, "other", f"invalid Pi {name} arguments without a matching validation error"
+    try:
+        if not isinstance(args, dict) or any(not isinstance(args[key], str) for key in required.get(name, ())):
+            raise TypeError("unsupported Pi argument types")
+        tool, mapped, effect = tool_action(name, args, cwd, home)
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        if failed and any(b.get("text", "").startswith(f'Validation failed for tool "{name}":')
+                          for b in result.get("content", [])):
+            return name, {}, "read_only", None
+        return name, {}, "other", f"unresolved Pi {name} arguments ({type(exc).__name__})"
+    if failed and name == "write":
+        # 1.4.0 creates parent directories before writing the file; an error does not undo them.
+        return tool, mapped, effect, "Pi write failed after validation; partial workspace effects are unknown"
+    return tool, mapped, effect, None
+
+
+def matched_tool_results(branch):
+    """Bind each result to the unique preceding, still-pending call with its ID and tool name."""
+    pending, matched = defaultdict(list), {}
+    for i, row in branch:
+        msg = row.get("message") or {}
+        if msg.get("role") == "assistant":
+            for block in msg["content"]:
+                if block["type"] == "toolCall":
+                    pending[block["id"]].append((i, block["name"]))
+        elif msg.get("role") == "toolResult":
+            cid = msg["toolCallId"]
+            candidates = pending.pop(cid, [])
+            if len(candidates) == 1:
+                line, name = candidates[0]
+                if msg.get("toolName", name) == name and isinstance(msg.get("isError"), bool):
+                    matched[line, cid] = i, msg
+    return matched
+
+
+def missing_pi_variable(command, env):
+    for name in re.findall(r"\$\{?[!#]?(PI_\w*)", command):
+        if name not in env:
+            return f"unrecorded Pi Bash environment variable {name}"
+    return None
+
+
 class PiAdapter(NativeAdapter):
     name, version, wire = "pi", "1.4.0", "chat"
     binary_sha256 = {"1.4.0": PI_TARBALL_SHA256}
@@ -134,10 +192,14 @@ class PiAdapter(NativeAdapter):
         response_owners = Counter(m["responseId"] for m in messages if m.get("role") == "assistant"
                                   and m.get("responseId"))
         steps, calls = [], {}
-        model = provider = None
+        model = provider = thinking_level = None
         branch = list(active_branch(records))
+        results = matched_tool_results(branch)
+        session_file = self.replay_session_path({"session_relpath": str(path.relative_to(trial))})
         included = {i for i, _ in branch}
         abandoned_effects = []
+        abandoned_results = {r["parentId"]: r["message"] for j, r in enumerate(records[1:], 1)
+                             if j not in included and (r.get("message") or {}).get("role") == "toolResult"}
         for i, row in enumerate(records[1:], 1):
             if i in included:
                 continue
@@ -146,12 +208,21 @@ class PiAdapter(NativeAdapter):
                     (msg.get("details") or {}).get("fullOutputPath")
                     or any(pi_log_path(b.get("text")) for b in msg["content"])):
                 abandoned_effects.append(i)
-            if msg.get("role") == "bashExecution" or (msg.get("role") == "assistant" and any(
-                    b.get("type") == "toolCall" and tool_action(b["name"], b["arguments"], header["cwd"], home)[2] != "read_only"
-                    for b in msg["content"])):
+            if msg.get("role") == "bashExecution":
                 abandoned_effects.append(i)
+            elif msg.get("role") == "assistant":
+                for b in msg["content"]:
+                    if b["type"] == "toolCall":
+                        result = abandoned_results.get(row["id"])
+                        if result and (result.get("toolCallId") != b["id"] or result.get("toolName", b["name"]) != b["name"]):
+                            result = None
+                        if session_tool(b, header["cwd"], home, result)[2] != "read_only":
+                            abandoned_effects.append(i)
+                            break
         for i, row in branch:
             typ = row["type"]
+            if typ == "thinking_level_change":
+                thinking_level = row["thinkingLevel"]
             if typ == "compaction" and steps:
                 steps[-1]["events"].append(dict(type="compaction_boundary", line=i))
             if typ != "message":
@@ -168,18 +239,27 @@ class PiAdapter(NativeAdapter):
                                                timestamp=row["timestamp"], line=i, is_error=bool(msg.get("exitCode"))),
                                           dict(type="observation", call_id=row["id"], text=msg.get("output", ""),
                                                line=i, is_error=bool(msg.get("exitCode")))]))
+                action = steps[-1]["events"][0]
+                issue = ("cancelled Pi bashExecution has no reproducible termination point"
+                         if msg.get("cancelled") else missing_pi_variable(msg["command"], {}))
+                if issue:
+                    action["replay_refusal"] = issue
                 continue
             events = steps[-1]["events"]
             if role == "toolResult":
-                call = calls[msg["toolCallId"]]
+                call = calls.get(msg["toolCallId"])
+                if call is None or call.get("result_line") != i:
+                    events.append(dict(type="observation", call_id=msg["toolCallId"], text="", line=i,
+                                       replay_refusal="unmatched or ambiguous Pi toolResult"))
+                    continue
                 call["is_error"] = msg["isError"]
                 call["duration_s"] = msg.get("durationMs", 0) / 1000
                 text = "\n".join(b["text"] for b in msg["content"] if b["type"] == "text")
-                if call["tool"] == "Bash":
+                if call["args"].get("pi_bash"):
                     log = pi_log_path(text)
                     recorded_log = (msg.get("details") or {}).get("fullOutputPath")
                     if recorded_log and recorded_log != log:
-                        raise ValueError("unsupported or inconsistent Pi full output path")
+                        call["replay_refusal"] = "unsupported or inconsistent Pi full output path"
                     if log:
                         call["args"]["pi_output_file"] = log
                         details = msg.get("details") or {}
@@ -189,14 +269,14 @@ class PiAdapter(NativeAdapter):
                             expected["sha256"] = details["fullOutputSha256"]
                         if expected:
                             call["args"]["pi_historical_output"] = expected
-                        call["side_effect"] = "exec"
+                        call.update(side_effect="exec", missing_result_reason="no matching Pi toolResult before cut")
                     timeout = re.search(r"(?:^|\n\n)Command timed out after (\d+(?:\.\d+)?) seconds\s*\Z", text)
                     if call["is_error"] and timeout:
                         seconds = float(timeout[1])
                         if seconds <= 0 or seconds * 1000 != call["args"].get("timeout"):
-                            raise ValueError("Pi timeout differs from recorded tool arguments")
+                            call["replay_refusal"] = "Pi timeout differs from recorded tool arguments"
                         call["args"]["pi_timeout_status"] = timeout[1]
-                        call["side_effect"] = "exec"
+                        call.update(side_effect="exec", missing_result_reason="no matching Pi toolResult before cut")
                     status = re.search(r"(?:^|\n+)Command exited with code (\d+)\s*\Z", text)
                     if call["is_error"] and status:
                         text = f"Exit code {status[1]}\n" + text[:status.start()]
@@ -205,7 +285,8 @@ class PiAdapter(NativeAdapter):
                 events.append(dict(type="observation", call_id=call["call_id"], is_error=call["is_error"],
                                    text=text, line=i))
             elif role == "assistant":
-                steps[-1].update(native_provider=msg["provider"], native_model=msg["model"])
+                thinking_level = msg.get("thinkingLevel", thinking_level)
+                steps[-1].update(native_provider=msg["provider"], native_model=msg["model"], native_effort=thinking_level)
                 if isinstance(msg.get("timestamp"), (int, float)):
                     steps[-1]["request_start_s"] = msg["timestamp"] / 1000
                 rid = msg.get("responseId")
@@ -216,9 +297,25 @@ class PiAdapter(NativeAdapter):
                 model, provider = msg["model"], msg["provider"]
                 for block in msg["content"]:
                     if block["type"] == "toolCall":
-                        tool, args, effect = tool_action(block["name"], block["arguments"], header["cwd"], home)
+                        cid, name = block["id"], block["name"]
+                        result_line, result = results.get((i, cid), (None, None))
+                        tool, args, effect, issue = session_tool(block, header["cwd"], home, result)
+                        if name == "bash" and tool == "Bash":
+                            env = dict(PI_SESSION_ID=header["id"], PI_SESSION_FILE=session_file,
+                                       PI_PROVIDER=provider, PI_MODEL=model)
+                            if thinking_level is not None:
+                                env["PI_REASONING_LEVEL"] = thinking_level
+                            args["pi_env"] = env
+                            issue = missing_pi_variable(args["command"], env)
                         event = dict(type="tool_call", tool=tool, args=args, side_effect=effect, cwd=header["cwd"],
-                                     call_id=block["id"], timestamp=row["timestamp"], line=i, is_error=None)
+                                     call_id=cid, timestamp=row["timestamp"], line=i, is_error=None,
+                                     result_line=result_line)
+                        if name in ("write", "edit") or effect != "read_only":
+                            event["missing_result_reason"] = "no matching Pi toolResult before cut"
+                        if cid in calls:
+                            issue = "duplicate Pi tool call ID; observations cannot be bound uniquely"
+                        if issue:
+                            event["replay_refusal"] = issue
                         calls[block["id"]] = event
                         events.append(event)
                     elif block["type"] in ("text", "thinking"):
@@ -301,8 +398,9 @@ class PiAdapter(NativeAdapter):
         home = "/logs/agent/pi"
         session = self.replay_session_path(meta)
         model, provider = meta["native_model"], meta["native_provider"]
+        args = pi_args(session, model, provider, meta["sentinel"], thinking_level=meta.get("native_effort"))
         return ({"PI_CODING_AGENT_DIR": home + "/config", "PI_OFFLINE": "1"}, session,
-                ["pi", *pi_args(session, model, provider, meta["sentinel"])], home + "/config/models.json",
+                ["pi", *args], home + "/config/models.json",
                 json.dumps(pi_models(base + "/v1", model, provider)))
 
 
@@ -313,6 +411,12 @@ class PiSnapshotResumeOptions(NativeOptions, PiOptions):
 class PiSnapshotResume(NativeResumeMixin, Pi):
     options_model = PiSnapshotResumeOptions
     adapter = PiAdapter()
+
+    async def install(self, environment):
+        from ..proxy import runtime
+        await super().install(environment)
+        # A clone may use an older snapshot whose baseline receipt writer predates JSON exit checks.
+        await environment.upload_file(runtime.HERE / "pi_receipts.py", f"{runtime.PROXY_DIR}/resume/pi_receipts.py")
 
 
 class PiBaseline(Pi):
@@ -359,6 +463,7 @@ class PiBaseline(Pi):
                                        remote_path=home + "/config/models.json", filename="models.json")
         args = pi_args(session, model, REASONING_PROVIDER, instruction)
         await self.exec_as_agent(environment, command=shlex.join(["pi", *args]) +
-                                 f" </dev/null >/logs/agent/{self._OUTPUT_FILENAME} 2>&1", env=env)
+                                 f" </dev/null >/logs/agent/{self._OUTPUT_FILENAME} 2>&1 && " +
+                                 check_output_command(f"/logs/agent/{self._OUTPUT_FILENAME}"), env=env)
         await self.exec_as_root(environment, command=shlex.join([
             runtime.RUNTIME, f"{runtime.PROXY_DIR}/src/pi_receipts.py", session, runtime.PASSTHROUGH_LOGDIR]))

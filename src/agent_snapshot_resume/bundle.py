@@ -125,9 +125,12 @@ def bundle_identity(bundle_dir: Path) -> dict[str, Any]:
     for f in [bundle_dir / "session_trunc.jsonl"] + sorted(p for p in (bundle_dir / "aux").rglob("*") if p.is_file()):
         seed.update(str(f.relative_to(bundle_dir)).encode() + b"\0" + hashlib.sha256(f.read_bytes()).digest())
     meta = json.loads((bundle_dir / "bundle.json").read_text())
-    return {"cut": snapshot_cut_identity(bundle_dir), "seed_sha256": seed.hexdigest(),
-            "proxy_spec_sha256": hashlib.sha256((bundle_dir / "proxy_spec.json").read_bytes()).hexdigest(),
-            "orig_request_at_k": meta.get("orig_request_at_k"), "run_id": meta.get("run_id")}
+    identity = {"cut": snapshot_cut_identity(bundle_dir), "seed_sha256": seed.hexdigest(),
+                "proxy_spec_sha256": hashlib.sha256((bundle_dir / "proxy_spec.json").read_bytes()).hexdigest(),
+                "orig_request_at_k": meta.get("orig_request_at_k"), "run_id": meta.get("run_id")}
+    if meta.get("agent") in ("pi", "codex"):
+        identity["agent_budget_s"] = meta["agent_budget_s"]
+    return identity
 
 
 # Keys the content reference *derived* after some fake runs were recorded. They describe the same message blocks
@@ -333,6 +336,22 @@ def step_for_cut_line(ir: dict[str, Any], cut_line: int, trimmed=None) -> int:
                      f"{[(ln, sid) for _, ln, sid in near]}")
 
 
+def resolved_replay_plan(trial_dir, ir, k, raw_lines):
+    plan = plan_with_observations(ir, k)
+    plan["post_cut_paths"] = post_cut_referenced_files(ir, k)
+    plan["initial_cwd"] = ir.get("cwd") or next((json.loads(trace_ir._REDACT_RE.sub(r"\1null", line)).get("cwd")
+                                                 for line in raw_lines if '"cwd"' in line), None)
+    plan["shell_env"] = captured_shell_env(trial_dir)
+    return plan
+
+
+def native_session_lines(path):
+    """Preserve the original bytes and split only on physical LF record boundaries."""
+    with path.open("rb") as stream:
+        data = stream.readlines()
+    return data, [line.decode("utf-8").rstrip("\r\n") for line in data]
+
+
 def build(*, adapter, trial_dir: Path, atif_step: int | None, out: Path, mode: str = "same", hint: str | None = None,
           agent_timeout: float | None = None, task_dir: Path | None = None, run_id: str | None = None,
           model: str | None = None, pin_date: bool = True, fingerprint_roots: list[str] | None = None,
@@ -359,9 +378,7 @@ def build(*, adapter, trial_dir: Path, atif_step: int | None, out: Path, mode: s
     sess_path = trial_dir / ir["sources"]["session_jsonl"]
     native_lines = None
     if getattr(adapter, "wire", None):
-        with sess_path.open("rb") as stream:
-            native_lines = stream.readlines()
-        raw_lines = [line.decode("utf-8").rstrip("\r\n") for line in native_lines]
+        native_lines, raw_lines = native_session_lines(sess_path)
     else:
         with open(sess_path, encoding="utf-8") as f:
             raw_lines = [l for l in f.read().split("\n") if l.strip()]
@@ -377,9 +394,7 @@ def build(*, adapter, trial_dir: Path, atif_step: int | None, out: Path, mode: s
     prev = ir["steps"][k - 1]
     cut = adapter.cut_line(raw_lines, ir, k)
     cut_orig = cut  # the plan and the base snapshot speak about the parent's own session, before any seed normalisation
-    plan = plan_with_observations(ir, k)
-    # what the agent will read after the cut: the lenient replay gate requires these to survive the replay
-    plan["post_cut_paths"] = post_cut_referenced_files(ir, k)
+    plan = resolved_replay_plan(trial_dir, ir, k, raw_lines)
     # ---- chained round-N build: a resumed trial's session must be normalised before it can seed the next run
     evidence = chain.run_evidence(trial_dir)
     if persist_hint and mode != "hint" and not evidence:
@@ -440,9 +455,6 @@ def build(*, adapter, trial_dir: Path, atif_step: int | None, out: Path, mode: s
                          "hints; an L0 trial never saw them)")
     if base_snapshot and not evidence:
         raise SystemExit("--base-snapshot needs a resumed trial dir (the tail is split on its own session lines)")
-    plan["initial_cwd"] = ir.get("cwd") or next((json.loads(trace_ir._REDACT_RE.sub(r"\1null", l)).get("cwd")
-                                for l in raw_lines if '\"cwd\"' in l), None)
-    plan["shell_env"] = captured_shell_env(trial_dir)
     if base_snapshot:
         line = int(base_snapshot["session_line"])
         if line >= cut_orig:

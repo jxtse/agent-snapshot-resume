@@ -210,6 +210,9 @@ def build_job_config(*, adapter, bundle: Path, task_dir: Path, job_name: str, jo
             raise SystemExit("--snapshot-id differs from the snapshot state file")
         if not source.get("snapshot_id") or not source.get("replay_gate_passed"):
             raise SystemExit("snapshot source has not passed the replay gates")
+        if getattr(adapter, "wire", None):
+            from .sandbox.source import check_native_replay
+            check_native_replay(adapter.name, task_dir, bundle, source.get("replay_policy") or "strict")
         check_shared_snapshot(source, bundle)  # always: a rebuilt bundle with the same run id must match too
         rebind_cut_identity(Path(snapshot_state), source, bundle)
         hashes = verifier_hashes(task_dir)

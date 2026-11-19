@@ -115,7 +115,12 @@ def run_bash(cmd, cwd, timeout, merge_stderr=False, termination_code=None, shell
     import tempfile
     with tempfile.TemporaryFile() as out_file, tempfile.TemporaryFile() as err_file:
         shell = ["/bin/bash", "-c"] if pi_bash else ["bash", "-lc"]
-        p = subprocess.Popen([*shell, cmd], env=dict(os.environ, **(shell_env or {})),
+        env = os.environ.copy()
+        if pi_bash:
+            for key in ("PI_SESSION_FILE", "PI_SESSION_ID", "PI_MODEL", "PI_PROVIDER", "PI_REASONING_LEVEL"):
+                env.pop(key, None)
+        env.update(shell_env or {})
+        p = subprocess.Popen([*shell, cmd], env=env,
                              cwd=cwd if cwd and os.path.isdir(cwd) else None,
                              stdin=subprocess.DEVNULL, stdout=out_file,
                              stderr=out_file if merge_stderr else err_file, start_new_session=True)
@@ -468,6 +473,8 @@ def main():
     dry = "--dry" in sys.argv
     with open(plan_p) as f:
         plan = json.load(f)
+    if plan.get("replay_refusals"):
+        raise RuntimeError("; ".join(plan["replay_refusals"]))
     results = []
     t_start = time.time()
     shell_cwd = plan.get("initial_cwd") or "/app"
@@ -575,7 +582,8 @@ def main():
                         rec["background_resume"] = "rerun_from_snapshot"
                     capture = {"pi_bash": True, "pi_user": pi_user, "pi_output_file": pi_log} if pi_bash else {}
                     r = run_bash(cmd, cwd, to, merge_stderr=(se == "exec_background" or pi_bash),
-                                 termination_code=termination_code, shell_env=plan.get("shell_env"), **capture)
+                                 termination_code=termination_code, shell_env={
+                                     **(plan.get("shell_env") or {}), **(args.get("pi_env") or {})}, **capture)
                     rec["shell_environment"] = ("captured_path" if plan.get("shell_env") else
                                                 "nonlogin_shell" if pi_bash else "login_shell")
                     if r.get("termination_reproduced"):

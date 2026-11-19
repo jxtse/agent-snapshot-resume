@@ -5,6 +5,41 @@ from pathlib import Path
 import tempfile
 
 
+def check_output(path):
+    """Read this print invocation's NDJSON, independent of any seeded session history."""
+    reason = None
+    with path.open("rb") as stream:
+        for line in stream:
+            try:
+                event = json.loads(line)
+            except (ValueError, UnicodeDecodeError):
+                # Ordinary stderr lines may be interleaved; a broken JSON event is ambiguous.
+                if line.lstrip().startswith(b"{"):
+                    raise ValueError("malformed Pi JSON output")
+                continue
+            if not isinstance(event, dict):
+                continue
+            message = event.get("message") or {}
+            if not isinstance(message, dict):
+                raise ValueError("malformed Pi message event")
+            if event.get("type") == "agent_end":
+                messages = event.get("messages", [])
+                if not isinstance(messages, list) or any(not isinstance(m, dict) for m in messages):
+                    raise ValueError("malformed Pi agent_end event")
+                assistants = [m for m in messages if m.get("role") == "assistant"]
+                if assistants:
+                    reason = assistants[-1].get("stopReason")
+            if event.get("type") == "agent_start":
+                reason = None
+            if message.get("role") == "assistant":
+                if event.get("type") == "message_start":
+                    reason = None
+                elif event.get("type") in ("message_end", "turn_end"):
+                    reason = message.get("stopReason")
+    if reason != "stop":
+        raise ValueError(f"Pi final assistant stopReason: {reason!r}")
+
+
 def compaction_kind(ref):
     if "pi_compaction_request" in ref:
         return ref["pi_compaction_request"]
@@ -77,4 +112,7 @@ def write_references(session_path, log_dir):
 
 if __name__ == "__main__":
     import sys
-    print(write_references(Path(sys.argv[1]), Path(sys.argv[2])))
+    if sys.argv[1] == "--check-output":
+        check_output(Path(sys.argv[2]))
+    else:
+        print(write_references(Path(sys.argv[1]), Path(sys.argv[2])))

@@ -104,6 +104,11 @@ def recorded_sandbox_mode(context):
     return "unsupported"
 
 
+# A literal range-print script with one plain file operand cannot edit the file.
+# Keep this native-only so historical Claude Code plans retain their exact actions.
+_SED_PRINT = re.compile(r"""(?:/usr/bin/|/bin/)?sed -n '(?:[0-9]+,)?[0-9]+p' [a-zA-Z0-9_./][a-zA-Z0-9_./-]*""")
+
+
 def tool_action(payload, cwd):
     name = payload["name"]
     if payload["type"] == "custom_tool_call":
@@ -118,7 +123,9 @@ def tool_action(payload, cwd):
             cmd = shlex.join(cmd)
         shell = args.get("shell")
         if isinstance(cmd, str) and not args.get("tty") and (shell is None or isinstance(shell, str)):
-            effect = "read_only" if bash_is_read_only(cmd) else "exec"
+            standard_shell = shell in (None, "bash", "/bin/bash", "sh", "/bin/sh")
+            read_only = standard_shell and (bash_is_read_only(cmd) or _SED_PRINT.fullmatch(cmd))
+            effect = "read_only" if read_only else "exec"
             if shell or args.get("login") is False:
                 cmd = shlex.join([shell or "bash", "-lc" if args.get("login", True) else "-c", cmd])
             return ("Bash", {"command": cmd}, effect,
@@ -176,26 +183,35 @@ class CodexAdapter(NativeAdapter):
         if rows[0]["type"] != "session_meta" or header["cli_version"] != self.version:
             raise ValueError("unsupported Codex rollout version")
         steps, calls = [], {}
-        current = None
+        current = last_counted = None
         model, cwd, context = None, header["cwd"], {}
         processes = {}
         for i, row in enumerate(rows):
             typ, p, ts = row["type"], row["payload"], row["timestamp"]
             subtype = p.get("type")
             if typ == "turn_context":
+                current = last_counted = None
                 context = p
                 model, cwd = p.get("model"), p["cwd"]
             if typ == "compacted" and steps:
                 steps[-1]["events"].append(dict(type="compaction_boundary", line=i))
-                current = None
-            if typ == "token_usage_record" and current:
-                current.update(usage=p["usage"], message_id=p.get("response_id"))
+                current = last_counted = None
+            if typ == "token_usage_record":
+                owner = current or last_counted
+                if owner is not None:
+                    owner.update(usage=p["usage"], message_id=p.get("response_id"))
+                current = last_counted = None  # subsequent tool results still bind via call ID
             if typ == "event_msg" and subtype == "token_count":
+                if current is not None:
+                    last_counted = current
+                    last = (p.get("info") or {}).get("last_token_usage")
+                    if last:
+                        current["usage"] = last
                 current = None
             if typ != "response_item":
                 continue
             if subtype == "message" and p["role"] in ("developer", "system", "user"):
-                current = None
+                current = last_counted = None
                 steps.append(dict(source="user", atif_source={"developer": "system"}.get(p["role"], p["role"]), line_range=[i], timestamp=ts,
                                   events=[dict(type="user_text", text=p["content"])]))
                 continue
@@ -221,6 +237,7 @@ class CodexAdapter(NativeAdapter):
                                            timestamp=ts, is_error=event["is_error"]))
                 continue
             if current is None:
+                last_counted = None
                 current = dict(source="agent", timestamp=ts, atif_message_timestamp=None, line_range=[i], events=[],
                                native_model=model, native_cwd=cwd, native_effort=context.get("effort"),
                                native_sandbox_mode=recorded_sandbox_mode(context))
@@ -229,6 +246,11 @@ class CodexAdapter(NativeAdapter):
                 tool, args, effect, workdir = tool_action(p, cwd)
                 event = dict(type="tool_call", tool=tool, args=args, side_effect=effect, cwd=workdir,
                              call_id=p["call_id"], line=i, timestamp=ts)
+                permissions = (json.loads(p["arguments"]).get("sandbox_permissions")
+                               if subtype == "function_call" else None)
+                policy = recorded_sandbox_mode(context)
+                if effect != "read_only" and (policy != "danger-full-access" or permissions not in (None, "use_default")):
+                    event["replay_refusal"] = f"Codex sandbox policy {policy or 'unrecorded'} cannot be reproduced"
                 calls[p["call_id"]] = event, current
             elif subtype in ("message", "reasoning"):
                 if subtype == "message":
@@ -238,6 +260,12 @@ class CodexAdapter(NativeAdapter):
             else:
                 raise ValueError(f"unsupported Codex response item {subtype!r}")
             current["events"].append(event)
+        for st in steps:
+            writers = [e for e in st["events"] if e["type"] == "tool_call" and e["side_effect"] != "read_only"]
+            if len(writers) > 1:
+                lines = ", ".join(str(e["line"]) for e in writers)
+                reason = f"parallel Codex calls may write (lines {lines}); final workspace order is unknown"
+                writers[0]["replay_refusal"] = "; ".join(filter(None, [writers[0].get("replay_refusal"), reason]))
         flags = align_atif_step_ids(
             trial, steps, [[e["call_id"] for e in st["events"] if e["type"] == "tool_call"] for st in steps],
             [st.get("atif_source", st["source"]) for st in steps])
@@ -271,8 +299,11 @@ class CodexAdapter(NativeAdapter):
 
     @staticmethod
     def request_records(trial):
-        return [json.loads(line) for p in sorted((trial/"agent/model-proxy").glob("requests-*.jsonl"))
-                for line in p.read_text().splitlines() if line.strip()]
+        records = []
+        for path in sorted((trial/"agent/model-proxy").glob("requests-*.jsonl")):
+            with path.open("rb") as stream:
+                records.extend(json.loads(line) for line in stream if line.strip())
+        return records
 
     @staticmethod
     def match_records(records, step, session_id):

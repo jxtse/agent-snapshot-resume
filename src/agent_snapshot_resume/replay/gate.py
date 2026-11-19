@@ -522,6 +522,8 @@ def lenient_report(plan, report, post_cut=None, blocks=None):
 def validate_replay(plan, report, rc, reviewed_exceptions=None, policy="strict", post_cut=None):
     """Replay gate. policy="strict" keeps the historical fail-closed behaviour; "lenient" accepts output
     divergences and blocks only the three classes in lenient_blocks (see the module comment)."""
+    if plan.get("replay_refusals"):
+        raise RuntimeError("; ".join(plan["replay_refusals"]))
     if policy not in ("strict", "lenient"):
         raise RuntimeError(f"unknown replay policy {policy!r}")
     if policy == "lenient":

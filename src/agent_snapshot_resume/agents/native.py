@@ -8,6 +8,9 @@ from ..trace.ir import _sha256, _ts
 from .base import AgentAdapter, SnapshotResumeAgentMixin, bounded_remote_command
 
 
+NATIVE_REPLAY_REVISION = 4
+
+
 class NativeAdapter(AgentAdapter):
     resume_artifacts = {"prompt": "sentinel_user_message"}
 
@@ -60,7 +63,7 @@ class NativeAdapter(AgentAdapter):
             step.update(index=i, elapsed_s=elapsed, remaining_s=timeout-elapsed)
             step.setdefault("atif_step_id", i+1)
             step["line_range"].append(steps[i+1]["line_range"][0] if i+1 < len(steps) else len(records))
-        return dict(trial=trial.name, session_id=sid, cwd=cwd, project_slug=cwd.replace("/", "-"),
+        return dict(native_replay_revision=NATIVE_REPLAY_REVISION, trial=trial.name, session_id=sid, cwd=cwd, project_slug=cwd.replace("/", "-"),
                     cc_version=version, start_ts=start, flags=flags, sidechains=[], steps=steps,
                     sources=dict(session_jsonl=str(path.relative_to(trial)), session_sha256=_sha256(path)),
                     **fields)
@@ -139,6 +142,9 @@ class NativeResumeMixin(SnapshotResumeAgentMixin):
         await self._verify_seeded(environment, seeded, env)
         output = self.environment_logs_dir / self._OUTPUT_FILENAME
         command = f"cd {shlex.quote(meta['cwd'])} && {shlex.join(args)} </dev/null >{shlex.quote(str(output))} 2>&1"
+        if self.adapter.name == "pi":
+            from .pi import check_output_command
+            command += " && " + check_output_command(output, resumed=True)
         await self.exec_as_agent(environment, command=bounded_remote_command(command, meta["agent_budget_s"]), env=env)
 
 

@@ -92,6 +92,9 @@ def screen_plan(plan: dict[str, Any], rp: dict[str, Any] | None = None, *, n_com
         r.update(kw)
         risks.append(r)
 
+    for detail in plan.get("replay_refusals", []):
+        add("unreplayable_action", BLOCK, detail=detail)
+
     bg_outputs: dict[str, dict[str, Any]] = {}  # file path -> background action
     bg_running: list[dict[str, Any]] = []
     for i, a in enumerate(plan["actions"]):
@@ -197,6 +200,11 @@ def screen_trial(adapter, trial_dir: Path, *, cut_lines: list[int] | None = None
     for sid in targets:
         k = trace_ir.step_index(ir, sid)
         plan = plan_with_observations(ir, k)
+        if task_dir and getattr(adapter, "wire", None):
+            from .sandbox.source import native_user_refusal
+            issue = native_user_refusal(adapter.name, task_dir, plan, policy)
+            if issue:
+                plan.setdefault("replay_refusals", []).append(issue)
         n_comp = sum(1 for s in ir["steps"][:k] for e in s["events"] if e["type"] == "compaction_boundary")
         if reqs is None:
             ref, _ = adapter.native_reference(trial_dir, ir, k, raw[:adapter.cut_line(raw, ir, k)])
