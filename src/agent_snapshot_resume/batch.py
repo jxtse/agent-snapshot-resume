@@ -32,6 +32,9 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
+from .trace.shell import BASH_CLASSIFIER_REVISION
+
+
 STAGES = ("screen", "bundles", "template", "snapshot", "fake", "launch")
 TERMINAL_FAIL = ("screen_block", "bundle_error", "template_error", "snapshot_error", "fake_parity_failed",
                  "launch_error")
@@ -217,7 +220,8 @@ class Batch:
         if out.is_file() and not getattr(self.adapter, "wire", None):
             rep = json.loads(out.read_text())
             # a report made under another replay policy is not reusable: the policy decides which risks block a cut
-            if rep.get("manifest_cut") == row["cut_line"] and rep.get("policy") == self.replay_policy:
+            if (rep.get("manifest_cut") == row["cut_line"] and rep.get("policy") == self.replay_policy
+                    and rep.get("bash_classifier_revision") == BASH_CLASSIFIER_REVISION):
                 if rep.get("cut_line") is None:
                     raise RuntimeError(f"every cut in the fork window blocks ({len(rep.get('candidates') or [])} "
                                        "candidates): see screen.json")
@@ -282,7 +286,7 @@ class Batch:
                 if r and r.get("verdict") == "review":
                     chosen = c
                     break
-        rep = {"task": task, "manifest_cut": row["cut_line"], "policy": self.replay_policy,
+        rep = {"task": task, "bash_classifier_revision": BASH_CLASSIFIER_REVISION, "manifest_cut": row["cut_line"], "policy": self.replay_policy,
                "snapped_cut": near, "fork_session_line": fork_line,
                "candidates": [screen.summarize(by_cut[c]) for c in cands if c in by_cut], "skipped": skipped,
                "cut_line": chosen, "moved": chosen != row["cut_line"],
@@ -327,7 +331,7 @@ class Batch:
             specs.pop("control")
         # A cached bundle is only reusable if it was built from the same inputs; a changed hint file, cut or source
         # session must rebuild it, and a downstream fake/parity proof must never legitimise the stale one.
-        inputs = {"cut_line": cut, "source_trial_dir": str(trial_dir.resolve()),
+        inputs = {"bash_classifier_revision": BASH_CLASSIFIER_REVISION, "cut_line": cut, "source_trial_dir": str(trial_dir.resolve()),
                   "hint_sha256": hashlib.sha256(hint.encode()).hexdigest() if hint else None,
                   "session_sha256": self.source_session_sha(row),
                   "chain": {"base_snapshot": (chain_spec.get("base_snapshot") or {}).get("snapshot_id"),

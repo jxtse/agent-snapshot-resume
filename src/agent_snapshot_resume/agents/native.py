@@ -8,7 +8,7 @@ from ..trace.ir import _sha256, _ts
 from .base import AgentAdapter, SnapshotResumeAgentMixin, bounded_remote_command
 
 
-NATIVE_REPLAY_REVISION = 6
+NATIVE_REPLAY_REVISION = 7
 
 
 def mark_parallel_writes(steps, agent):

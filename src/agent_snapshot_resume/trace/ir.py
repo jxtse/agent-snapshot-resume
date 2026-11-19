@@ -15,10 +15,10 @@ from __future__ import annotations
 import datetime as _dt
 import hashlib
 import json
-import os
 import re
-import shlex
 from collections import Counter
+
+from .shell import bash_is_read_only
 
 IR_VERSION = "asr-trace-ir/0.1"
 # Some export pipelines replace secret-looking values with a bare [REDACTED] token, which is not valid
@@ -26,56 +26,6 @@ IR_VERSION = "asr-trace-ir/0.1"
 _REDACT_RE = re.compile(r"(?<=[:\[,])(\s*)\[REDACTED\](?=\s*[,}\]])")
 
 SIDE_EFFECT_CLASSES = ["read_only", "file_write", "exec", "exec_background", "subagent", "task_mgmt", "web", "other"]
-
-# conservative read-only Bash heuristic: every pipeline segment starts with a whitelisted command,
-# no output redirection to files, no in-place flags, no command substitution writing files.
-_RO_CMDS = {"ls", "cat", "head", "tail", "wc", "grep", "egrep", "fgrep", "pwd", "echo",
-            "which", "stat", "du", "df", "nproc", "free", "uname", "whoami", "id", "printenv",
-            "cut", "tr", "cmp", "md5sum", "sha256sum", "od", "realpath", "dirname", "basename",
-            "true", "uptime", "type", "test", "[", "readlink", "sleep", "zcat", "strings", "nl", "seq"}
-
-
-def bash_is_read_only(cmd: str) -> bool:
-    """Classify ordinary probes. Retain commands with ambiguous shell syntax or writing options."""
-    if not cmd or re.search(r"[$\x60<>(){}\\!#]|(?<!&)&(?!&)", cmd):
-        return False
-    for segment in re.split(r"&&|\|\||[;|\n]", cmd.strip()):
-        try:
-            words = shlex.split(segment)
-        except ValueError:
-            return False
-        if not words:
-            return False
-        exe, *args = words
-        name = os.path.basename(exe)
-        if exe not in (name, "/bin/" + name, "/usr/bin/" + name):
-            return False
-        if name != "date" and name not in _RO_CMDS and any(re.search(r"[*?\[]", arg) for arg in args):
-            return False
-        if name == "date":
-            formats = [arg for arg in args if arg.startswith("+")]
-            if len(formats) > 1 or any(not (arg.startswith("+") or re.fullmatch(
-                    r"-[uR]+|-I(?:date|hours|minutes|seconds|ns)?", arg)) for arg in args):
-                return False
-        elif name == "sort":
-            if any(v.startswith("-") and not re.fullmatch(r"--?|-[bdfghinMnrRsuV]+", v) for v in args):
-                return False
-        elif name == "uniq":
-            if sum(not v.startswith("-") for v in args) > 1 or any(
-                    v.startswith("-") and not re.fullmatch(r"-[cdiu]+", v) for v in args):
-                return False
-        elif name == "rg":
-            if any(v.startswith("-") and not re.fullmatch(r"-[inlovcFHwS]+|--files|--no-heading", v)
-                   for v in args):
-                return False
-        elif name == "find":
-            if any(v.startswith("-") and v not in {"-name", "-iname", "-type", "-maxdepth", "-mindepth",
-                                                   "-print", "-print0", "-size", "-mtime"} for v in args):
-                return False
-        elif name not in _RO_CMDS:
-            return False
-    return True
-
 
 def _sha256(path):
     h = hashlib.sha256()

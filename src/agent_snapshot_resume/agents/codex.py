@@ -107,7 +107,6 @@ def recorded_sandbox_mode(context):
 
 # A literal range-print script with one plain file operand cannot edit the file.
 # Keep this native-only so historical Claude Code plans retain their exact actions.
-_SED_PRINT = re.compile(r"""(?:/usr/bin/|/bin/)?sed -n '(?:[0-9]+,)?[0-9]+p' [a-zA-Z0-9_./][a-zA-Z0-9_./-]*""")
 
 
 _JUSTIFICATION_REJECTION = (
@@ -134,7 +133,7 @@ def tool_action(payload, cwd, args=None):
         if (isinstance(cmd, str) and not args.get("tty") and isinstance(workdir, str)
                 and (shell is None or isinstance(shell, str))):
             standard_shell = shell in (None, "bash", "/bin/bash", "sh", "/bin/sh")
-            read_only = standard_shell and (bash_is_read_only(cmd) or _SED_PRINT.fullmatch(cmd))
+            read_only = standard_shell and bash_is_read_only(cmd)
             effect = "read_only" if read_only else "exec"
             if shell or args.get("login") is False:
                 cmd = shlex.join([shell or "bash", "-lc" if args.get("login", True) else "-c", cmd])
