@@ -11,7 +11,7 @@ import shlex
 DEFAULT_ROOTS = ("/app",)
 
 
-def build_fingerprint_command(roots, optional_roots=()):
+def build_fingerprint_command(roots, optional_roots=(), python="python3"):
     if not roots or any(not p.startswith('/') or p in ('/', '/root') for p in roots):
         raise ValueError('Specify explicit absolute task-data/work/output roots, not whole home/root')
     if not set(optional_roots).issubset(roots):
@@ -39,4 +39,4 @@ payload=json.dumps(sorted(rows+missing,key=lambda row:row[0]),separators=(',',':
 print('files='+str(len(rows)))
 print(hashlib.sha256(payload).hexdigest())
 '''.replace('ROOTS_JSON',repr(json.dumps(roots))).replace('OPTIONAL_JSON',repr(json.dumps(list(optional_roots))))
-    return 'python3 -c '+shlex.quote(code)
+    return shlex.quote(python) + " -c " + shlex.quote(code)

@@ -15,10 +15,10 @@ from __future__ import annotations
 import datetime as _dt
 import hashlib
 import json
-import os
 import re
-import shlex
 from collections import Counter
+
+from .shell import bash_is_read_only
 
 IR_VERSION = "asr-trace-ir/0.1"
 # Some export pipelines replace secret-looking values with a bare [REDACTED] token, which is not valid
@@ -26,42 +26,6 @@ IR_VERSION = "asr-trace-ir/0.1"
 _REDACT_RE = re.compile(r"(?<=[:\[,])(\s*)\[REDACTED\](?=\s*[,}\]])")
 
 SIDE_EFFECT_CLASSES = ["read_only", "file_write", "exec", "exec_background", "subagent", "task_mgmt", "web", "other"]
-
-# conservative read-only Bash heuristic: every pipeline segment starts with a whitelisted command,
-# no output redirection to files, no in-place flags, no command substitution writing files.
-_RO_CMDS = {"ls", "cat", "head", "tail", "wc", "grep", "egrep", "fgrep", "rg", "find", "pwd", "echo", "printf",
-            "which", "file", "stat", "du", "df", "nproc", "free", "uname", "whoami", "id", "env", "printenv",
-            "date", "sort", "uniq", "cut", "tr", "awk", "column", "diff", "cmp", "md5sum", "sha256sum", "tree",
-            "less", "more", "xxd", "od", "hexdump", "realpath", "dirname", "basename", "true", "nvidia-smi",
-            "ps", "top", "uptime", "lscpu", "type", "command", "test", "[", "jq", "readlink", "sleep", "cd",
-            "zcat", "gzip", "unzip", "tar", "h5dump", "ncdump", "strings", "nl", "seq", "lsof", "pgrep"}
-_RO_ARG_BLOCK = re.compile(r"(^|\s)(-delete|-exec|-execdir|-i\b|--in-place|-x\b|-c\b.*>|>)")
-
-
-def bash_is_read_only(cmd: str) -> bool:
-    if not cmd or "<<" in cmd or re.search(r"(?<![<>&0-9])>(?!&)|>>|\btee\b", cmd.replace("2>&1", "").replace(">/dev/null", "").replace("> /dev/null", "").replace("2>/dev/null", "")):
-        return False
-    segs = re.split(r"\|\||&&|;|\||\n", cmd)
-    for s in segs:
-        s = s.strip()
-        if not s:
-            continue
-        s = re.sub(r"^(\w+=\S+\s+)+", "", s)  # env assignments
-        try:
-            tok = shlex.split(s)[0]
-        except (ValueError, IndexError):
-            return False
-        tok = os.path.basename(tok)
-        if tok not in _RO_CMDS:
-            return False
-        if tok in ("tar", "unzip", "gzip") and not re.search(r"\s-(t|l|tf|tzf|tvf)\b|--list|\s-l\b|\s-c\b", s):
-            return False
-        if tok == "find" and re.search(r"-delete|-exec|-execdir|-fprint", s):
-            return False
-        if tok == "awk" and re.search(r"system\(|print\s*>", s):
-            return False
-    return True
-
 
 def _sha256(path):
     h = hashlib.sha256()
@@ -100,9 +64,17 @@ def replay_plan(ir, k_index, include_read_only=False):
         raise ValueError("resume step must be an agent step after the instruction")
     cut_ts = _ts(ir["steps"][k]["timestamp"])
     actions = []
+    refusals = []
     for st in ir["steps"][:k]:
         for e in st["events"]:
-            if e["type"] != "tool_call":
+            reason = e.get("replay_refusal")
+            if e.get("missing_result_reason"):
+                result_line = e.get("result_line")
+                if result_line is None or result_line >= ir["steps"][k]["line_range"][0]:
+                    reason = e["missing_result_reason"]
+            if reason:
+                refusals.append(f"{e['call_id']} (line {e['line']}): {reason}")
+            if e["type"] != "tool_call" or e.get("execution_rejected"):
                 continue
             if e["side_effect"] == "read_only" and not include_read_only:
                 continue
@@ -164,8 +136,15 @@ def replay_plan(ir, k_index, include_read_only=False):
                                 "background_output_file": None, "cwd": e.get("cwd"), "auto_backgrounded": False,
                                 "evidence_read_for": "failed_background_output"})
     actions.sort(key=lambda a: (_ts(a["timestamp"]) or 0))
-    return {"trial": ir["trial"], "resume_step_atif": ir["steps"][k]["atif_step_id"], "resume_step_index": k,
+    plan = {"trial": ir["trial"], "resume_step_atif": ir["steps"][k]["atif_step_id"], "resume_step_index": k,
             "actions": actions}
+    if "native_replay_revision" in ir:
+        if ir.get("native_agent"):
+            plan["native_agent"] = ir["native_agent"]
+        plan["native_replay_revision"] = ir["native_replay_revision"]
+        if refusals:
+            plan["replay_refusals"] = refusals
+    return plan
 
 
 def resume_points(ir):

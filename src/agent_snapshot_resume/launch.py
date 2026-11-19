@@ -18,16 +18,11 @@ from typing import Any
 from urllib.parse import urlparse
 
 from . import config
+from .agent_env import SECRET_NAME as _SECRET_RE, RESERVED_ENV as _RESERVED_ENV, native_agent_env
 from .agents.base import load_bundle
 
 SNAPSHOT_ENV_IMPORT = "agent_snapshot_resume.sandbox.snapshot_env:SnapshotCloneEnvironment"
 _TEMPLATE_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
-_SECRET_RE = re.compile(r"(KEY|SECRET|TOKEN(?!S)|PASSWORD|CREDENTIAL|AUTH)", re.I)
-# Agent env keys that must come from this tool, never from the original run.
-_RESERVED_ENV = {"ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_BASE_URL",
-                 "OPENAI_API_KEY", "CLAUDE_CONFIG_DIR"}
-
-
 # Packed inputs a task image unpacks during its build and then drops (round 1b: a task's `tests/data/*.tar.gz`
 # population archives). They are never verifier runtime files, and a task's own corpus gate treats a restored copy
 # as an "extra" file, so they are not part of the /tests identity the gate asserts.
@@ -48,17 +43,22 @@ def verifier_hashes(task_dir: Path) -> dict[str, str]:
 # mode, its bundle). Inheriting those would make the next round's fake run compare against the previous round's
 # request, which can never match, so they are dropped; only the reproduction settings (env, model, flags) are kept.
 _RESUME_KWARGS = {"resume_bundle", "upstream_fake", "upstream_url", "parity_gate", "expected_first_request_sha256",
-                  "freeze_first_request", "max_model_requests", "passthrough_args"}
+                  "freeze_first_request", "max_model_requests", "passthrough_args", "passthrough_script",
+                  "passthrough_script_sha256", "allow_incomplete_evidence", "parity_verdict", "fake_parity_verdict"}
 
 
-def original_agent_settings(trial_dir: str | None) -> tuple[dict[str, str], dict[str, Any]]:
+def original_agent_settings(trial_dir: str | None, *, native: str | None = None) -> tuple[dict[str, str], dict[str, Any]]:
     """Non-secret env and kwargs of the original run's agent (from <trial>/config.json), to reproduce its setup."""
+    if native:
+        return native_agent_env(trial_dir, native)[0], {}
     if not trial_dir or not (Path(trial_dir) / "config.json").is_file():
         return {}, {}
     agent = (json.loads((Path(trial_dir) / "config.json").read_text()).get("agent") or {})
     env = {}
     for k, v in (agent.get("env") or {}).items():
-        if k in _RESERVED_ENV or _SECRET_RE.search(k):
+        if _SECRET_RE.search(k) or k in _RESERVED_ENV:
+            continue
+        if any(_SECRET_RE.search(ref[1]) for ref in _TEMPLATE_RE.finditer(str(v))):
             continue
         m = _TEMPLATE_RE.fullmatch(str(v))
         if m:  # "${VAR}" / "${VAR:-default}": resolve from this process (non-secret names only), else drop
@@ -116,7 +116,8 @@ def rebind_cut_identity(state_path: Path, source: dict[str, Any], bundle: Path) 
     os.replace(tmp, state_path)
 
 
-def frozen_first_request_digest(path: Path, bundle: Path, passthrough_args: list[str] | None) -> str:
+def frozen_first_request_digest(path: Path, bundle: Path, passthrough_args: list[str] | None,
+                                allow_incomplete_evidence=False, passthrough_script_sha256=None) -> str:
     """Digest of a fake run's rewritten first request (every field except `metadata`), to require the real run's
     first request to be identical. Verified provenance: the parity report next to it judged exactly this request
     (request_sha256), passed, came from a fake run, used the same passthrough route as this launch, and the fake
@@ -128,11 +129,36 @@ def frozen_first_request_digest(path: Path, bundle: Path, passthrough_args: list
     path = Path(path)
     rec = json.loads(path.read_text())
     body = rec.get("body", rec)
-    digest = request_digest(body)
+    wire = json.loads((Path(bundle) / "proxy_spec.json").read_text()).get("wire")
+    digest = request_digest(body, wire)
     rep_path = path.with_name("first_request_parity.json")
     rep = json.loads(rep_path.read_text()) if rep_path.is_file() else {}
     problems = []
-    if not rep.get("ok"):
+    if allow_incomplete_evidence != rep.get("allow_incomplete_evidence", False):
+        problems.append("incomplete evidence policy differs")
+    if passthrough_script_sha256 != rep.get("passthrough_script_sha256"):
+        problems.append("translator digest differs")
+    partial = allow_incomplete_evidence and rep.get("verdict") == "incomplete_evidence" and rep.get("admitted")
+    if partial:
+        from .proxy import native_wire
+        from .proxy.resume_proxy import spec_hints
+        spec = json.loads((Path(bundle) / "proxy_spec.json").read_text())
+        exp = json.loads((Path(bundle) / "bundle.json").read_text())["orig_request_at_k"]
+        ref = exp["content"]
+        payload_hash = rep.get("translated_request_sha256")
+        frozen = digest
+        if payload_hash:
+            if not passthrough_script_sha256 or not re.fullmatch(r"[a-f0-9]{64}", payload_hash):
+                problems.append("translator proof missing its pin or payload digest")
+            frozen = native_wire.digest([{k: v for k, v in body.items() if k != "client_metadata"}, payload_hash])
+        if exp.get("metadata") and (rep.get("translator_metrics") != exp["metadata"] or not passthrough_script_sha256):
+            problems.append("historical translator metrics unverified")
+        if not (native_wire.envelope_only_gap(ref) and not rep.get("translator_diffs")
+                and not rep.get("content_problems") and rep.get("all_items_equal")
+                and native_wire.compare_native(body, ref, spec_hints(spec))["verdict"] == "incomplete_evidence"
+                and frozen == rep.get("freeze_sha256")):
+            problems.append("incomplete evidence proof is invalid")
+    elif not rep.get("ok") or not rep.get("admitted", True) or rep.get("verdict", "ok") != "ok":
         problems.append("parity report missing or not ok")
     if rep.get("request_sha256") != digest:
         problems.append("parity report did not judge this request")
@@ -154,7 +180,7 @@ def frozen_first_request_digest(path: Path, bundle: Path, passthrough_args: list
             problems.append(f"fake run's bundle identity differs from this bundle in {diff}")
     if problems:
         raise SystemExit(f"--freeze-first-request {path}: " + "; ".join(problems))
-    return digest
+    return rep["freeze_sha256"] if partial else digest
 
 
 def build_job_config(*, adapter, bundle: Path, task_dir: Path, job_name: str, jobs_dir: Path,
@@ -163,11 +189,17 @@ def build_job_config(*, adapter, bundle: Path, task_dir: Path, job_name: str, jo
                      extra_env: dict[str, str] | None = None, extra_kwargs: dict[str, Any] | None = None,
                      original_trial_dir: str | None = None, setup_timeout_s: float = 1200.0,
                      passthrough_args: list[str] | None = None, parity_gate: str = "auto",
+                     passthrough_script=None, passthrough_script_sha256=None, allow_incomplete_evidence=False,
                      max_model_requests: int | None = None,
                      freeze_first_request: str | None = None) -> dict[str, Any]:
     bundle, meta = load_bundle(bundle)
     bundle = bundle.resolve()
     task_dir = task_dir.resolve()
+    requested_model = model or config.model_override()
+    if getattr(adapter, "wire", None):
+        native_model = meta.get("native_model")
+        adapter.validate_model(meta, requested_model)
+        requested_model = requested_model or native_model
     if not (task_dir / "task.toml").is_file():
         raise SystemExit(f"{task_dir} is not a Harbor task dir (no task.toml)")
     env_kwargs: dict[str, Any] = {"owner": config.owner_tag(), "job": job_name}
@@ -177,6 +209,9 @@ def build_job_config(*, adapter, bundle: Path, task_dir: Path, job_name: str, jo
             raise SystemExit("--snapshot-id differs from the snapshot state file")
         if not source.get("snapshot_id") or not source.get("replay_gate_passed"):
             raise SystemExit("snapshot source has not passed the replay gates")
+        if getattr(adapter, "wire", None):
+            from .sandbox.source import check_native_replay
+            check_native_replay(adapter.name, task_dir, bundle, source.get("replay_policy") or "strict")
         check_shared_snapshot(source, bundle)  # always: a rebuilt bundle with the same run id must match too
         rebind_cut_identity(Path(snapshot_state), source, bundle)
         hashes = verifier_hashes(task_dir)
@@ -190,17 +225,43 @@ def build_job_config(*, adapter, bundle: Path, task_dir: Path, job_name: str, jo
         env_kwargs["snapshot_id"] = snapshot_id
     else:
         raise SystemExit("need --snapshot-state (recommended) or --snapshot-id")
-    orig_env, orig_kwargs = original_agent_settings(original_trial_dir)
+    # Native adapters reconstruct the original provider settings from their session and pinned auxiliary data.
+    native = adapter.name if getattr(adapter, "wire", None) else None
+    plan_file = bundle / "plan.json"
+    plan = json.loads(plan_file.read_bytes()) if native and plan_file.is_file() else {}
+    if "agent_env_sha256" in plan:
+        orig_env, orig_kwargs = plan["shell_env"], {}
+        if any(k in orig_env and v != orig_env[k] for k, v in (extra_env or {}).items()):
+            raise ValueError("native environment override differs from the replay plan")
+    else:
+        orig_env, orig_kwargs = original_agent_settings(original_trial_dir, native=native)
+    from .proxy.runtime import verified_script
+    script = verified_script(passthrough_script, passthrough_script_sha256)
+    if allow_incomplete_evidence and parity_gate != "require":
+        raise ValueError("--allow-incomplete-evidence requires --parity-gate require")
     agent_env = {**getattr(adapter, "default_env", {}), **orig_env, **(extra_env or {})}
     upstream_url = upstream_url or config.upstream_url()
     kwargs = {**orig_kwargs, **(extra_kwargs or {}), "version": meta.get("agent_version_orig") or adapter.version,
               "resume_bundle": str(bundle), "upstream_fake": bool(fake), "parity_gate": parity_gate}
+    if adapter.name == "pi" and snapshot_state and source.get("pi_output_manifest") is not None:
+        kwargs["pi_output_manifest"] = source["pi_output_manifest"]
+    if script:
+        kwargs.update(passthrough_script=str(script), passthrough_script_sha256=passthrough_script_sha256)
+    if parity_gate == "require":
+        ref = (meta.get("orig_request_at_k") or {}).get("content") or {}
+        if ref.get("wire") and ref.get("complete") is False:
+            from .proxy.native_wire import envelope_only_gap
+            if not (allow_incomplete_evidence and envelope_only_gap(ref)):
+                raise SystemExit("incomplete_evidence: required original request unavailable")
+        kwargs.update(allow_incomplete_evidence=allow_incomplete_evidence, parity_verdict="pending")
     if parity_gate == "require" and not meta.get("orig_request_at_k"):
         raise SystemExit("--parity-gate require: bundle has no orig_request_at_k "
                          f"({meta.get('orig_request_locate_error')})")
     if freeze_first_request:
         kwargs["expected_first_request_sha256"] = frozen_first_request_digest(
-            Path(freeze_first_request), bundle, passthrough_args)
+            Path(freeze_first_request), bundle, passthrough_args, allow_incomplete_evidence, passthrough_script_sha256)
+        report = json.loads(Path(freeze_first_request).with_name("first_request_parity.json").read_text())
+        kwargs["fake_parity_verdict"] = report.get("verdict", "ok")
         kwargs["freeze_first_request"] = str(Path(freeze_first_request).resolve())
     elif parity_gate == "require" and not fake:
         raise SystemExit("--parity-gate require for a real run needs --freeze-first-request <first_request_rewritten.json "
@@ -213,7 +274,7 @@ def build_job_config(*, adapter, bundle: Path, task_dir: Path, job_name: str, jo
         from .proxy.runtime import validate_passthrough_args
         kwargs["passthrough_args"] = validate_passthrough_args(passthrough_args)
     agent: dict[str, Any] = {"import_path": adapter.harbor_import_path,
-                             "model_name": model or config.model_override() or meta.get("model"),
+                             "model_name": requested_model or meta.get("model"),
                              "override_timeout_sec": float(meta["agent_budget_s"]),
                              "override_setup_timeout_sec": float(setup_timeout_s), "kwargs": kwargs, "env": agent_env}
     if not fake:
@@ -245,6 +306,7 @@ def launch_one(*, adapter, bundle: Path, task_dir: Path, job_name: str, jobs_dir
                verifier: bool = True, model: str | None = None, upstream_url: str | None = None,
                extra_env: dict[str, str] | None = None, original_trial_dir: str | None = None,
                passthrough_args: list[str] | None = None, parity_gate: str = "auto",
+               passthrough_script=None, passthrough_script_sha256=None, allow_incomplete_evidence=False,
                max_model_requests: int | None = None, freeze_first_request: str | None = None,
                midrun_snapshot_every: float = 1200.0, midrun_snapshot_poll: float = 60.0) -> int:
     """Write runs/<job>/job.json, start the mid-run snapshotter, run Harbor. Returns Harbor's exit code."""
@@ -252,7 +314,8 @@ def launch_one(*, adapter, bundle: Path, task_dir: Path, job_name: str, jobs_dir
                            snapshot_state=snapshot_state, snapshot_id=snapshot_id, fake=fake, verifier=verifier,
                            model=model, upstream_url=upstream_url, extra_env=extra_env,
                            original_trial_dir=original_trial_dir, passthrough_args=passthrough_args,
-                           parity_gate=parity_gate, max_model_requests=max_model_requests,
+                           passthrough_script=passthrough_script, passthrough_script_sha256=passthrough_script_sha256,
+                           allow_incomplete_evidence=allow_incomplete_evidence, parity_gate=parity_gate, max_model_requests=max_model_requests,
                            freeze_first_request=freeze_first_request)
     validate_job_config(cfg)
     run_dir = Path(runs_dir) / job_name
@@ -266,6 +329,16 @@ def launch_one(*, adapter, bundle: Path, task_dir: Path, job_name: str, jobs_dir
     try:
         return run_harbor(path, fake)
     finally:
+        if parity_gate == "require":
+            reports = list((Path(jobs_dir) / job_name).glob("*/agent/resume-proxy/*/first_request_parity.json"))
+            verdict = "unobserved"
+            if len(reports) == 1:
+                report = json.loads(reports[0].read_text())
+                verdict = report.get("verdict", "ok" if report.get("ok") else "mismatch")
+            cfg["agents"][0]["kwargs"]["parity_verdict"] = verdict
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(cfg, indent=1) + "\n")
+            os.replace(tmp, path)
         if snap is not None:
             snap.stop()
             if snap.errors:
@@ -289,7 +362,7 @@ def run_harbor(config_path: Path, fake: bool) -> int:
         if missing:
             raise SystemExit(f"missing in the environment: {missing} (never put it in the job config)")
     env = dict(os.environ)
-    env.pop("PYTHONPATH", None)
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
     # Harbor's Claude Code agent resolves a key/base URL at init; give it the dummy values the sandbox will use.
     env.update(ANTHROPIC_API_KEY="dummy-resume", ANTHROPIC_BASE_URL="http://127.0.0.1:4031")
     harbor = shutil.which("harbor") or str(Path(sys.executable).with_name("harbor"))

@@ -32,6 +32,9 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
+from .trace.shell import BASH_CLASSIFIER_REVISION
+
+
 STAGES = ("screen", "bundles", "template", "snapshot", "fake", "launch")
 TERMINAL_FAIL = ("screen_block", "bundle_error", "template_error", "snapshot_error", "fake_parity_failed",
                  "launch_error")
@@ -89,10 +92,50 @@ class State:
             return u
 
 
+def native_compactions(trial):
+    """Count persisted post-seed events, including split summaries stored as one Pi entry."""
+    from .agents import get_adapter
+    try:
+        meta = json.loads((trial / "agent/resume/bundle.json").read_bytes())
+        adapter = get_adapter(meta["agent"])
+        path = trial / "agent" / adapter.session_relative_path(meta)
+        seed = hashlib.sha256()
+        with path.open("rb") as stream:
+            for _ in range(meta["cut_line"]):
+                seed.update(next(stream))
+            if seed.hexdigest() != meta["prefix_sha256"]:
+                return None
+            event = "compaction" if meta["agent"] == "pi" else "compacted"
+            return sum(json.loads(line).get("type") == event for line in stream)
+    except (ValueError, OSError, KeyError, StopIteration, AttributeError, TypeError):
+        return None
+
+
+def native_metrics(trial, records):
+    """A summary request can finish without Pi persisting a compaction entry."""
+    metrics = dict(n_compactions=native_compactions(trial), n_compaction_requests=None,
+                   hint_counts=None, hint_counts_last=None)
+    if records is None:
+        return metrics
+    main = [r for r in records if r.get("n") is not None]
+    metrics["n_requests"] = len(main)
+    if main and all("compaction_request" in r and r.get("wire") == "chat" for r in main):
+        metrics["n_compaction_requests"] = sum(bool(r["compaction_request"]) for r in main)
+    if main:
+        for key, entry in (("hint_counts", main[0]), ("hint_counts_last", main[-1])):
+            counts = [h["blocks"] for h in entry.get("hint_chain", [])]
+            if counts:
+                metrics[key] = counts
+            elif entry.get("hint_blocks") is not None:
+                metrics[key] = [entry["hint_blocks"]]
+    return metrics
+
+
 class Batch:
-    def __init__(self, *, name: str, work_dir: Path, manifest: Path, tasks_dir: Path, jobs_dir: Path,
+    def __init__(self, *, name: str, work_dir: Path, manifest: Path | None, tasks_dir: Path, jobs_dir: Path,
                  runs_dir: Path, state_dir: Path, agent_env: dict[str, str] | None = None,
                  passthrough_args: list[str] | None = None, model: str | None = None,
+                 passthrough_script=None, passthrough_script_sha256=None, allow_incomplete_evidence=False,
                  upstream_url: str | None = None, hinted_reps: int = 2, control_reps: int = 1,
                  midrun_snapshot_every: float = 1200.0, cut_window: int = 200, max_cut_candidates: int = 16,
                  retry_failed: str = "off", prep_concurrency: int = 6,
@@ -102,13 +145,18 @@ class Batch:
         self.replay_deadline_s = replay_deadline_s
         self.name, self.work = name, Path(work_dir)
         self.batch_dir = self.work / "batch" / name
-        self.manifest_path = Path(manifest)
-        self.rows = load_manifest(self.manifest_path)
+        self.state = State(self.batch_dir)
+        self.manifest_path = Path(manifest) if manifest else None
+        self.rows = load_manifest(self.manifest_path) if self.manifest_path else list(self.state.units.values())
         if only:
             self.rows = [r for r in self.rows if r["task"] in only]
         self.tasks_dir = Path(tasks_dir)
         self.jobs_dir, self.runs_dir, self.state_dir = Path(jobs_dir), Path(runs_dir), Path(state_dir)
         self.agent_env, self.passthrough_args, self.model = agent_env or {}, passthrough_args, model
+        from .proxy.runtime import verified_script
+        self.route_options = dict(passthrough_script=verified_script(passthrough_script, passthrough_script_sha256),
+                                  passthrough_script_sha256=passthrough_script_sha256,
+                                  allow_incomplete_evidence=allow_incomplete_evidence)
         self.upstream_url = upstream_url
         self.hinted_reps, self.control_reps = hinted_reps, control_reps
         self.midrun_every = midrun_snapshot_every
@@ -118,7 +166,6 @@ class Batch:
         self.replay_policy, self.cost_alarm_usd = replay_policy, cost_alarm_usd
         self.prep_concurrency, self.launch_concurrency = prep_concurrency, launch_concurrency
         self.agent_name, self.verifier = agent, verifier
-        self.state = State(self.batch_dir)
         self.log = log
         self._adapter = None
 
@@ -148,6 +195,8 @@ class Batch:
         """Session hash of the source trial (part of the bundle input identity)."""
         src = self.source(row)
         p = Path(src["trial_dir"])
+        if getattr(self.adapter, "wire", None):
+            return __import__("hashlib").sha256(self.adapter.find_session(p).read_bytes()).hexdigest()
         js = p / "agent" / "sessions" / "projects"
         cand = sorted(js.glob("*/*.jsonl"))
         if not cand:
@@ -168,10 +217,11 @@ class Batch:
         task = row["task"]
         ud = self.unit_dir(task)
         out = ud / "screen.json"
-        if out.is_file():
+        if out.is_file() and not getattr(self.adapter, "wire", None):
             rep = json.loads(out.read_text())
             # a report made under another replay policy is not reusable: the policy decides which risks block a cut
-            if rep.get("manifest_cut") == row["cut_line"] and rep.get("policy") == self.replay_policy:
+            if (rep.get("manifest_cut") == row["cut_line"] and rep.get("policy") == self.replay_policy
+                    and rep.get("bash_classifier_revision") == BASH_CLASSIFIER_REVISION):
                 if rep.get("cut_line") is None:
                     raise RuntimeError(f"every cut in the fork window blocks ({len(rep.get('candidates') or [])} "
                                        "candidates): see screen.json")
@@ -213,10 +263,12 @@ class Batch:
                                f"line {base_line}: no cut can replay the tail from that image")
         by_cut: dict[int, dict[str, Any]] = {}
         skipped: list[dict[str, Any]] = []
+        evidence_policy = ({"allow_incomplete_evidence": self.route_options["allow_incomplete_evidence"]}
+                           if getattr(self.adapter, "wire", None) else {})
         for c in cands[:self.max_cut_candidates]:
             try:
                 rep = screen.screen_trial(self.adapter, trial_dir, cut_lines=[c], task_dir=self.task_dir(row), ir=ir,
-                                          policy=self.replay_policy)
+                                          policy=self.replay_policy, **evidence_policy)
             except (SystemExit, ValueError) as exc:  # e.g. a step at index 0 has no prefix to replay
                 skipped.append({"cut_line": c, "error": str(exc)[:200]})
                 continue
@@ -234,7 +286,7 @@ class Batch:
                 if r and r.get("verdict") == "review":
                     chosen = c
                     break
-        rep = {"task": task, "manifest_cut": row["cut_line"], "policy": self.replay_policy,
+        rep = {"task": task, "bash_classifier_revision": BASH_CLASSIFIER_REVISION, "manifest_cut": row["cut_line"], "policy": self.replay_policy,
                "snapped_cut": near, "fork_session_line": fork_line,
                "candidates": [screen.summarize(by_cut[c]) for c in cands if c in by_cut], "skipped": skipped,
                "cut_line": chosen, "moved": chosen != row["cut_line"],
@@ -251,7 +303,7 @@ class Batch:
 
         task = row["task"]
         ud = self.unit_dir(task)
-        hint = Path(row["hint_path"]).read_text().strip()
+        hint = Path(row["hint_path"]).read_text().strip() if self.hinted_reps else ""
         src = self.source(row)
         # Chained round-N unit: `chain.json` names the resumed trial this cut belongs to, the mid-run snapshot the
         # replay continues from, and the hints that run already carried. The new hint is injected at the new cut on
@@ -273,32 +325,63 @@ class Batch:
             control = {"mode": "hint", "hint": "\n\n".join(h.strip() for h in chain_spec["prior_hints"]),
                        "run_id": f"{task}-s{cut}-control"}
         specs = {"hinted": {"mode": "hint", "hint": hint, "run_id": f"{task}-s{cut}-hint"}, "control": control}
+        if not self.hinted_reps:
+            specs.pop("hinted")
+        if not self.control_reps:
+            specs.pop("control")
         # A cached bundle is only reusable if it was built from the same inputs; a changed hint file, cut or source
         # session must rebuild it, and a downstream fake/parity proof must never legitimise the stale one.
-        inputs = {"cut_line": cut, "source_trial_dir": str(trial_dir.resolve()),
+        inputs = {"bash_classifier_revision": BASH_CLASSIFIER_REVISION, "cut_line": cut, "source_trial_dir": str(trial_dir.resolve()),
                   "hint_sha256": hashlib.sha256(hint.encode()).hexdigest() if hint else None,
                   "session_sha256": self.source_session_sha(row),
                   "chain": {"base_snapshot": (chain_spec.get("base_snapshot") or {}).get("snapshot_id"),
                             "prior_hints_sha256": hashlib.sha256("\n\n".join(
                                 chain_spec.get("prior_hints") or []).encode()).hexdigest()} if chain_spec else None}
+        if getattr(self.adapter, "wire", None):
+            # Older native bundles can omit Pi file effects or use the initial Codex cwd at the cut.
+            from .agents.native import NATIVE_REPLAY_REVISION
+            inputs["native_bundle_revision"] = NATIVE_REPLAY_REVISION
+            if hasattr(self.adapter, "native_reference"):
+                timeout = bundle_mod.resolve_agent_timeout(trial_dir, task_dir=self.task_dir(row))
+                ir = self.adapter.load_trace(trial_dir, agent_timeout_s=timeout)
+                _, raw = bundle_mod.native_session_lines(trial_dir / ir["sources"]["session_jsonl"])
+                trim = lambda i: self.adapter.cut_line(raw, ir, i)
+                sid = bundle_mod.step_for_cut_line(ir, cut, trim)
+                k = bundle_mod.trace_ir.step_index(ir, sid)
+                ref, error = self.adapter.native_reference(trial_dir, ir, k, raw[:trim(k)])
+                step = ir["steps"][k]
+                plan = bundle_mod.resolved_replay_plan(trial_dir, ir, k, raw)
+                resolved = dict(plan=plan, sources=ir["sources"], step=sid, prefix_lines=trim(k), timeout=timeout,
+                                elapsed=step["elapsed_s"], remaining=step["remaining_s"], reference=ref, error=error)
+                evidence = json.dumps(resolved, sort_keys=True).encode()
+                inputs["native_cut_sha256"] = hashlib.sha256(evidence).hexdigest()
+        if self.agent_name == "codex":
+            inputs["sandbox_policy_source"] = "turn_context"
         cached = {}
-        if (ud / "bundles.json").is_file():
+        manifest = ud / "bundles.json"
+        if manifest.is_file():
             try:
-                cached = json.loads((ud / "bundles.json").read_text())
+                cached = json.loads(manifest.read_text())
             except ValueError:
                 cached = {}
         rebuild = bool(cached) and cached.get("inputs") != inputs
+        if rebuild:
+            # A failed rebuild may already have replaced one kind's directory.
+            # Invalidate the old manifest before replacing any of its members.
+            manifest.unlink()
         out: dict[str, Any] = {"cut_line": cut, "inputs": inputs, "bundles": {},
                                "rebuilt_for_input_change": rebuild}
         for kind, spec in specs.items():
             bdir = ud / "bundles" / spec["run_id"]
-            if bdir.is_dir() and (bdir / "bundle.json").is_file() and not rebuild:
+            entry = (cached.get("bundles") or {}).get(kind) or {}
+            if (not rebuild and cached.get("inputs") == inputs and entry.get("run_id") == spec["run_id"]
+                    and (bdir / "bundle.json").is_file()):
                 meta = json.loads((bdir / "bundle.json").read_text())
             else:
                 bdir, meta = bundle_mod.build(adapter=self.adapter, trial_dir=trial_dir,
                                              atif_step=None, cut_line=cut, out=ud / "bundles",
                                              task_dir=self.task_dir(row), mode=spec["mode"], hint=spec["hint"],
-                                             run_id=spec["run_id"], persist_hint=(spec["mode"] == "hint"),
+                                             run_id=spec["run_id"], persist_hint=(spec["mode"] == "hint" and not getattr(self.adapter, "wire", None)),
                                              force=True,
                                              # only the hinted bundle names the carried hints explicitly; the
                                              # control bundle inherits them from the resumed session's own proxy spec
@@ -324,7 +407,9 @@ class Batch:
             if not meta.get("orig_request_at_k"):
                 raise RuntimeError(f"{kind} bundle has no original request at the cut: "
                                    f"{meta.get('orig_request_locate_error')}")
-        (ud / "bundles.json").write_text(json.dumps(out, indent=1))
+        tmp = manifest.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(out, indent=1))
+        tmp.replace(manifest)
         return out
 
     # ------------------------------------------------------------------ stage: template
@@ -358,6 +443,7 @@ class Batch:
         base_tag = f"{task}-s{cut}"
         if not tmpl_id:
             raise RuntimeError("no ready template id for this task")
+        base = bundled.get("bundles", {}).get("hinted") or bundled.get("bundles", {}).get("control") or {}
         tag, attempt = base_tag, 0
         while True:
             out = self.state_dir / f"snapshot-{tag}.json"
@@ -367,7 +453,7 @@ class Batch:
             # a snapshot accepted under another policy was not gated the way this batch gates: never reuse it silently
             same_policy = (rec.get("replay_policy") or "strict") == self.replay_policy
             # a snapshot replayed from a different plan (e.g. the bundle was rebuilt) restores a different state
-            hinted_dir = ((bundled.get("bundles") or {}).get("hinted") or {}).get("dir")
+            hinted_dir = base.get("dir")
             if rec.get("replay_gate_passed") and rec.get("snapshot_id") and hinted_dir and rec.get("cut_identity"):
                 from .bundle import cut_identity_diff, snapshot_cut_identity
                 if cut_identity_diff(snapshot_cut_identity(Path(hinted_dir)), rec["cut_identity"]):
@@ -388,17 +474,28 @@ class Batch:
             out.rename(out.with_name(out.name + f".stale-{attempt}"))
             tag = f"{base_tag}-r{attempt}"
         rec = source.prepare_source(adapter=self.adapter, task_dir=self.task_dir(row),
-                                    bundle=Path(bundled["bundles"]["hinted"]["dir"]),
+                                    bundle=Path(base["dir"]),
                                     template=str(tmpl_id), tag=tag, state_dir=self.state_dir,
                                     replay_policy=self.replay_policy, replay_deadline_s=self.replay_deadline_s,
                                     # a chained bundle's plan holds only the tail after its mid-run snapshot: the
                                     # replay must start from that snapshot, not from a fresh container
-                                    base_snapshot=(json.loads((Path(bundled["bundles"]["hinted"]["dir"])
+                                    base_snapshot=(json.loads((Path(base["dir"])
                                                                / "bundle.json").read_text()).get("base_snapshot")
                                                    or {}).get("snapshot_id"))
         if not rec.get("snapshot_id"):
             raise RuntimeError("prepare-snapshot produced no snapshot id")
         return rec
+
+    def _fake_completed(self, trial: Path) -> bool:
+        try:
+            result = json.loads((trial / "result.json").read_bytes())
+            if self.agent_name == "pi":
+                from .agents.pi import PiBaseline
+                from .proxy.pi_receipts import check_output
+                check_output(trial / "agent" / PiBaseline._OUTPUT_FILENAME)
+        except (OSError, ValueError):
+            return False
+        return isinstance(result, dict) and bool(result.get("finished_at")) and result.get("exception_info") is None
 
     # ------------------------------------------------------------------ stage: fake parity
     def stage_fake(self, row: dict[str, Any], cut: int, bundled: dict[str, Any], snap_path: Path) -> dict[str, Any]:
@@ -412,15 +509,27 @@ class Batch:
         for kind, b in bundled["bundles"].items():
             job = f"{self.job(row, 'fake-' + kind)}"
             cached = (cache.get("runs") or {}).get(kind) or {}
-            if cached.get("parity_ok") and Path(cached.get("first_request", "")).is_file():
+            if cached.get("admitted", cached.get("parity_ok")) and Path(cached.get("first_request", "")).is_file():
                 # the proof is only reusable while it was made against this exact bundle: a changed review set or cut
                 # changes the bundle identity, and the real launch checks identity equality against the fake run
                 from .bundle import cut_identity_diff, snapshot_cut_identity
                 ident = Path(cached["first_request"]).parent.parent.parent / "resume" / "bundle_identity.json"
                 theirs = (json.loads(ident.read_text()).get("cut") if ident.is_file() else None) or {}
-                if not cut_identity_diff(snapshot_cut_identity(Path(b["dir"])), theirs):
-                    out["runs"][kind] = {**cached, "cached": True}
-                    continue
+                if (self._fake_completed(Path(cached["first_request"]).parents[3])
+                        and not cut_identity_diff(snapshot_cut_identity(Path(b["dir"])), theirs)):
+                    from .launch import frozen_first_request_digest
+                    try:
+                        frozen_first_request_digest(Path(cached["first_request"]), Path(b["dir"]), self.passthrough_args,
+                                                    self.route_options["allow_incomplete_evidence"],
+                                                    self.route_options["passthrough_script_sha256"])
+                    except (ValueError, SystemExit, FileNotFoundError):
+                        pass
+                    else:
+                        cached_report = json.loads(Path(cached["first_request"]).with_name("first_request_parity.json").read_text())
+                        self.state.update(task, parity_verdict=cached_report.get("verdict", "ok"),
+                                          allow_incomplete_evidence=cached_report.get("allow_incomplete_evidence", False))
+                        out["runs"][kind] = {**cached, "cached": True}
+                        continue
                 n = 2
                 while (self.runs_dir / f"{job}-v{n}" / "job.json").is_file():
                     n += 1
@@ -429,7 +538,7 @@ class Batch:
                             jobs_dir=self.jobs_dir, runs_dir=self.runs_dir, snapshot_state=snap_path, fake=True,
                             verifier=False, model=self.model, extra_env=self.agent_env,
                             original_trial_dir=self.source(row).get("trial_dir"),
-                            passthrough_args=self.passthrough_args, parity_gate="require",
+                            passthrough_args=self.passthrough_args, parity_gate="require", **self.route_options,
                             midrun_snapshot_every=0)
             trial = self.find_trial(job)
             if trial is None:
@@ -439,15 +548,19 @@ class Batch:
                 raise RuntimeError(f"fake run {job} wrote no proxy log")
             first = proxies[-1] / "first_request_rewritten.json"
             parity = proxies[-1] / "first_request_parity.json"
-            if not first.is_file() or not parity.is_file():
+            if not parity.is_file():
                 raise RuntimeError(f"fake run {job} missed {first.name}/{parity.name}")
-            ok = bool(json.loads(parity.read_text()).get("ok"))
+            report = json.loads(parity.read_text())
+            ok = bool(report.get("admitted", report.get("ok")))
             (ud / f"fake-parity-{kind}.json").write_text(parity.read_text())  # record for the batch, not for freezing
-            if not ok:
-                raise RuntimeError(f"fake parity failed for {kind}: {parity}")
+            self.state.update(task, allow_incomplete_evidence=self.route_options["allow_incomplete_evidence"],
+                              parity_verdict=report.get("verdict", "ok" if ok else "mismatch"))
+            if not ok or rc or not first.is_file() or not self._fake_completed(trial):
+                raise RuntimeError(f"fake parity or job execution failed for {kind}: {parity}")
             # --freeze-first-request resolves the parity report and the bundle identity *next to* this file, so pass
             # the request where the fake run wrote it (inside the trial's resume-proxy log), never a copy.
-            out["runs"][kind] = {"job": job, "first_request": str(first), "parity_ok": True, "trial": str(trial),
+            out["runs"][kind] = {"job": job, "first_request": str(first), "parity_ok": bool(report.get("ok")), "admitted": ok,
+                                 "parity_verdict": report.get("verdict", "ok"), "trial": str(trial),
                                  "parity_report": str(parity)}
         (ud / "fake.json").write_text(json.dumps(out, indent=1))
         return out
@@ -494,7 +607,7 @@ class Batch:
                             snapshot_state=snap_path, fake=False, verifier=self.verifier, model=self.model,
                             upstream_url=self.upstream_url, extra_env=self.agent_env,
                             original_trial_dir=self.source(row).get("trial_dir"),
-                            passthrough_args=self.passthrough_args, parity_gate="require",
+                            passthrough_args=self.passthrough_args, parity_gate="require", **self.route_options,
                             freeze_first_request=item["freeze"],
                             midrun_snapshot_every=self.midrun_every if item["kind"] == "hinted" else 0)
             trials = [p.name for p in (self.jobs_dir / item["job"]).glob("*") if p.is_dir()] \
@@ -503,6 +616,8 @@ class Batch:
             runs[item["job"]] = {"run": item["run"], "kind": item["kind"], "job": item["job"],
                                  "trial": (trials[0] if trials else None), "rc": rc, "launched": _now()}
             self.state.update(task, runs=runs)
+            if rc:
+                raise RuntimeError(f"Harbor job {item['job']} exited {rc}")
             launched.append({**item, "rc": rc, "trial": trials[0] if trials else None})
         return launched
 
@@ -510,7 +625,8 @@ class Batch:
     def prep(self, row: dict[str, Any]) -> dict[str, Any]:
         task = row["task"]
         try:
-            self.state.update(task, stage="screen", group=row.get("group"))
+            self.state.update(task, stage="screen", group=row.get("group"), parity_verdict="pending",
+                              allow_incomplete_evidence=self.route_options["allow_incomplete_evidence"])
             scr = self.stage_screen(row)
             cut = int(scr["cut_line"])
             self.state.update(task, stage="bundles", cut_line=cut, screen_verdict=scr["verdict"],
@@ -636,7 +752,9 @@ class Batch:
                              "state": st.get("stage"), "cut_line": st.get("cut_line"), "error": st.get("error"),
                              "replay_policy": st.get("replay_policy"),
                              "divergent_commands": st.get("divergent_commands"),
-                             "divergences_by_kind": st.get("divergences_by_kind")})
+                             "divergences_by_kind": st.get("divergences_by_kind"),
+                             "allow_incomplete_evidence": st.get("allow_incomplete_evidence"),
+                             "parity_verdict": st.get("parity_verdict")})
         return rows
 
     def run_status(self, row: dict[str, Any], st: dict[str, Any], job: str, info: dict[str, Any]) -> dict[str, Any]:
@@ -647,6 +765,26 @@ class Batch:
                                "hint_counts": [], "n_compactions": 0, "class": None, "error": None,
                                "replay_policy": st.get("replay_policy"),
                                "divergent_commands": st.get("divergent_commands")}
+        reqs = sorted((trial / "agent" / "resume-proxy").glob("*/requests.jsonl"))
+        records = None
+        if reqs:
+            try:
+                records = [json.loads(line) for line in reqs[-1].read_text().splitlines() if line.strip()]
+            except (OSError, ValueError):
+                pass  # the writer may still be appending the current request
+        native = self.agent_name in {"pi", "codex"} or any(r.get("wire") for r in records or [])
+        if native:
+            out.update(native_metrics(trial, records))
+        out["allow_incomplete_evidence"] = st.get("allow_incomplete_evidence", False)
+        out["parity_verdict"] = "pending"
+        for parity in trial.glob("agent/resume-proxy/*/first_request_parity.json"):
+            try:
+                report = json.loads(parity.read_text())
+            except ValueError:
+                continue
+            out.update(allow_incomplete_evidence=report.get("allow_incomplete_evidence", False),
+                       parity_verdict=report.get("verdict", "ok" if report.get("ok") else "mismatch"),
+                       admitted=report.get("admitted", report.get("ok")))
         res_path = trial / "result.json"
         if not res_path.is_file():
             started = info.get("launched")
@@ -668,10 +806,8 @@ class Batch:
             out["class"] = "infra" if any(k in str(exc).lower() for k in
                                           ("sandbox", "snapshot", "connect", "timeout connecting", "http")) else "model"
         out["failed_tests"] = failed_tests(trial)
-        reqs = sorted((trial / "agent" / "resume-proxy").glob("*/requests.jsonl"))
-        if reqs:
-            recs = [json.loads(l) for l in reqs[-1].read_text().splitlines() if l.strip()]
-            main = [r for r in recs if r.get("n") is not None]
+        if records is not None and not native:
+            main = [r for r in records if r.get("n") is not None]
             out["n_requests"] = len(main)
             out["n_compactions"] = sum(1 for r in main if r.get("compact_summary"))
             if main:
@@ -709,7 +845,8 @@ def failed_tests(trial: Path, limit: int = 12) -> list[str]:
 
 
 def print_status(rows: list[dict[str, Any]]) -> None:
-    cols = ("task", "run", "state", "reward", "cost_usd", "hint_counts", "n_compactions", "class", "error")
+    cols = ("task", "run", "state", "reward", "cost_usd", "hint_counts", "n_compactions",
+            "allow_incomplete_evidence", "parity_verdict", "class", "error")
     print("\t".join(cols + ("runaway",)))
     for r in rows:
         tail = "RUNAWAY" if r.get("runaway") else ""

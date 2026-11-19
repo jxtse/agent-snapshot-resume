@@ -78,7 +78,39 @@ _BG_RE = re.compile(r"(?:Command running in background with ID: (\w+)|moved to t
                     r"Output is being written to: (\S+?)\.?(?:\s|$)")
 
 
-def load_trial(trial_dir, agent_timeout_s=None, task=None, reward=None):
+def align_user_notifications(steps, main_atif, records):
+    """Resolve reversals of adjacent user records. Keep the native replay order."""
+    if len(steps) != len(main_atif):
+        return None
+    timestamps = [s.get("timestamp") for s in main_atif]
+    ids = [s.get("step_id") for s in main_atif]
+    if (not all(timestamps) or len(set(timestamps)) != len(steps)
+            or None in ids or len(set(ids)) != len(ids)):
+        return None
+    aligned = list(main_atif)
+    i = 0
+    while i < len(steps):
+        if steps[i]["timestamp"] == timestamps[i]:
+            if steps[i]["source"] != main_atif[i]["source"]:
+                return None
+            i += 1
+            continue
+        if i + 1 >= len(steps):
+            return None
+        for j, other in ((i, i + 1), (i + 1, i)):
+            native = records[steps[j]["line_start"]]
+            exported = main_atif[other]
+            content = native["message"]["content"]
+            if (steps[j]["source"] != "user" or exported["source"] != "user"
+                    or steps[j]["timestamp"] != timestamps[other]
+                    or not isinstance(content, str) or content != exported["message"]):
+                return None
+            aligned[j] = exported
+        i += 2
+    return aligned
+
+
+def load_trial(trial_dir, agent_timeout_s=None, task=None, reward=None, *, include_config=True):
     if agent_timeout_s is None:
         raise ValueError("agent_timeout_s is required (the task's agent timeout in seconds)")
     trial = os.path.basename(trial_dir.rstrip("/"))
@@ -101,7 +133,7 @@ def load_trial(trial_dir, agent_timeout_s=None, task=None, reward=None):
     sid = os.path.basename(sess)[:-6]
     slug = os.path.basename(os.path.dirname(sess))
     sess_dir = os.path.join(os.path.dirname(sess), sid)
-    cfg = json.load(open(os.path.join(trial_dir, "config.json"))) if os.path.exists(os.path.join(trial_dir, "config.json")) else {}
+    cfg = json.load(open(os.path.join(trial_dir, "config.json"))) if include_config and os.path.exists(os.path.join(trial_dir, "config.json")) else {}
     cc_version = next((r.get("version") for r in recs if r.get("version")), None)
     timeout = float(agent_timeout_s)
 
@@ -145,7 +177,13 @@ def load_trial(trial_dir, agent_timeout_s=None, task=None, reward=None):
     aligned = bool(atif) and len(main_atif) == len(steps) and all(
         a["timestamp"] == s["timestamp"] for a, s in zip(main_atif, steps))
     if atif and not aligned:
-        flags.append("atif_alignment_failed")
+        repaired = align_user_notifications(steps, main_atif, recs)
+        if repaired is None:
+            flags.append("atif_alignment_failed")
+        else:
+            main_atif = repaired
+            aligned = True
+            flags.append("atif_user_notifications_reordered")
     if not atif:
         # No ATIF file: use the 1-based position of each main-chain step as its step id.
         flags.append("atif_missing_step_ids_positional")

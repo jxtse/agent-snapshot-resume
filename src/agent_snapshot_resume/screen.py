@@ -92,6 +92,9 @@ def screen_plan(plan: dict[str, Any], rp: dict[str, Any] | None = None, *, n_com
         r.update(kw)
         risks.append(r)
 
+    for detail in plan.get("replay_refusals", []):
+        add("unreplayable_action", BLOCK, detail=detail)
+
     bg_outputs: dict[str, dict[str, Any]] = {}  # file path -> background action
     bg_running: list[dict[str, Any]] = []
     for i, a in enumerate(plan["actions"]):
@@ -176,9 +179,9 @@ def screen_plan(plan: dict[str, Any], rp: dict[str, Any] | None = None, *, n_com
 
 def screen_trial(adapter, trial_dir: Path, *, cut_lines: list[int] | None = None, steps: list[int] | None = None,
                  agent_timeout_s: float | None = None, task_dir: Path | None = None,
-                 ir: dict[str, Any] | None = None, policy: str = "strict") -> list[dict[str, Any]]:
+                 ir: dict[str, Any] | None = None, policy: str = "strict", allow_incomplete_evidence: bool = False) -> list[dict[str, Any]]:
     from . import parity
-    from .bundle import plan_with_observations, resolve_agent_timeout, step_for_cut_line
+    from .bundle import plan_with_observations, resolved_replay_plan, resolve_agent_timeout, step_for_cut_line
     trial_dir = Path(trial_dir)
     if ir is None:
         ir = adapter.load_trace(trial_dir,
@@ -188,7 +191,7 @@ def screen_trial(adapter, trial_dir: Path, *, cut_lines: list[int] | None = None
         raise SystemExit(f"{trial_dir.name}: {(ir or {}).get('error')}")
     raw = [l for l in (trial_dir / ir["sources"]["session_jsonl"]).read_text(encoding="utf-8").split("\n")
            if l.strip()]
-    reqs = parity.original_requests(trial_dir)
+    reqs = parity.original_requests(trial_dir) if not getattr(adapter, "wire", None) else None
     rps = {r["index"]: r for r in trace_ir.resume_points(ir)}
     targets = list(steps or [])
     for cl in cut_lines or []:
@@ -196,11 +199,29 @@ def screen_trial(adapter, trial_dir: Path, *, cut_lines: list[int] | None = None
     out = []
     for sid in targets:
         k = trace_ir.step_index(ir, sid)
-        plan = plan_with_observations(ir, k)
+        plan = (resolved_replay_plan(trial_dir, ir, k, raw) if getattr(adapter, "wire", None)
+                else plan_with_observations(ir, k))
+        if task_dir and getattr(adapter, "wire", None):
+            from .sandbox.source import native_user_refusal
+            issue = native_user_refusal(adapter.name, task_dir, plan, policy)
+            if issue:
+                plan.setdefault("replay_refusals", []).append(issue)
         n_comp = sum(1 for s in ir["steps"][:k] for e in s["events"] if e["type"] == "compaction_boundary")
-        loc = parity.locate_request(ir, k, reqs)
+        if reqs is None:
+            ref, _ = adapter.native_reference(trial_dir, ir, k, raw[:adapter.cut_line(raw, ir, k)])
+            loc = {"record": ref, "index": (ref or {}).get("index")}
+        else:
+            loc = parity.locate_request(ir, k, reqs)
         rep = screen_plan(plan, rps.get(k), n_compactions=n_comp, orig_request=loc.get("record"),
                           policy=policy)
+        if reqs is None:
+            from .proxy.native_wire import envelope_only_gap
+            content = (ref or {}).get("content") or {}
+            if not (content.get("wire") == adapter.wire and (content.get("complete") is True or
+                    (allow_incomplete_evidence and envelope_only_gap(content)))):
+                rep["verdict"] = BLOCK
+                rep["counts"][BLOCK] += 1
+                rep["risks"].append({"rule": "incomplete_evidence", "severity": BLOCK})
         rep.update(trial=trial_dir.name, atif_step=sid, cut_line=adapter.cut_line(raw, ir, k),
                    step_first_line=ir["steps"][k]["line_range"][0],
                    elapsed_s=ir["steps"][k].get("elapsed_s"), remaining_s=ir["steps"][k].get("remaining_s"),

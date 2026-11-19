@@ -31,11 +31,23 @@ import json
 import math
 import os
 import shlex
+import tempfile
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
 
+
+# One API write per part: a provider request that carries more than this can exceed its write timeout (both the
+# seeded session and a persisted tool-result file can be tens of MB of base64 images).
+UPLOAD_PART_BYTES = 8 * 1024 * 1024
+
+
+def upload_part_ranges(size: int, part: int = UPLOAD_PART_BYTES) -> list[tuple[int, int]]:
+    """[start, end) ranges to upload size bytes in; a single range when the file fits in one request."""
+    if size <= part:
+        return [(0, size)]
+    return [(lo, min(lo + part, size)) for lo in range(0, size, part)]
 
 class AgentAdapter(ABC):
     name: str = ""
@@ -43,6 +55,9 @@ class AgentAdapter(ABC):
     binary_sha256: dict[str, str] = {}
     # {"continue_text": ..., "synthetic_assistant_text": ...}; written into proxy_spec.json
     resume_artifacts: dict[str, str] = {}
+
+    def bundle_artifacts(self, cwd, original=None):
+        return dict(self.resume_artifacts)
 
     @abstractmethod
     def find_session(self, trial_dir: Path) -> Path:
@@ -98,10 +113,10 @@ def load_bundle(path: str | os.PathLike) -> tuple[Path, dict[str, Any]]:
     return b, json.loads((b / "bundle.json").read_text())
 
 
-def seed_hash_command(paths: list[str]) -> str:
+def seed_hash_command(paths: list[str], python="python3") -> str:
     code = ("import pathlib,hashlib,json; print(json.dumps({p:hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest() "
             "for p in " + repr(list(paths)) + "}))")
-    return "python3 -c " + shlex.quote(code)
+    return shlex.quote(python) + " -c " + shlex.quote(code)
 
 
 class SnapshotResumeAgentMixin:
@@ -113,6 +128,32 @@ class SnapshotResumeAgentMixin:
 
     RESUME_PORT = 4031
     PASSTHROUGH_PORT = 4013
+
+    async def _upload_session_file(self, environment, source: Path, target: str) -> None:
+        """Bound each provider write. Publish a complete seed before its hash check."""
+        ranges = upload_part_ranges(source.stat().st_size)
+        if len(ranges) == 1:
+            await environment.upload_file(source, target)
+        else:
+            # A local private directory also gives concurrent uploads distinct remote part names.
+            with tempfile.TemporaryDirectory(prefix="asr-seed-") as tmp, source.open("rb") as stream:
+                part = Path(tmp) / "part"
+                parts = []
+                staging = shlex.quote(f"{target}.{Path(tmp).name}.joined")
+                try:
+                    for index, (start, end) in enumerate(ranges):
+                        part.write_bytes(stream.read(end - start))
+                        remote = f"{target}.{Path(tmp).name}.{index}"
+                        parts.append(shlex.quote(remote))
+                        await environment.upload_file(part, remote)
+                    joined = " ".join(parts)
+                    await self.exec_as_root(environment, command=(
+                        f"cat {joined} > {staging} && mv {staging} {shlex.quote(target)}"))
+                finally:
+                    await self.exec_as_root(environment, command="rm -f " + " ".join([staging, *parts]))
+        user = getattr(environment, "default_user", None)
+        if user is not None:
+            await self.exec_as_root(environment, command=shlex.join(["chown", str(user), target]))
 
     def _bundle(self):
         return load_bundle(self.options.resume_bundle)
@@ -146,6 +187,20 @@ class SnapshotResumeAgentMixin:
         if spec.get("model"):
             raise ValueError("proxy-side model override is not supported; set the agent model in the job config")
         gate = getattr(self.options, "parity_gate", "auto") or "auto"
+        allow = getattr(self.options, "allow_incomplete_evidence", False)
+        if allow and gate != "require":
+            raise ValueError("allow_incomplete_evidence requires parity_gate=require")
+        checksum = getattr(self.options, "passthrough_script_sha256", None)
+        script = runtime.verified_script(getattr(self.options, "passthrough_script", None), checksum)
+        if script:
+            remote = f"{runtime.PROXY_DIR}/src/{runtime.script_name(checksum)}"
+            await environment.upload_file(script, remote)
+            command = (f"chown root:root {remote} && chmod 0444 {remote} && cd {runtime.PROXY_DIR}/src && "
+                       f"echo '{checksum}  {runtime.script_name(checksum)}' | sha256sum -c -")
+            check = await self.exec_as_root(environment, command=command)
+            if getattr(check, "return_code", 0):
+                raise RuntimeError("sandbox passthrough script SHA-256 mismatch")
+        spec.update(allow_incomplete_evidence=allow, passthrough_script_sha256=checksum)
         from ..bundle import bundle_identity
         (logs / "bundle_identity.json").write_text(json.dumps(bundle_identity(bundle), ensure_ascii=False, indent=1))
         if gate == "require" and not self.options.upstream_fake:
@@ -158,7 +213,7 @@ class SnapshotResumeAgentMixin:
                                    "(asr launch --freeze-first-request)")
             try:
                 digest = frozen_first_request_digest(Path(src), bundle,
-                                                     getattr(self.options, "passthrough_args", None) or [])
+                                                     getattr(self.options, "passthrough_args", None) or [], allow, checksum)
             except SystemExit as exc:
                 raise RuntimeError(str(exc)) from None
             if getattr(self.options, "expected_first_request_sha256", None) not in (None, digest):
@@ -195,10 +250,11 @@ class SnapshotResumeAgentMixin:
             # and from there into the proxy over a pipe. See proxy/runtime.py.
             extra = runtime.validate_passthrough_args(getattr(self.options, "passthrough_args", None) or [])
             await self.exec_as_root(environment, command=runtime.passthrough_start_command(
-                url, self.PASSTHROUGH_PORT, extra=" ".join(shlex.quote(x) for x in extra)),
+                url, self.PASSTHROUGH_PORT, extra=" ".join(shlex.quote(x) for x in extra), script_sha256=checksum),
                 env={runtime.KEY_ENV_IN_SANDBOX: key})
         resume_proxy = Path(runtime.HERE / "resume_proxy.py")
         await self.exec_as_root(environment, command=f"mkdir -p {runtime.PROXY_DIR}/resume/specs")
+        await environment.upload_file(runtime.HERE / "native_wire.py", f"{runtime.PROXY_DIR}/resume/native_wire.py")
         await environment.upload_file(resume_proxy, f"{runtime.PROXY_DIR}/resume/resume_proxy.py")
         await environment.upload_file(logs / "proxy_spec.json", f"{runtime.PROXY_DIR}/resume/specs/{meta['run_id']}.json")
         await self.exec_as_root(environment, command=runtime.resume_start_command(self.RESUME_PORT))
@@ -211,7 +267,9 @@ class SnapshotResumeAgentMixin:
     async def _verify_seeded(self, environment, seeded: dict[str, Path], env: dict[str, str]) -> None:
         """Fail closed unless every seeded remote file has the exact local bytes."""
         expected = {remote: hashlib.sha256(local.read_bytes()).hexdigest() for remote, local in seeded.items()}
-        result = await self.exec_as_agent(environment, command=seed_hash_command(list(seeded)), env=env)
+        from ..proxy import runtime
+        python = runtime.RUNTIME if getattr(getattr(self, "adapter", None), "name", None) == "codex" else "python3"
+        result = await self.exec_as_agent(environment, command=seed_hash_command(list(seeded), python), env=env)
         actual = json.loads(result.stdout or "{}")
         (self._resume_logs() / "session_aux_hashes.json").write_text(
             json.dumps({"expected": expected, "actual": actual}, indent=1))

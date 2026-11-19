@@ -38,17 +38,7 @@ from ..proxy.runtime import APT, fetch
 from ..trace import claude_code as cc_trace
 from ..trace.ir import _REDACT_RE
 from .base import AgentAdapter, SnapshotResumeAgentMixin, bounded_remote_command
-
-# One API write per part: a provider request that carries more than this can exceed its write timeout (both the
-# seeded session and a persisted tool-result file can be tens of MB of base64 images).
-UPLOAD_PART_BYTES = 8 * 1024 * 1024
-
-
-def upload_part_ranges(size: int, part: int = UPLOAD_PART_BYTES) -> list[tuple[int, int]]:
-    """[start, end) ranges to upload size bytes in; a single range when the file fits in one request."""
-    if size <= part:
-        return [(0, size)]
-    return [(lo, min(lo + part, size)) for lo in range(0, size, part)]
+from .base import UPLOAD_PART_BYTES, upload_part_ranges  # public compatibility imports
 
 # sha256 of the official linux-x64 binary, from
 # https://downloads.claude.ai/claude-code-releases/<version>/manifest.json (platforms.linux-x64.checksum)
@@ -292,6 +282,11 @@ class ClaudeCodeSnapshotResumeOptions(ClaudeCodeOptions):
     upstream_url: str | None = Field(default=None)
     # Extra flags for the in-sandbox passthrough proxy, e.g. ["--drop-fields", "metadata", "--strip-is-error"] to
     # reproduce a route that needed them (whitelisted in proxy.runtime.validate_passthrough_args).
+    passthrough_script: str | None = None
+    passthrough_script_sha256: str | None = None
+    allow_incomplete_evidence: bool = False
+    parity_verdict: str | None = None
+    fake_parity_verdict: str | None = None
     passthrough_args: list[str] | None = Field(default=None)
     # First-request parity gate in the resume proxy (fail closed): "auto" (default: gate whenever the bundle recorded
     # the original request at the cut), "require" (refuse to run without that record), "off".
@@ -356,36 +351,6 @@ class ClaudeCodeSnapshotResume(SnapshotResumeAgentMixin, ClaudeCode):
         env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
         env["CLAUDE_CONFIG_DIR"] = (self.environment_logs_dir / "sessions").as_posix()
         return env
-
-    async def _upload_session_file(self, environment, source: Path, target: str) -> None:
-        """Upload a seed/aux file the agent must read, in parts when it is large.
-
-        The environment's upload_file sends the whole file in one API request. A session seeded from a mid-run
-        snapshot can be tens of megabytes (base64 image tool results), and a single write then exceeds the provider's
-        request timeout (40+ MB seeds time out on FC; the agent then finds no session and the run fails). Parts are
-        uploaded one request each and concatenated inside the guest.
-        """
-        ranges = upload_part_ranges(source.stat().st_size)
-        if len(ranges) == 1:
-            await self._upload_agent_owned_file(environment, source, target)
-            return
-        parts = []
-        for i, (lo, hi) in enumerate(ranges):
-            with open(source, "rb") as f:
-                f.seek(lo)
-                data = f.read(hi - lo)
-            part = source.with_name(f"{source.name}.part{i}")
-            part.write_bytes(data)
-            remote = f"{target}.part{i}"
-            await self._upload_agent_owned_file(environment, part, remote)
-            part.unlink()
-            parts.append(remote)
-        await self.exec_as_root(environment, command=(
-            "cat " + " ".join(shlex.quote(p) for p in parts) + " > " + shlex.quote(target) +
-            " && rm -f " + " ".join(shlex.quote(p) for p in parts)))
-        if getattr(environment, "default_user", None) is not None:
-            await self.exec_as_root(environment, command=f"chown {shlex.quote(str(environment.default_user))} "
-                                                        f"{shlex.quote(target)}")
 
     @with_prompt_template
     async def run(self, instruction, environment, context) -> None:

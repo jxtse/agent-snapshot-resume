@@ -99,7 +99,7 @@ def cmd_prepare_snapshot(a):
         if base and a.full_replay:
             raise SystemExit("this bundle's plan.json was trimmed to the post-snapshot tail: rebuild the bundle "
                              "without --base-snapshot for a full replay")
-        rec = source.prepare_source(adapter=_adapter(a.agent), task_dir=Path(a.task_dir), bundle=Path(a.bundle),
+        rec = source.prepare_source(adapter=_adapter(bmeta.get("agent") or a.agent), task_dir=Path(a.task_dir), bundle=Path(a.bundle),
                                     template=template, tag=a.tag, state_dir=Path(a.state_dir), version=a.version,
                                     exec_cap=a.exec_cap, expected_fingerprint=a.expected_fingerprint,
                                     retain_on_gate_failure=a.retain_on_gate_failure, base_snapshot=base,
@@ -136,6 +136,8 @@ def cmd_launch(a):
                               snapshot_id=a.snapshot_id, fake=a.fake, verifier=not a.no_verifier, model=a.model,
                               upstream_url=a.upstream_url, extra_env=_kv(a.agent_env),
                               original_trial_dir=a.original_trial_dir or meta.get("trial_dir"),
+                              passthrough_script=a.passthrough_script, passthrough_script_sha256=a.passthrough_script_sha256,
+                              allow_incomplete_evidence=a.allow_incomplete_evidence,
                               passthrough_args=shlex.split(a.passthrough_args) if a.passthrough_args else None,
                               parity_gate=a.parity_gate, max_model_requests=a.max_model_requests,
                               freeze_first_request=a.freeze_first_request)
@@ -153,6 +155,8 @@ def cmd_launch(a):
                       snapshot_id=a.snapshot_id, fake=a.fake, verifier=not a.no_verifier, model=a.model,
                       upstream_url=a.upstream_url, extra_env=_kv(a.agent_env),
                       original_trial_dir=a.original_trial_dir or meta.get("trial_dir"),
+                      passthrough_script=a.passthrough_script, passthrough_script_sha256=a.passthrough_script_sha256,
+                      allow_incomplete_evidence=a.allow_incomplete_evidence,
                       passthrough_args=shlex.split(a.passthrough_args) if a.passthrough_args else None,
                       parity_gate=a.parity_gate, max_model_requests=a.max_model_requests,
                       freeze_first_request=a.freeze_first_request,
@@ -180,12 +184,16 @@ def cmd_batch(a):
     from .batch import Batch, print_status
 
     work = Path(a.work_dir).resolve()
-    b = Batch(name=a.name, work_dir=work, manifest=Path(a.manifest),
+    if a.mode != "status" and not a.manifest:
+        raise SystemExit("--manifest is required for run/prep/launch")
+    b = Batch(name=a.name, work_dir=work, manifest=Path(a.manifest) if a.manifest else None,
               tasks_dir=Path(a.tasks_dir) if a.tasks_dir else work / "tasks",
               jobs_dir=Path(a.jobs_dir) if a.jobs_dir else work / "jobs",
               runs_dir=Path(a.runs_dir) if a.runs_dir else work / "runs",
               state_dir=Path(a.state_dir) if a.state_dir else work / "state",
               agent_env=_kv(a.agent_env),
+              passthrough_script=a.passthrough_script, passthrough_script_sha256=a.passthrough_script_sha256,
+              allow_incomplete_evidence=a.allow_incomplete_evidence,
               passthrough_args=shlex.split(a.passthrough_args) if a.passthrough_args else None,
               model=a.model, upstream_url=a.upstream_url, hinted_reps=a.hinted_reps,
               control_reps=a.control_reps, midrun_snapshot_every=a.midrun_snapshot_every,
@@ -205,8 +213,6 @@ def cmd_batch(a):
             print(f"\n{len(rows)} runs: {done} done, {running} running, "
                   f"{len({r['task'] for r in rows})} tasks")
         return 0
-    if not a.manifest:
-        raise SystemExit("--manifest is required for run/prep/launch")
     if a.mode == "prep":
         res = b.run(do_launch=False)
     elif a.mode == "launch":
@@ -243,7 +249,8 @@ def cmd_screen(a):
     from . import screen
     reps = screen.screen_trial(_adapter(a.agent), Path(a.trial_dir), cut_lines=a.cut_line, steps=a.step,
                                agent_timeout_s=a.agent_timeout,
-                               task_dir=Path(a.task_dir) if a.task_dir else None, policy=a.replay_policy)
+                               task_dir=Path(a.task_dir) if a.task_dir else None, policy=a.replay_policy,
+                               allow_incomplete_evidence=a.allow_incomplete_evidence)
     print(screen.main_json(reps, a.full))
     if a.out:
         Path(a.out).write_text(json.dumps(reps, ensure_ascii=False, indent=1))
@@ -395,6 +402,10 @@ def build_parser():
     p.add_argument("--upstream-url", help="default: ASR_UPSTREAM_URL")
     p.add_argument("--original-trial-dir", help="copy non-secret agent env/kwargs from <trial>/config.json")
     p.add_argument("--agent-env", action="append", metavar="KEY=VALUE", help="extra non-secret agent env (repeatable)")
+    p.add_argument("--passthrough-script", type=Path, help="local translator implementing the passthrough CLI")
+    p.add_argument("--passthrough-script-sha256", help="required SHA-256 of the translator")
+    p.add_argument("--allow-incomplete-evidence", action="store_true",
+                   help="admit a fully matched rollout prefix with only the original envelope unavailable")
     p.add_argument("--passthrough-args", help="extra in-sandbox passthrough proxy flags, e.g. "
                    "'--drop-fields metadata --strip-is-error' (whitelisted)")
     p.add_argument("--fake", action="store_true", help="resume proxy answers end_turn; no model call, no key")
@@ -437,6 +448,10 @@ def build_parser():
     p.add_argument("--model")
     p.add_argument("--upstream-url", help="default: ASR_UPSTREAM_URL")
     p.add_argument("--agent-env", action="append", metavar="KEY=VALUE")
+    p.add_argument("--passthrough-script", type=Path, help="local translator implementing the passthrough CLI")
+    p.add_argument("--passthrough-script-sha256", help="required SHA-256 of the translator")
+    p.add_argument("--allow-incomplete-evidence", action="store_true",
+                   help="admit a fully matched rollout prefix with only the original envelope unavailable")
     p.add_argument("--passthrough-args", help="in-sandbox passthrough proxy flags for every run")
     p.add_argument("--hinted-reps", type=int, default=2)
     p.add_argument("--control-reps", type=int, default=1)
@@ -464,6 +479,13 @@ def build_parser():
     equiv_parser(p)
     p.set_defaults(fn=cmd_equiv)
 
+    p = sub.add_parser("preflight", help="compare independent historical cut exports offline")
+    p.add_argument("reference", type=Path)
+    p.add_argument("restored", type=Path)
+    p.add_argument("--control", type=Path, help="unhinted capture from the changed harness at the same cut")
+    p.add_argument("--hint-spec", type=Path, help="declared addition with message, block and text fields")
+    p.set_defaults(fn=cmd_preflight)
+
     p = sub.add_parser("screen", help="offline replayability risks of candidate cuts")
     p.add_argument("--trial-dir", required=True)
     p.add_argument("--cut-line", type=int, action="append", help="0-based session line of a candidate cut (repeat)")
@@ -475,6 +497,8 @@ def build_parser():
     p.add_argument("--out", help="write the full reports as JSON")
     p.add_argument("--replay-policy", choices=["strict", "lenient"], default="strict",
                    help="lenient treats pace-dependent reads of finished background jobs as a warning, not a block")
+    p.add_argument("--allow-incomplete-evidence", action="store_true",
+                   help="allow a Codex projection with only the original envelope missing")
     p.set_defaults(fn=cmd_screen)
 
     p = sub.add_parser("parity", help="first rewritten request vs the original run's request at the cut")
@@ -510,9 +534,21 @@ def build_parser():
     return ap
 
 
+def cmd_preflight(a):
+    from .preflight import compare_exports
+
+    hint = json.loads(a.hint_spec.read_bytes()) if a.hint_spec else None
+    if a.hint_spec and not isinstance(hint, dict):
+        raise SystemExit("invalid hint declaration")
+    report = compare_exports(a.reference, a.restored, hint, a.control)
+    print(json.dumps(report))
+    return int(report["comparison"] != "captures-match")
+
+
 def main(argv=None):
     a = build_parser().parse_args(argv)
-    config.load_env_file(a.env_file)
+    if a.cmd != "preflight":
+        config.load_env_file(a.env_file)
     return a.fn(a) or 0
 
 

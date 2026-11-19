@@ -125,9 +125,12 @@ def bundle_identity(bundle_dir: Path) -> dict[str, Any]:
     for f in [bundle_dir / "session_trunc.jsonl"] + sorted(p for p in (bundle_dir / "aux").rglob("*") if p.is_file()):
         seed.update(str(f.relative_to(bundle_dir)).encode() + b"\0" + hashlib.sha256(f.read_bytes()).digest())
     meta = json.loads((bundle_dir / "bundle.json").read_text())
-    return {"cut": snapshot_cut_identity(bundle_dir), "seed_sha256": seed.hexdigest(),
-            "proxy_spec_sha256": hashlib.sha256((bundle_dir / "proxy_spec.json").read_bytes()).hexdigest(),
-            "orig_request_at_k": meta.get("orig_request_at_k"), "run_id": meta.get("run_id")}
+    identity = {"cut": snapshot_cut_identity(bundle_dir), "seed_sha256": seed.hexdigest(),
+                "proxy_spec_sha256": hashlib.sha256((bundle_dir / "proxy_spec.json").read_bytes()).hexdigest(),
+                "orig_request_at_k": meta.get("orig_request_at_k"), "run_id": meta.get("run_id")}
+    if meta.get("agent") in ("pi", "codex"):
+        identity["agent_budget_s"] = meta["agent_budget_s"]
+    return identity
 
 
 # Keys the content reference *derived* after some fake runs were recorded. They describe the same message blocks
@@ -248,6 +251,9 @@ def plan_with_observations(ir: dict[str, Any], k: int) -> dict[str, Any]:
                         rows = re.findall(r"(?m)^\s*\d+[→\t](.*)$", text)
                         if rows:
                             a["bg_original_output"] = "\n".join(rows)
+    if ir.get("native_agent") == "codex" or any(a["tool"] == "unified_exec" for a in plan["actions"]):
+        from .agents.codex import resolve_polled_commands
+        resolve_polled_commands(plan, ir["steps"][:k])
     return plan
 
 
@@ -321,11 +327,44 @@ def step_for_cut_line(ir: dict[str, Any], cut_line: int, trimmed=None) -> int:
     for st in ir["steps"]:
         if st["source"] == "agent" and (st["line_range"][0] == cut_line or
                                         (trimmed is not None and trimmed(st["index"]) == cut_line)):
+            if st["atif_step_id"] is None:
+                raise SystemExit(f"session line {cut_line} has no aligned ATIF step")
             return st["atif_step_id"]
     near = sorted((abs(st["line_range"][0] - cut_line), st["line_range"][0], st["atif_step_id"])
                   for st in ir["steps"] if st["source"] == "agent")[:4]
     raise SystemExit(f"no agent step starts at session line {cut_line}; nearest (line, step): "
                      f"{[(ln, sid) for _, ln, sid in near]}")
+
+
+def resolved_replay_plan(trial_dir, ir, k, raw_lines):
+    plan = plan_with_observations(ir, k)
+    plan["post_cut_paths"] = post_cut_referenced_files(ir, k)
+    plan["initial_cwd"] = ir.get("cwd") or next((json.loads(trace_ir._REDACT_RE.sub(r"\1null", line)).get("cwd")
+                                                 for line in raw_lines if '"cwd"' in line), None)
+    native = ir.get("native_agent")
+    if native:
+        from .agent_env import native_agent_env, unavailable_references
+        env, unavailable = native_agent_env(trial_dir, native)
+        plan["shell_env"] = env
+        plan["agent_env_sha256"] = {name: hashlib.sha256(value.encode()).hexdigest() for name, value in env.items()}
+        for action in plan["actions"]:
+            args = action["args"]
+            if action["tool"] == "Bash" and not args.get("codex_patch") and isinstance(args.get("command"), str):
+                known = env.keys() | args.get("pi_env", {}).keys()
+                missing = unavailable_references(args["command"], known, unavailable)
+                if missing:
+                    plan.setdefault("replay_refusals", []).append(
+                        f"{action['call_id']}: unavailable historical environment: {', '.join(missing)}")
+    else:
+        plan["shell_env"] = captured_shell_env(trial_dir)
+    return plan
+
+
+def native_session_lines(path):
+    """Preserve the original bytes and split only on physical LF record boundaries."""
+    with path.open("rb") as stream:
+        data = stream.readlines()
+    return data, [line.decode("utf-8").rstrip("\r\n") for line in data]
 
 
 def build(*, adapter, trial_dir: Path, atif_step: int | None, out: Path, mode: str = "same", hint: str | None = None,
@@ -352,20 +391,25 @@ def build(*, adapter, trial_dir: Path, atif_step: int | None, out: Path, mode: s
     if (atif_step is None) == (cut_line is None):
         raise SystemExit("give exactly one of --step / --cut-line")
     sess_path = trial_dir / ir["sources"]["session_jsonl"]
-    with open(sess_path, encoding="utf-8") as f:
-        raw_lines = [l for l in f.read().split("\n") if l.strip()]
+    native_lines = None
+    if getattr(adapter, "wire", None):
+        native_lines, raw_lines = native_session_lines(sess_path)
+    else:
+        with open(sess_path, encoding="utf-8") as f:
+            raw_lines = [l for l in f.read().split("\n") if l.strip()]
     if atif_step is None:
         atif_step = step_for_cut_line(ir, int(cut_line), lambda i: adapter.cut_line(raw_lines, ir, i))
     k = trace_ir.step_index(ir, atif_step)
     st = ir["steps"][k]
+    if model and getattr(adapter, "wire", None):
+        adapter.validate_model(dict(native_model=st.get("native_model") or ir.get("model"),
+                                    native_provider=st.get("native_provider") or ir.get("provider")), model)
     if st["source"] != "agent":
         raise SystemExit("resume step must be an agent step")
     prev = ir["steps"][k - 1]
     cut = adapter.cut_line(raw_lines, ir, k)
     cut_orig = cut  # the plan and the base snapshot speak about the parent's own session, before any seed normalisation
-    plan = plan_with_observations(ir, k)
-    # what the agent will read after the cut: the lenient replay gate requires these to survive the replay
-    plan["post_cut_paths"] = post_cut_referenced_files(ir, k)
+    plan = resolved_replay_plan(trial_dir, ir, k, raw_lines)
     # ---- chained round-N build: a resumed trial's session must be normalised before it can seed the next run
     evidence = chain.run_evidence(trial_dir)
     if persist_hint and mode != "hint" and not evidence:
@@ -377,6 +421,8 @@ def build(*, adapter, trial_dir: Path, atif_step: int | None, out: Path, mode: s
     hint_anchors: list[dict[str, Any]] = []
     positions: list[dict[str, Any]] = []
     base = None
+    if getattr(adapter, "wire", None) and (evidence or persist_hint or prior_hints):
+        raise SystemExit("chained resume and persistent hints are supported for Claude Code only")
     if evidence:
         carried = chain.hints_of(evidence["spec"])
         if prior_hints is not None and [h.strip() for h in prior_hints] != carried:
@@ -424,9 +470,6 @@ def build(*, adapter, trial_dir: Path, atif_step: int | None, out: Path, mode: s
                          "hints; an L0 trial never saw them)")
     if base_snapshot and not evidence:
         raise SystemExit("--base-snapshot needs a resumed trial dir (the tail is split on its own session lines)")
-    plan["initial_cwd"] = next((json.loads(trace_ir._REDACT_RE.sub(r"\1null", l)).get("cwd")
-                                for l in raw_lines if '\"cwd\"' in l), None)
-    plan["shell_env"] = captured_shell_env(trial_dir)
     if base_snapshot:
         line = int(base_snapshot["session_line"])
         if line >= cut_orig:
@@ -448,9 +491,9 @@ def build(*, adapter, trial_dir: Path, atif_step: int | None, out: Path, mode: s
             raise SystemExit(f"{bdir} exists (use --force to overwrite)")
         shutil.rmtree(bdir)
     (bdir / "aux").mkdir(parents=True)
-    trunc = "\n".join(seed_lines[:cut]) + "\n"
-    with open(bdir / "session_trunc.jsonl", "w", encoding="utf-8") as f:
-        f.write(trunc)
+    trunc = (b"".join(native_lines[:cut]).decode() if native_lines is not None
+             else "\n".join(seed_lines[:cut]) + "\n")
+    (bdir / "session_trunc.jsonl").write_bytes(trunc.encode())
     with open(bdir / "plan.json", "w") as f:
         json.dump(plan, f, ensure_ascii=False)
     aux_counts = adapter.collect_aux(sess_path, ir, k, trunc, bdir / "aux")
@@ -460,23 +503,30 @@ def build(*, adapter, trial_dir: Path, atif_step: int | None, out: Path, mode: s
     if evidence:
         elapsed_run = None
         if (evidence.get("run_start") or {}).get("t") and st.get("timestamp"):
-            elapsed_run = chain.ts_seconds(st["timestamp"]) - float(evidence["run_start"]["t"])
+            inference_start = st.get("request_start_s")
+            if inference_start is None:
+                inference_start = chain.ts_seconds(st["timestamp"])
+            elapsed_run = inference_start - float(evidence["run_start"]["t"])
         budget, budget_source = chain.remaining_budget(evidence, elapsed_run, budget)
     if budget <= 0:
         raise SystemExit(f"no agent budget left at step {atif_step} (elapsed {st['elapsed_s']} s >= {timeout} s)")
     orig_date = (ir["start_ts"] or "")[:10]
     sentinel = sentinel_for(run_id)
     n_compactions = sum(1 for s in ir["steps"][:k] for e in s["events"] if e["type"] == "compaction_boundary")
-    loc = parity.locate_request(ir, k, parity.original_requests(trial_dir))
-    orig_request = (parity.expected_from_record(loc["record"], index=loc["index"], method=loc["method"])
-                    if "record" in loc else None)
-    if orig_request is not None:
-        if evidence:
-            prefix = [json.loads(l) for l in seed_lines[:cut]]
-        else:
-            prefix = [json.loads(trace_ir._REDACT_RE.sub(r"\1null", l)) for l in raw_lines[:cut]]
-        orig_request["content"] = parity.content_reference(
-            prefix, adapter.rendered_attachment_templates(ir.get("cc_version")))
+    if getattr(adapter, "wire", None):
+        orig_request, error = adapter.native_reference(trial_dir, ir, k, seed_lines[:cut])
+        loc = {"error": error}
+    else:
+        loc = parity.locate_request(ir, k, parity.original_requests(trial_dir))
+        orig_request = (parity.expected_from_record(loc["record"], index=loc["index"], method=loc["method"])
+                        if "record" in loc else None)
+        if orig_request is not None:
+            if evidence:
+                prefix = [json.loads(l) for l in seed_lines[:cut]]
+            else:
+                prefix = [json.loads(trace_ir._REDACT_RE.sub(r"\1null", l)) for l in raw_lines[:cut]]
+            orig_request["content"] = parity.content_reference(
+                prefix, adapter.rendered_attachment_templates(ir.get("cc_version")))
     agent_model = model or ((result.get("config") or {}).get("agent") or {}).get("model_name") or ir.get("model")
     roots = fingerprint_roots or default_fingerprint_roots(plan)
     optional_roots: list[str] = []
@@ -508,6 +558,15 @@ def build(*, adapter, trial_dir: Path, atif_step: int | None, out: Path, mode: s
                                 for e in st["events"] if e["type"] in ("assistant_reasoning", "assistant_text",
                                                                        "tool_call")],
     }
+    if getattr(adapter, "wire", None):
+        meta.update(prefix_sha256=hashlib.sha256(trunc.encode()).hexdigest(),
+                    native_provider=st.get("native_provider") or ir.get("provider"), native_model=st.get("native_model") or ir.get("model"),
+                    native_effort=st.get("native_effort"),
+                    session_relpath=ir["sources"]["session_jsonl"])
+    if st.get("native_cwd"):
+        meta.update(initial_cwd=plan["initial_cwd"], cwd=st["native_cwd"])
+    if st.get("native_sandbox_mode"):
+        meta["native_sandbox_mode"] = st["native_sandbox_mode"]
     if chain_audit is not None:
         meta["chain"] = chain_audit
         meta["parent_run_id"] = chain_audit.get("parent_run_id")
@@ -517,7 +576,11 @@ def build(*, adapter, trial_dir: Path, atif_step: int | None, out: Path, mode: s
         json.dump(meta, f, ensure_ascii=False, indent=1)
     spec = {"mode": mode, "sentinel": sentinel, "hint": hint if mode == "hint" else None,
             "upstream": "http://127.0.0.1:4013", "model": None, "pin_date": orig_date if pin_date else None,
-            "resume_artifacts": dict(adapter.resume_artifacts)}
+            "resume_artifacts": adapter.bundle_artifacts(meta["cwd"], meta["orig_request_at_k"])}
+    if getattr(adapter, "wire", None):
+        spec["wire"] = adapter.wire
+        if meta.get("native_sandbox_mode"):
+            spec["resume_artifacts"]["sandbox_mode"] = meta["native_sandbox_mode"]
     carried_hints = list(wanted[:-1] if mode == "hint" else wanted)
     if carried_hints:
         spec["prior_hints"] = carried_hints  # both modes: the next round must know which hints this run carried

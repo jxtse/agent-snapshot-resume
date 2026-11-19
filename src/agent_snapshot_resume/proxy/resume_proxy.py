@@ -37,8 +37,15 @@ replaces it. Logs: <log_dir>/<run_id>/requests.jsonl, first_request_{raw,rewritt
 """
 import argparse, asyncio, collections, copy, hashlib, json, os, re, time
 
+from pathlib import Path
+
 import aiohttp
 from aiohttp import web
+
+if __package__:
+    from . import native_wire
+else:
+    import native_wire
 
 HOP = {"host", "content-length", "transfer-encoding", "connection", "keep-alive", "proxy-authenticate",
        "proxy-authorization", "te", "trailers", "upgrade", "accept-encoding"}
@@ -73,7 +80,9 @@ def assert_text_only(value):
             assert_text_only(child)
 
 
-def request_digest(body):
+def request_digest(body, wire=None):
+    if wire:
+        return native_wire.digest(body)
     # Only CC's transport identity is excluded. Every model-visible field is bound.
     return hashlib.sha256(json.dumps({k: v for k, v in body.items() if k != 'metadata'},
                                     sort_keys=True, ensure_ascii=False, separators=(',', ':')).encode()).hexdigest()
@@ -602,8 +611,10 @@ def pin_date_in_message(msg, pin_date, acts):
     return msg
 
 
-def rewrite(body, spec):
+def rewrite(body, spec, *, first=False):
     """Return (new_body, actions). Pure function; unit-testable."""
+    if spec.get("wire"):
+        return native_wire.rewrite_native(body, spec, first=first)
     if spec.get("require_text_only"):
         assert_text_only(body)
     acts = []
@@ -742,6 +753,61 @@ def fake_reply(model, stream):
     return "".join(f"event: {e}\ndata: {json.dumps(p)}\n\n" for e, p in evs).encode()
 
 
+def native_fake_reply(wire, body):
+    if wire == "chat":
+        data = {"id": "chatcmpl_fake", "object": "chat.completion", "created": 1, "model": body["model"],
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}]}
+        if not body.get("stream"):
+            return web.json_response(data)
+        data["object"] += ".chunk"
+        choice = data["choices"][0]
+        choice["delta"] = choice.pop("message")
+        stream = "data: " + json.dumps(data) + "\n\ndata: [DONE]\n\n"
+    else:
+        part = {"type": "output_text", "text": "OK", "annotations": []}
+        message = {"id": "msg_fake", "type": "message", "role": "assistant",
+                   "status": "completed", "content": [part]}
+        response = {"object": "response", "id": "resp_fake", "model": body["model"], "status": "completed",
+                    "output": [message], "created_at": 1, "usage": {"input_tokens": 1, "output_tokens": 1,
+                    "total_tokens": 2, "input_tokens_details": {"cached_tokens": 0},
+                    "output_tokens_details": {"reasoning_tokens": 0}}}
+        if not body.get("stream"):
+            return web.json_response(response)
+        cursor = {"item_id": message["id"], "output_index": 0, "content_index": 0}
+        events = [
+            ("response.created", {"response": dict(response, status="in_progress", output=[], usage=None)}),
+            ("response.output_item.added", {"output_index": 0, "item": dict(message, status="in_progress", content=[])}),
+            ("response.content_part.added", {**cursor, "part": dict(part, text="")}),
+            ("response.output_text.delta", {**cursor, "delta": "OK"}),
+            ("response.output_text.done", {**cursor, "text": "OK"}),
+            ("response.content_part.done", {**cursor, "part": part}),
+            ("response.output_item.done", {"output_index": 0, "item": message}),
+            ("response.completed", {"response": response}),
+        ]
+        stream = "".join(f"event: {typ}\ndata: " + json.dumps(dict(type=typ, sequence_number=i, **fields)) + "\n\n"
+                         for i, (typ, fields) in enumerate(events))
+    return web.Response(text=stream, content_type="text/event-stream")
+
+
+TRANSLATOR_DIR = Path("/opt/asr-proxy/src")
+
+
+def load_translation_function(checksum):
+    import importlib.util
+    if not re.fullmatch(r"[0-9a-f]{64}", checksum):
+        raise ValueError("invalid translator checksum")
+    path = TRANSLATOR_DIR / f"translator-{checksum}.py"
+    if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != checksum:
+        raise ValueError("translator digest changed")
+    loader = importlib.util.spec_from_file_location("asr_translator", path)
+    module = importlib.util.module_from_spec(loader)
+    try:
+        loader.loader.exec_module(module)
+    except Exception as exc:
+        raise ValueError("cannot load pinned translation function") from exc
+    return getattr(module, "build_chat_request", None)
+
+
 async def handle(request):
     app = request.app
     run_id = request.match_info["run_id"]
@@ -756,6 +822,13 @@ async def handle(request):
     rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "path": "/" + tail, "method": request.method}
     out_body = body
     is_msg = request.method == "POST" and tail.startswith("v1/messages") and "count_tokens" not in tail
+    wire = spec.get("wire")
+    if wire:
+        if not body:
+            return web.json_response({"error": "missing request body"}, status=400)
+        if wire not in native_wire.PATHS or tail != native_wire.PATHS[wire] or request.method != "POST":
+            return web.json_response({"error": "unexpected native model route"}, status=404)
+        is_msg = True
     if is_msg and body:
         d = json.loads(body)
         n = app["counts"].get(run_id, 0)
@@ -770,8 +843,11 @@ async def handle(request):
         if n == 0:
             hdr = {k: v for k, v in request.headers.items() if k.lower() not in AUTH}
             wlog(app, run_id, "first_request_raw.json", {"headers": hdr, "body": d}, mode="w")
+        parity_logged = False
         try:
-            nd, acts = rewrite(d, spec)
+            if wire and spec.get("_native_first_failed"):
+                raise ValueError("native first request failed earlier")
+            nd, acts = rewrite(d, spec, first=n == 0)
             if spec.get("first_request_parity"):
                 state = spec.get("_parity_state")  # lives on the cached spec: reset only by a new spec
                 if state is False:
@@ -781,18 +857,39 @@ async def handle(request):
                     # bytes as logged by the original route, model/max_tokens/thinking/tool and message counts,
                     # and the model-visible content (system prompt, tools, every message block of the prefix).
                     exp = spec["first_request_parity"]
-                    rep = compare_parity(nd, exp, exp.get("route") or {}, parity_hints(spec))
-                    if exp.get("content"):
+                    if wire:
+                        allow = spec.get("allow_incomplete_evidence", False)
+                        checksum = spec.get("passthrough_script_sha256")
+                        translate = (load_translation_function(checksum)
+                                     if allow and checksum and not exp["content"].get("complete") else None)
+                        rep = native_wire.evaluate_native_gate(nd, exp, spec_hints(spec), allow, translate)
+                    else:
+                        rep = compare_parity(nd, exp, exp.get("route") or {}, parity_hints(spec))
+                    if not wire and exp.get("content"):
                         notes: list[str] = []
                         rep["content_problems"] = check_content(nd, exp["content"], spec_hints(spec), notes)
                         rep["notes"] = notes
                         rep["ok"] = rep["ok"] and not rep["content_problems"]
                     # provenance for --freeze-first-request: which exact request and route this report judged
-                    rep.update(request_sha256=request_digest(nd), route=exp.get("route") or {},
+                    rep.update(request_sha256=request_digest(nd, wire), route=exp.get("route") or {},
                                upstream_fake=spec.get("upstream") == "fake")
+                    rep.setdefault("admitted", rep["ok"])
+                    rep.setdefault("verdict", "ok" if rep["ok"] else "mismatch")
+                    rep.update(allow_incomplete_evidence=spec.get("allow_incomplete_evidence", False),
+                               passthrough_script_sha256=spec.get("passthrough_script_sha256"))
+                    spec["_freeze_digest"] = rep.get("freeze_sha256", rep["request_sha256"])
+                    if spec.get("expected_first_request_sha256"):
+                        rep["frozen_request_equal"] = spec["_freeze_digest"] == spec["expected_first_request_sha256"]
+                        if not rep["frozen_request_equal"]:
+                            rep.update(reference_verdict=rep["verdict"], verdict="mismatch", admitted=False, ok=False)
                     wlog(app, run_id, "first_request_parity.json", rep, mode="w")
-                    spec["_parity_state"] = bool(rep["ok"])
-                    if not rep["ok"]:
+                    parity_logged = True
+                    spec["_parity_state"] = bool(rep["admitted"])
+                    if not rep["admitted"]:
+                        if rep.get('frozen_request_equal') is False:
+                            raise ValueError('First model request differs from the frozen fake-resume request')
+                        if rep.get("verdict") == "incomplete_evidence":
+                            raise ValueError("incomplete_evidence: original request envelope or history unavailable")
                         raise ValueError("First resumed request differs from the original request at the cut: "
                                          + json.dumps({"diffs": rep["diffs"], "content": rep.get("content_problems")},
                                                       ensure_ascii=False)[:600])
@@ -801,21 +898,32 @@ async def handle(request):
                 if spec.get('_first_request_validated') is False:
                     raise ValueError('frozen first-request gate failed earlier in this run; every request is refused')
                 if spec.get('_first_request_validated') is None:
-                    ok = request_digest(nd) == spec['expected_first_request_sha256']
+                    ok = spec.get('_freeze_digest', request_digest(nd, wire)) == spec['expected_first_request_sha256']
                     spec['_first_request_validated'] = ok
                     if not ok:
                         raise ValueError('First model request differs from the frozen fake-resume request')
                     acts.append('first_request_hash_gate_passed')
         except ValueError as exc:
+            if wire and n == 0:
+                spec["_native_first_failed"] = True
+                if not parity_logged and spec.get("first_request_parity"):
+                    wlog(app, run_id, "first_request_parity.json", {
+                        "ok": False, "admitted": False, "verdict": "mismatch", "content_problems": [str(exc)],
+                        "upstream_fake": spec.get("upstream") == "fake",
+                        "allow_incomplete_evidence": spec.get("allow_incomplete_evidence", False),
+                        "passthrough_script_sha256": spec.get("passthrough_script_sha256")}, mode="w")
             rec.update(status=400, local_gate_error=str(exc))
             wlog(app, run_id, "requests.jsonl", rec)
             return web.json_response({"type":"error", "error":{"type":"invalid_request_error", "message":str(exc)}}, status=400)
         if n == 0:
             wlog(app, run_id, "first_request_rewritten.json", {"body": nd, "actions": acts}, mode="w")
-        out_body = json.dumps(nd, ensure_ascii=False).encode()
+        out_body = json.dumps(nd, ensure_ascii=False, separators=(",", ":") if wire else None).encode()
         rec.update({"n": n, "model": nd.get("model"), "n_messages_in": len(d.get("messages") or []),
                     "n_messages_out": len(nd.get("messages") or []), "actions": acts, "bytes": len(out_body)})
-        rec.update(request_fingerprint(nd, spec))
+        if wire:
+            rec.update(native_wire.native_request_metrics(nd, spec))
+        else:
+            rec.update(request_fingerprint(nd, spec))
         if any(isinstance(a, str) and a.startswith("reinject_hint_after_compaction") for a in acts):
             c = find_compact_summary(nd.get("messages") or [])
             key = hashlib.sha256(json.dumps(nd["messages"][c], ensure_ascii=False).encode()).hexdigest()[:12]
@@ -826,6 +934,8 @@ async def handle(request):
         if spec.get("upstream") == "fake":
             rec["status"] = 200
             wlog(app, run_id, "requests.jsonl", rec)
+            if wire:
+                return native_fake_reply(wire, nd)
             if d.get("stream"):
                 resp = web.StreamResponse(status=200, headers={"content-type": "text/event-stream"})
                 await resp.prepare(request)
@@ -860,15 +970,29 @@ async def handle(request):
         wlog(app, run_id, "requests.jsonl", rec)
         return web.json_response({"type": "error", "error": {"type": "api_error", "message": "resume proxy upstream error"}}, status=529)
     resp = web.StreamResponse(status=up.status, headers={k: v for k, v in up.headers.items() if k.lower() not in HOP | {"content-encoding"}})
-    await resp.prepare(request)
     nbytes = 0
-    async for chunk in up.content.iter_any():
-        nbytes += len(chunk)
-        await resp.write(chunk)
-    await resp.write_eof()
-    up.release()
-    rec.update({"status": up.status, "latency_s": round(time.time() - t0, 2), "resp_bytes": nbytes})
-    wlog(app, run_id, "requests.jsonl", rec)
+    try:
+        try:
+            await resp.prepare(request)
+        except ConnectionError:
+            rec["client_closed_before_eof"] = True
+            return resp
+        async for chunk in up.content.iter_any():
+            nbytes += len(chunk)
+            try:
+                await resp.write(chunk)
+            except ConnectionError:
+                rec["client_closed_before_eof"] = True
+                break
+        else:
+            try:
+                await resp.write_eof()
+            except ConnectionError:
+                rec["client_closed_before_eof"] = True
+    finally:
+        up.release()
+        rec.update(status=up.status, latency_s=round(time.time() - t0, 2), resp_bytes=nbytes)
+        wlog(app, run_id, "requests.jsonl", rec)
     return resp
 
 

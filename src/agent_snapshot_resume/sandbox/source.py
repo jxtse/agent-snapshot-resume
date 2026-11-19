@@ -52,7 +52,8 @@ def probe_post_cut(sbx, run, plan: dict, state_dir: Path, tag: str) -> dict:
         return {"n": 0, "present": 0, "missing": []}
     sbx.files.write(f"{REPLAY_DIR}/postcut_paths.json", json.dumps(paths).encode())
     sbx.files.write(f"{REPLAY_DIR}/postcut_probe.py", POSTCUT_SCRIPT.encode())
-    run(sbx, f"python3 {REPLAY_DIR}/postcut_probe.py {REPLAY_DIR}/postcut_paths.json "
+    python = runtime.RUNTIME if plan.get("native_agent") == "codex" else "python3"
+    run(sbx, f"{python} {REPLAY_DIR}/postcut_probe.py {REPLAY_DIR}/postcut_paths.json "
              f"{REPLAY_DIR}/postcut_presence.json")
     raw = json.loads(bytes(sbx.files.read(f"{REPLAY_DIR}/postcut_presence.json", format="bytes")).decode())
     missing = sorted(p for p, ok in raw.items() if not ok)
@@ -105,27 +106,29 @@ def _write_in_parts(sbx, remote: str, data: bytes, part: int = 8 * 1024 * 1024) 
         rp = f"{remote}.part{i}"
         sbx.files.write(rp, data[lo:lo + part])
         parts.append(rp)
-    sbx.commands.run("cat " + " ".join(parts) + " > " + remote + " && rm -f " + " ".join(parts),
+    sbx.commands.run("cat " + shlex.join(parts) + " > " + shlex.quote(remote) + " && rm -f " + shlex.join(parts),
                      user="root", timeout=180)
     if not sbx.files.read(remote, format="bytes")[:64]:
         raise RuntimeError(f"part upload of {remote} produced an empty file")
 
 
-def dispatch_replay(sbx, cwd: str, exec_cap: int, replay_deadline_s: int = REPLAY_DEADLINE_S) -> int:
+def dispatch_replay(sbx, cwd: str, exec_cap: int, replay_deadline_s: int = REPLAY_DEADLINE_S, pi_user=None, python="python3") -> int:
     """Start the replay exactly once in SDK background mode; completion is signalled by an atomic rc file.
 
     The replay runs in a LOGIN shell, as the original agent's shell did (Harbor's task healthcheck installs the
     task's environment through /etc/profile.d/*.sh). A plain `bash -c` inherits only the image's ENV PATH, whose
     first entry is typically the base conda environment, so a task whose image selects another env replays with the
     wrong interpreter (e.g. /opt/conda/bin/python3 without numpy instead of /opt/conda/envs/stereo/bin/python3)."""
+    user_arg = "" if pi_user is None else " --pi-user " + shlex.quote(str(pi_user))
     command = (f'cd {shlex.quote(cwd)} && timeout -s TERM -k 10s {int(replay_deadline_s)}s '
-               f'python3 {REPLAY_DIR}/replay_inside.py {REPLAY_DIR}/plan.json '
-               f'{REPLAY_DIR}/replay_report.json --exec-cap {int(exec_cap)} '
+               f'{shlex.quote(python)} {REPLAY_DIR}/replay_inside.py {REPLAY_DIR}/plan.json '
+               f'{REPLAY_DIR}/replay_report.json --exec-cap {int(exec_cap)}{user_arg} '
                f'> {REPLAY_DIR}/replay_stdout.log 2>&1; rc=$?; '
                f'printf "%s\\n" "$rc" > {REPLAY_DIR}/rc.tmp; '
                f'mv {REPLAY_DIR}/rc.tmp {REPLAY_DIR}/rc')
     # One dispatch only. SDK-background detaches the process; a shell '&' did not.
-    return sbx.commands.run(f'bash -lc {shlex.quote(command)}', user='root', background=True, timeout=0).pid
+    shell = "/bin/bash -c" if pi_user is not None else "bash -lc"
+    return sbx.commands.run(f'{shell} {shlex.quote(command)}', user='root', background=True, timeout=0).pid
 
 
 def retain_for_audit(requested: bool, plan: dict, report: dict, rc) -> bool:
@@ -136,7 +139,31 @@ def retain_for_audit(requested: bool, plan: dict, report: dict, rc) -> bool:
 
 def fingerprint_command_for(meta: dict[str, Any]) -> str:
     roots = meta.get("fingerprint_roots") or list(DEFAULT_ROOTS)
-    return build_fingerprint_command(roots, meta.get("fingerprint_optional_roots", []))
+    python = runtime.RUNTIME if meta.get("agent") == "codex" else "python3"
+    return build_fingerprint_command(roots, meta.get("fingerprint_optional_roots", []), python=python)
+
+
+def native_user_refusal(agent, task_dir, plan, policy):
+    if agent not in ("pi", "codex") or policy != "strict" or not plan["actions"]:
+        return None
+    user = tomllib.loads((task_dir / "task.toml").read_text()).get("agent", {}).get("user")
+    if user is not None and str(user) not in ("root", "0"):
+        return f"strict {agent} workspace replay cannot reproduce task user {user!r}, group and HOME"
+    return None
+
+
+def check_native_replay(agent, task_dir, bundle, policy):
+    if agent not in ("pi", "codex"):
+        return
+    from ..agents.native import NATIVE_REPLAY_REVISION
+    plan = json.loads((bundle / "plan.json").read_bytes())
+    issue = native_user_refusal(agent, task_dir, plan, policy)
+    if issue:
+        raise ValueError(issue)
+    if plan.get("native_replay_revision") != NATIVE_REPLAY_REVISION:
+        raise ValueError("rebuild the native bundle to check its historical workspace actions")
+    if plan.get("replay_refusals"):
+        raise ValueError("; ".join(plan["replay_refusals"]))
 
 
 def task_healthcheck(task_dir: Path) -> str | None:
@@ -165,13 +192,24 @@ def _collect_gate_evidence(sbx, rec, rep, save):
     rec["reviewed_replay_exceptions"] = [{"call_id": x["call_id"], "reason": x["reviewed_exception"]}
                                          for x in rep["results"] if x.get("reviewed_exception")]
     rec["auxiliary_hashes"] = {}
-    for item in rep["results"]:
-        if item.get("background_output_file"):
-            fp = item["background_output_file"]
-            h = hashlib.sha256(bytes(sbx.files.read(fp, format="bytes"))).hexdigest()
-            if h != item["background_output_sha256"]:
-                raise RuntimeError("Restored background output hash mismatch")
-            rec["auxiliary_hashes"][fp] = h
+    pi_paths = {r["pi_output_file"] for r in rep["results"] if r.get("pi_output_file")}
+    manifest = rep.get("pi_output_manifest", {})
+    if pi_paths != set(manifest):
+        raise RuntimeError("missing Pi cut output manifest")
+    expected = [(r["background_output_file"], r["background_output_sha256"]) for r in rep["results"]
+                if r.get("background_output_file")]
+    for path, info in manifest.items():
+        if info is None:
+            quoted = shlex.quote(path)
+            sbx.commands.run(f"test ! -e {quoted} && test ! -L {quoted}", user="root")
+        else:
+            expected.append((path, info["sha256"]))
+    for path, digest in expected:
+        if hashlib.sha256(bytes(sbx.files.read(path, format="bytes"))).hexdigest() != digest:
+            raise RuntimeError("Restored auxiliary file hash mismatch")
+        rec["auxiliary_hashes"][path] = digest
+    if pi_paths:
+        rec["pi_output_manifest"] = manifest
     rec["replay_gate_passed"] = True
     save()
 
@@ -242,6 +280,7 @@ def prepare_source(*, adapter, task_dir: Path, bundle: Path, template: str, tag:
                    replay_deadline_s: int = REPLAY_DEADLINE_S) -> dict[str, Any]:
     if replay_deadline_s <= 0:
         raise ValueError("replay_deadline_s must be positive")
+    check_native_replay(adapter.name, task_dir, bundle, replay_policy)
     sandbox_timeout_s = max(sandbox_timeout_s, replay_deadline_s + 3600)
     Sandbox = _sandbox_cls()
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -336,7 +375,13 @@ for _ in range(12):
     time.sleep(0.5)
 print(json.dumps({"killed": killed}))
 """
-            kill_cmd = "echo " + __import__("base64").b64encode(kill.encode()).decode() + " | base64 -d | python3 -"
+            cleanup_python = "python3"
+            if adapter.name == "codex":
+                cleanup_python = runtime.RUNTIME
+            elif adapter.name == "pi":
+                # Reuse the pinned interpreter already present on a prepared base snapshot.
+                cleanup_python = f'$(command -v python3 || echo {runtime.RUNTIME})'
+            kill_cmd = "echo " + __import__("base64").b64encode(kill.encode()).decode() + f" | base64 -d | {cleanup_python} -"
 
             def survivors(tag: str) -> list[str]:
                 ps = run(sbx, "ps -eo pid=,ppid=,args=").stdout.splitlines()
@@ -387,11 +432,16 @@ print(json.dumps({"killed": killed}))
         # at the same path the agent will use for the resumed session.
         slug, sid = meta.get("project_slug"), meta.get("session_id")
         if slug and sid:
-            sess_path = f"/logs/agent/sessions/projects/{slug}/{sid}.jsonl"
-            run(sbx, f"mkdir -p /logs/agent/sessions/projects/{slug}")
+            sess_path = (adapter.replay_session_path(meta) if getattr(adapter, "wire", None)
+                         else f"/logs/agent/sessions/projects/{slug}/{sid}.jsonl")
+            run(sbx, "mkdir -p " + shlex.quote(str(Path(sess_path).parent)))
             _write_in_parts(sbx, sess_path, transcript_prefix(meta, bundle))
-        cwd = meta.get("cwd") or "/app"
-        rec["replay_pid"] = dispatch_replay(sbx, cwd, exec_cap, replay_deadline_s)
+        cwd = meta.get("initial_cwd") or meta.get("cwd") or "/app"
+        replay_options = {"python": runtime.RUNTIME} if adapter.name == "codex" else {}
+        if meta.get("agent") == "pi":
+            agent_settings = tomllib.loads((task_dir / "task.toml").read_text()).get("agent", {})
+            replay_options["pi_user"] = agent_settings.get("user", "root")
+        rec["replay_pid"] = dispatch_replay(sbx, cwd, exec_cap, replay_deadline_s, **replay_options)
         step("replay_dispatched_once", t, pid=rec["replay_pid"])
         while True:
             time.sleep(15)
@@ -406,7 +456,7 @@ print(json.dumps({"killed": killed}))
         for name in ("replay_report.json", "replay_stdout.log"):
             (state_dir / f"{tag}-{name}").write_bytes(bytes(sbx.files.read(f"{REPLAY_DIR}/{name}", format="bytes")))
         rep = json.loads((state_dir / f"{tag}-replay_report.json").read_text())
-        step("replay", t, rc=rc, summary={k: v for k, v in rep.items() if k != "results"})
+        step("replay", t, rc=rc, summary={k: v for k, v in rep.items() if k not in ("results", "pi_output_manifest")})
         plan = json.loads((bundle / "plan.json").read_text())
         t = time.time()
         post_cut = probe_post_cut(sbx, run, plan, state_dir, tag)
@@ -429,7 +479,6 @@ print(json.dumps({"killed": killed}))
                 save()
             raise
         (state_dir / f"{tag}-replay_report.json").write_text(json.dumps(rep, ensure_ascii=False, indent=1))
-        rec["replay_gate_passed"] = True
         if replay_policy == "lenient" and isinstance(gate_result, dict):
             # Per-task divergence report: travels with the bundle and the state so results can quote it.
             rec["divergence_report"] = gate_result
@@ -483,6 +532,8 @@ def finish_prepared_source(state_path: Path, *, observe_timeout_s: int = 10800,
     def run(sbx, cmd, timeout=900):
         return sbx.commands.run(cmd, user="root", timeout=timeout)
 
+    if meta.get("agent") in ("pi", "codex"):
+        check_native_replay(meta["agent"], Path(rec["task_dir"]), bundle, replay_policy or rec.get("replay_policy", "strict"))
     sb = Sandbox.connect(rec["source_sandbox_id"])
     info = sb.get_info()
     if info.metadata.get("owner") != rec.get("owner", owner_tag()) or info.metadata.get("role") != "source" \
@@ -534,7 +585,6 @@ def finish_prepared_source(state_path: Path, *, observe_timeout_s: int = 10800,
         save()
         raise
     rec.pop("replay_gate_error", None)
-    rec["replay_gate_passed"] = True
     rec["replay_policy"] = policy
     if policy == "lenient" and isinstance(gate_result, dict):
         rec["divergence_report"] = gate_result
