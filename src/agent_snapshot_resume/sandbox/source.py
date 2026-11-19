@@ -105,7 +105,7 @@ def _write_in_parts(sbx, remote: str, data: bytes, part: int = 8 * 1024 * 1024) 
         rp = f"{remote}.part{i}"
         sbx.files.write(rp, data[lo:lo + part])
         parts.append(rp)
-    sbx.commands.run("cat " + " ".join(parts) + " > " + remote + " && rm -f " + " ".join(parts),
+    sbx.commands.run("cat " + shlex.join(parts) + " > " + shlex.quote(remote) + " && rm -f " + shlex.join(parts),
                      user="root", timeout=180)
     if not sbx.files.read(remote, format="bytes")[:64]:
         raise RuntimeError(f"part upload of {remote} produced an empty file")
@@ -387,8 +387,9 @@ print(json.dumps({"killed": killed}))
         # at the same path the agent will use for the resumed session.
         slug, sid = meta.get("project_slug"), meta.get("session_id")
         if slug and sid:
-            sess_path = f"/logs/agent/sessions/projects/{slug}/{sid}.jsonl"
-            run(sbx, f"mkdir -p /logs/agent/sessions/projects/{slug}")
+            sess_path = (adapter.replay_session_path(meta) if getattr(adapter, "wire", None)
+                         else f"/logs/agent/sessions/projects/{slug}/{sid}.jsonl")
+            run(sbx, "mkdir -p " + shlex.quote(str(Path(sess_path).parent)))
             _write_in_parts(sbx, sess_path, transcript_prefix(meta, bundle))
         cwd = meta.get("cwd") or "/app"
         rec["replay_pid"] = dispatch_replay(sbx, cwd, exec_cap, replay_deadline_s)

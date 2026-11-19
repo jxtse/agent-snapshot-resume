@@ -29,7 +29,7 @@ RESUME_LOGDIR = "/logs/agent/resume-proxy"
 KEY_ENV_IN_SANDBOX = "ASR_PROXY_KEY"
 
 # Files uploaded into the snapshot at preparation time (explicit list: never upload stray files).
-PROXY_FILES = ("passthrough_proxy.py", "proxy-requirements.txt")
+PROXY_FILES = ("passthrough_proxy.py", "native_wire.py", "pi_receipts.py", "proxy-requirements.txt")
 
 PBS_URL = ("https://github.com/astral-sh/python-build-standalone/releases/download/20251014/"
            "cpython-3.12.12%2B20251014-x86_64-unknown-linux-gnu-install_only.tar.gz")
@@ -38,9 +38,21 @@ PBS_SHA256 = "1ab2b6594d1c3d76cbebea09d6bc3e6ba68d8eb3b6322080375c4cc3dd188f34" 
 
 def fetch(url: str, dst: str, sha256: str) -> str:
     """Shell: download url to dst (curl, retried) and require sha256 == expected."""
-    return (f"(for i in 1 2 3 4 5; do curl -fsSL --retry 3 --connect-timeout 30 -o {dst} {url} && break; "
+    # curl when present, else python3 urllib (minimal task images may ship python3 without curl)
+    get = (f"(if command -v curl >/dev/null 2>&1; then curl -fsSL --retry 3 --connect-timeout 30 -o {dst} {url}; "
+           f"else python3 -c 'import sys,urllib.request; urllib.request.urlretrieve(sys.argv[1], sys.argv[2])' "
+           f"{url} {dst}; fi)")
+    return (f"(for i in 1 2 3 4 5; do {get} && break; "
             f"echo 'download attempt '$i' failed: {url}' >&2; sleep 10; done; "
             f"echo '{sha256}  {dst}' | sha256sum -c - )")
+
+
+def fetch_unverified(url: str, dst: str) -> str:
+    """Shell: download url to dst (curl or python3 urllib, retried). The caller verifies the content."""
+    return (f"(for i in 1 2 3 4 5; do (if command -v curl >/dev/null 2>&1; then curl -fsSL --retry 3 "
+            f"--connect-timeout 30 -o {dst} {url}; else python3 -c 'import sys,urllib.request; "
+            f"urllib.request.urlretrieve(sys.argv[1], sys.argv[2])' {url} {dst}; fi) && break; "
+            f"echo 'download attempt '$i' failed: {url}' >&2; sleep 10; done; test -s {dst})")
 
 
 APT = (
@@ -96,17 +108,18 @@ set -eu
 P=/opt/asr-proxy
 umask 077
 mkdir -p /root/.asr-proxy {logdir}
-cat > /root/.asr-proxy/run-{port}.sh <<EOF
+cat > /root/.asr-proxy/run-{port}.sh <<'EOF'
 #!/bin/bash
 set -u
+P=/opt/asr-proxy
 unset KV
-KV="\$ASR_PROXY_KEY"; unset ASR_PROXY_KEY
+KV="$ASR_PROXY_KEY"; unset ASR_PROXY_KEY
 cd $P/src
 while true; do
   PYTHONPATH=$P/site:$P/src PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 $P/rt/bin/asr-model-proxy {script} \
-    --host 127.0.0.1 --port {port} --key-file <(printf '%s' "\$KV") --upstream {upstream} --cafile $P/ca-bundle.crt {extra} \
+    --host 127.0.0.1 --port {port} --key-file <(printf '%s' "$KV") --upstream {upstream} --cafile $P/ca-bundle.crt {extra} \
     --log-dir {logdir} >> {logdir}/proxy-{port}.stderr 2>&1 < /dev/null
-  echo "proxy exited rc=\$? at \$(date -u +%FT%TZ), restarting" >> {logdir}/proxy-{port}.restarts
+  echo "proxy exited rc=$? at $(date -u +%FT%TZ), restarting" >> {logdir}/proxy-{port}.restarts
   sleep 2
 done
 EOF
@@ -149,7 +162,7 @@ cat {logdir}/resume-proxy.stderr >&2; echo "resume proxy did not start" >&2; exi
 # Extra passthrough-proxy flags an agent may request (e.g. the original route's `--drop-fields metadata
 # --strip-is-error`). Whitelisted so a job config cannot inject shell or override host/port/key/upstream/log-dir.
 PASSTHROUGH_FLAGS = {"--drop-fields": 1, "--strip-is-error": 0, "--strip-thinking": 0, "--retry-403-marker": 1,
-                     "--no-thinking-text": 0}
+                     "--no-thinking-text": 0, "--record-request-digests": 0}
 _ARG_VALUE_RE = re.compile(r"[A-Za-z0-9_.,:-]+")
 
 
@@ -171,11 +184,32 @@ def validate_passthrough_args(args) -> list[str]:
     return out
 
 
+def verified_script(path, checksum):
+    """Validate an explicitly pinned local translator before building a job or uploading it."""
+    if path is None and checksum is None:
+        return None
+    if not path or not re.fullmatch(r"[0-9a-f]{64}", checksum or ""):
+        raise ValueError("passthrough script requires its lowercase SHA-256")
+    path = Path(path).resolve(strict=True)
+    if hashlib.sha256(path.read_bytes()).hexdigest() != checksum:
+        raise ValueError("passthrough script SHA-256 mismatch")
+    return path
+
+
+def script_name(checksum):
+    if not re.fullmatch(r"[0-9a-f]{64}", checksum or ""):
+        raise ValueError("invalid passthrough script SHA-256")
+    return f"translator-{checksum}.py"
+
+
 def passthrough_start_command(upstream: str, port: int = PASSTHROUGH_PORT, logdir: str = PASSTHROUGH_LOGDIR,
-                              extra: str = "") -> str:
+                              extra: str = "", script_sha256: str | None = None) -> str:
     if not upstream.startswith(("http://", "https://")):
         raise ValueError("upstream must be an http(s) URL")
-    return MEMORY_PROXY_START.format(script="passthrough_proxy.py", port=int(port), upstream=shlex.quote(upstream),
+    script = script_name(script_sha256) if script_sha256 else "passthrough_proxy.py"
+    if script_sha256:
+        extra = "--proxy '' " + extra
+    return MEMORY_PROXY_START.format(script=script, port=int(port), upstream=shlex.quote(upstream),
                                      extra=extra, logdir=logdir)
 
 

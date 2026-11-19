@@ -188,7 +188,7 @@ def screen_trial(adapter, trial_dir: Path, *, cut_lines: list[int] | None = None
         raise SystemExit(f"{trial_dir.name}: {(ir or {}).get('error')}")
     raw = [l for l in (trial_dir / ir["sources"]["session_jsonl"]).read_text(encoding="utf-8").split("\n")
            if l.strip()]
-    reqs = parity.original_requests(trial_dir)
+    reqs = parity.original_requests(trial_dir) if not getattr(adapter, "wire", None) else None
     rps = {r["index"]: r for r in trace_ir.resume_points(ir)}
     targets = list(steps or [])
     for cl in cut_lines or []:
@@ -198,7 +198,11 @@ def screen_trial(adapter, trial_dir: Path, *, cut_lines: list[int] | None = None
         k = trace_ir.step_index(ir, sid)
         plan = plan_with_observations(ir, k)
         n_comp = sum(1 for s in ir["steps"][:k] for e in s["events"] if e["type"] == "compaction_boundary")
-        loc = parity.locate_request(ir, k, reqs)
+        if reqs is None:
+            ref, _ = adapter.native_reference(trial_dir, ir, k, raw[:adapter.cut_line(raw, ir, k)])
+            loc = {"record": ref, "index": (ref or {}).get("index")}
+        else:
+            loc = parity.locate_request(ir, k, reqs)
         rep = screen_plan(plan, rps.get(k), n_compactions=n_comp, orig_request=loc.get("record"),
                           policy=policy)
         rep.update(trial=trial_dir.name, atif_step=sid, cut_line=adapter.cut_line(raw, ir, k),

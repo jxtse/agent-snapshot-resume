@@ -1,0 +1,403 @@
+"""Codex CLI 0.154.0 rollouts (Responses). One model call can contain parallel tools."""
+import hashlib
+import json
+import math
+import posixpath
+import re
+import shlex
+from pathlib import Path
+
+from harbor.agents.installed.codex import Codex, CodexOptions
+
+from ..proxy.native_wire import digest
+from ..proxy.runtime import fetch
+from ..trace.ir import bash_is_read_only
+from .native import NativeAdapter, NativeOptions, NativeResumeMixin
+
+
+CATALOG_SHA256 = "b7d04bd6ed29640ac4a80cd6ffbda125d94dd5f8ccb95d29721099d4118ec873"
+DEFAULT_CATALOG = Path(".cache/deepseek-models.json")
+
+
+def read_catalog(path, model):
+    """Verify the exact bytes used for both seeding and selecting the model policy."""
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
+        raise ValueError(f"missing pinned Codex model catalog: {path}") from None
+    if hashlib.sha256(data).hexdigest() != CATALOG_SHA256:
+        raise ValueError(f"Codex model catalog SHA256 mismatch: {path}")
+    policies = [entry["truncation_policy"] for entry in json.loads(data)["models"] if entry["slug"] == model]
+    if len(policies) != 1 or policies[0]["mode"] != "tokens" or policies[0]["limit"] <= 0:
+        raise ValueError(f"no supported token policy for model {model!r} in pinned catalog")
+    return data, policies[0]["limit"]
+
+
+def render_text(text, tokens):
+    data = text.encode("utf-8")
+    budget = 4 * tokens
+    if len(data) <= budget:
+        return text
+    half = budget // 2
+    head = data[:half].decode("utf-8", errors="ignore")
+    tail = data[len(data) - half:].decode("utf-8", errors="ignore")
+    omitted = (len(data) - budget + 3) // 4
+    return f"{head}…{omitted} tokens truncated…{tail}"
+
+
+def render_output(output, catalog_limit):
+    # Context history grants tool outputs 120% of the catalog token limit in 0.154.0.
+    remaining = math.ceil(catalog_limit * 1.2)
+    if isinstance(output, str):
+        return render_text(output, remaining)
+    blocks = []
+    omitted = 0
+    for block in output:
+        if block["type"] != "input_text":
+            blocks.append(block)
+            continue
+        text = block["text"]
+        if not text:
+            continue
+        if remaining:
+            blocks.append({**block, "text": render_text(text, remaining)})
+            remaining = max(0, remaining - (len(text.encode("utf-8")) + 3) // 4)
+        else:
+            omitted += 1
+    if omitted:
+        blocks.append({"type": "input_text", "text": f"[omitted {omitted} text items ...]"})
+    return blocks
+
+
+def project_item(item, catalog_limit):
+    projected = {k: v for k, v in item.items() if k != "internal_chat_message_metadata_passthrough"}
+    if projected.get("type") in {"function_call_output", "custom_tool_call_output"}:
+        projected["output"] = render_output(projected["output"], catalog_limit)
+    return projected
+
+
+def codex_history(records, catalog_limit):
+    """Projected model history. Keep wire IDs and nulls. Exclude storage-only turn metadata."""
+    history = []
+    for row in records:
+        payload = row["payload"]
+        if row["type"] == "response_item":
+            history.append(payload)
+        elif row["type"] == "compacted":
+            replacement = payload.get("replacement_history")
+            if not isinstance(replacement, list):
+                raise ValueError("compaction has no explicit replacement history")
+            history = list(replacement)
+    return [project_item(item, catalog_limit) for item in history]
+
+
+def recorded_sandbox_mode(context):
+    policy = context.get("sandbox_policy")
+    if policy is None:
+        return None  # Older rollout schemas carried no restorable policy.
+    if (policy == {"type": "danger-full-access"} and context.get("approval_policy") == "never"
+            and context.get("permission_profile") == {"type": "disabled"}):
+        return "danger-full-access"
+    if policy == {"type": "read-only"} and context.get("approval_policy") in (None, "never"):
+        return "read-only"
+    return "unsupported"
+
+
+def tool_action(payload, cwd):
+    name = payload["name"]
+    if payload["type"] == "custom_tool_call":
+        if name == "apply_patch":
+            # The pinned executable provides the patch implementation, including moves and contextual hunks.
+            return "Bash", {"command": shlex.join(["codex", "--codex-run-as-apply-patch", payload["input"]])}, "exec", cwd
+        return name, {"input": payload["input"]}, "other", cwd
+    args = json.loads(payload["arguments"])
+    if name in ("exec_command", "shell", "shell_command"):
+        cmd = args.get("cmd", args.get("command"))
+        if isinstance(cmd, list):
+            cmd = shlex.join(cmd)
+        shell = args.get("shell")
+        if isinstance(cmd, str) and not args.get("tty") and (shell is None or isinstance(shell, str)):
+            effect = "read_only" if bash_is_read_only(cmd) else "exec"
+            if shell or args.get("login") is False:
+                cmd = shlex.join([shell or "bash", "-lc" if args.get("login", True) else "-c", cmd])
+            return ("Bash", {"command": cmd}, effect,
+                    posixpath.join(cwd, args.get("workdir") or cwd))
+    return name, args, "other", cwd
+
+
+def decode_output(output):
+    if not isinstance(output, str):
+        return json.dumps(output, ensure_ascii=False), None, None, None
+    if output.startswith("Chunk ID:"):
+        marker = re.search(r"(?m)^(?:Final output|Output):(?:\n|$)", output)
+        if marker:
+            header, text = output[:marker.start()], output[marker.end():]
+            status = re.search(r"(?m)^Process exited with code (-?\d+)$", header)
+            session = re.search(r"(?m)^Process running with session ID (\d+)$", header)
+            wall = re.search(r"(?m)^Wall time: ([.\d]+) seconds", header)
+            return (text, int(status[1]) if status else None, session[1] if session else None,
+                    float(wall[1]) if wall else None)
+    return output, None, None, None
+
+
+class CodexAdapter(NativeAdapter):
+    name, version, wire = "codex", "0.154.0", "responses"
+    resume_artifacts = {**NativeAdapter.resume_artifacts, "resume_context": "codex-0.154.0-skills-permissions-environment"}
+
+    def __init__(self, catalog_path=DEFAULT_CATALOG):
+        self.catalog_path = Path(catalog_path)
+
+    def trial_catalog(self, agent_dir, model):
+        exported = agent_dir / "model-catalog.json"
+        return read_catalog(exported if exported.exists() or exported.is_symlink() else self.catalog_path, model)
+
+    def bundle_artifacts(self, cwd, original=None):
+        artifacts = {**self.resume_artifacts, "cwd": cwd, "codex_home": "/logs/agent"}
+        if original and original.get("content"):
+            artifacts["prefix_items"] = len(original["content"]["items"])
+        return artifacts
+
+    session_root = "agent/sessions"
+    session_glob = session_root + "/*/*/*/rollout-*.jsonl"
+    binary_sha256 = {"0.154.0": "e27c83a49e6031685ee7f956c12aad5f16484d3a80181dd3fea930fb96b3832b"}
+    harbor_import_path = "agent_snapshot_resume.agents.codex:CodexSnapshotResume"
+
+    def load_trace(self, trial_dir, agent_timeout_s, task=None, reward=None):
+        trial = Path(trial_dir)
+        path = self.find_session(trial)
+        with path.open("rb") as stream:
+            rows = [json.loads(line) for line in stream]
+        header = rows[0]["payload"]
+        if rows[0]["type"] != "session_meta" or header["cli_version"] != self.version:
+            raise ValueError("unsupported Codex rollout version")
+        steps, calls = [], {}
+        current = None
+        model, cwd, context = None, header["cwd"], {}
+        processes = {}
+        for i, row in enumerate(rows):
+            typ, p, ts = row["type"], row["payload"], row["timestamp"]
+            subtype = p.get("type")
+            if typ == "turn_context":
+                context = p
+                model, cwd = p.get("model"), p["cwd"]
+            if typ == "compacted" and steps:
+                steps[-1]["events"].append(dict(type="compaction_boundary", line=i))
+                current = None
+            if typ == "token_usage_record" and current:
+                current.update(usage=p["usage"], message_id=p.get("response_id"))
+            if typ == "event_msg" and subtype == "token_count":
+                current = None
+            if typ != "response_item":
+                continue
+            if subtype == "message" and p["role"] in ("developer", "system", "user"):
+                current = None
+                steps.append(dict(source="user", line_range=[i], timestamp=ts,
+                                  events=[dict(type="user_text", text=p["content"])]))
+                continue
+            if subtype in ("function_call_output", "custom_tool_call_output"):
+                event, step = calls[p["call_id"]]
+                text, rc, session_id, duration = decode_output(p["output"])
+                if rc not in (None, 0) and event["tool"] == "Bash":
+                    text = f"Exit code {rc}\n" + text
+                event.update(is_error=rc != 0 if rc is not None else None, duration_s=duration)
+                if session_id and event["tool"] == "Bash":
+                    # A PTY session cannot be revived by executing a fresh foreground command.
+                    event.update(tool="unified_exec", side_effect="exec_background", background_task_id=session_id)
+                    processes[session_id] = event["call_id"]
+                if event["tool"] == "write_stdin" and rc is not None:
+                    sid = str(event["args"]["session_id"])
+                    if sid in processes:
+                        step["events"].append(dict(type="attachment", bg_task_id=sid, bg_call_id=processes.pop(sid),
+                                                   bg_status="completed" if rc == 0 else "failed", bg_exit_code=rc,
+                                                   timestamp=ts, line=i))
+                step["events"].append(dict(type="observation", call_id=p["call_id"], text=text, line=i,
+                                           timestamp=ts, is_error=event["is_error"]))
+                continue
+            if current is None:
+                current = dict(source="agent", timestamp=ts, line_range=[i], events=[],
+                               native_model=model, native_effort=context.get("effort"),
+                               native_sandbox_mode=recorded_sandbox_mode(context))
+                steps.append(current)
+            if subtype in ("function_call", "custom_tool_call"):
+                tool, args, effect, workdir = tool_action(p, cwd)
+                event = dict(type="tool_call", tool=tool, args=args, side_effect=effect, cwd=workdir,
+                             call_id=p["call_id"], line=i, timestamp=ts)
+                calls[p["call_id"]] = event, current
+            elif subtype in ("message", "reasoning"):
+                event = dict(type="assistant_text" if subtype == "message" else "assistant_reasoning",
+                             text="\n".join(b.get("text", "") for b in p.get("content") or []))
+            else:
+                raise ValueError(f"unsupported Codex response item {subtype!r}")
+            current["events"].append(event)
+        atif = trial / "agent/trajectory.json"
+        if atif.is_file():
+            # Harbor can omit a reasoning-only response. Bind steps by exact tool ids or message timestamp.
+            exported = json.loads(atif.read_text())["steps"]
+            by_call = {c["tool_call_id"]: s["step_id"] for s in exported for c in s.get("tool_calls", [])}
+            by_message = {}
+            for s in exported:
+                by_message.setdefault((s["source"], s.get("timestamp")), []).append(s["step_id"])
+            for step in steps:
+                ids = {by_call[e["call_id"]] for e in step["events"] if e["type"] == "tool_call"
+                       and e["call_id"] in by_call}
+                if not ids:
+                    i = step["line_range"][0]
+                    while i < len(rows):
+                        row = rows[i]
+                        p = row["payload"]
+                        if row["type"] == "response_item" and p["type"] == "message":
+                            src = {"assistant": "agent", "developer": "system"}.get(p["role"], p["role"])
+                            matches = by_message.get((src, row["timestamp"]), [])
+                            if matches:
+                                ids.add(matches.pop(0))
+                            break
+                        if row["type"] == "event_msg" and p.get("type") == "token_count":
+                            break
+                        i += 1
+                step["atif_step_id"] = ids.pop() if len(ids) == 1 else None
+        return self.trace(path, trial, rows, header["id"], header["cwd"], self.version, steps, agent_timeout_s,
+                          task=task, reward=reward, model=model, provider=header["model_provider"])
+
+    def cut_line(self, raw_lines, ir, k_index):
+        cut = super().cut_line(raw_lines, ir, k_index)
+        while cut > 0:
+            row = json.loads(raw_lines[cut - 1])
+            p = row["payload"]
+            if (row["type"] == "event_msg" and p.get("type") == "item_completed" and
+                    p.get("item", {}).get("type") in {"Reasoning", "AgentMessage"}):
+                cut -= 1
+            else:
+                break
+        return cut
+
+    def native_reference(self, trial, ir, k, prefix):
+        if (trial / "agent/model-proxy/native-reference.jsonl").exists():
+            return super().native_reference(trial, ir, k, prefix)
+        usage = ir["steps"][k].get("usage") or {}
+        records = [json.loads(line) for p in sorted((trial/"agent/model-proxy").glob("requests-*.jsonl"))
+                   for line in p.read_text().splitlines()]
+        entry = ir["steps"][k].get("message_id")
+        captured = [(i, r["native_reference"]) for i, r in enumerate(records)
+                    if entry and r.get("entry_id") == entry and r.get("session_id") == ir["session_id"]
+                    and r.get("status") == 200 and r.get("native_reference")]
+        if captured:
+            if len(captured) != 1:
+                return None, "ambiguous captured Codex request"
+            i, ref = captured[0]
+            if ref.get("wire") != self.wire or ref.get("complete") is not True:
+                return None, "invalid captured Codex reference"
+            return dict(index=i, method="captured-entry-id", content=ref), None
+        keys = ("input_tokens", "output_tokens")
+        hits = [(i, r) for i, r in enumerate(records) if r.get("status") == 200 and
+                all(usage.get(key) is not None and usage[key] == (r.get("usage") or {}).get(key) for key in keys)]
+        if len(hits) != 1:
+            return None, "no unique Codex usage match"
+        index, record = hits[0]
+        rows = [json.loads(l) for l in prefix]
+        _, limit = self.trial_catalog(trial / "agent", ir["steps"][k]["native_model"])
+        history = codex_history(rows, limit)
+        instructions = rows[0]["payload"]["base_instructions"]["text"]
+        content = dict(wire=self.wire, complete=False, items=[digest(item) for item in history],
+                       fields={"instructions": digest(instructions), "model": digest(record["model"])},
+                       projection="codex_rollout_tokens", missing_evidence=["original_request_envelope"], logged_item_count=record.get("n_items"))
+        return dict(index=index, method="unique-usage", content=content,
+                    metadata={k: record.get(k) for k in ("req_bytes", "n_items", "n_tools", "effort", "n_msgs",
+                                                      "n_reasoning_replayed", "dropped_tools", "dropped_fields") if k in record}), None
+
+    def collect_aux(self, session_path, ir, k_index, prefix_text, out_dir):
+        model = ir["steps"][k_index]["native_model"]
+        content, _ = self.trial_catalog(session_path.parents[4], model)
+        (out_dir / "model-catalog.json").write_bytes(content)
+        return {"model_catalog": 1}
+
+    def sanity_check_bundle(self, bundle_dir, meta):
+        if meta.get("aux_counts", {}).get("model_catalog") != 1:
+            raise ValueError("Codex resume requires a bundled, pinned model catalog")
+        read_catalog(bundle_dir / "aux/model-catalog.json", meta["native_model"])
+        session = bundle_dir / "session_trunc.jsonl"
+        if session.is_file():
+            policy = None
+            with session.open() as stream:
+                for line in stream:
+                    row = json.loads(line)
+                    if row["type"] == "turn_context":
+                        policy = recorded_sandbox_mode(row["payload"])
+            if policy == "unsupported" or policy != meta.get("native_sandbox_mode"):
+                raise ValueError("unsupported or stale Codex sandbox policy; rebuild the bundle")
+
+    def install_commands(self, version=None):
+        v = version or self.version
+        if v not in self.binary_sha256:
+            raise ValueError("unsupported Codex version")
+        checksum = self.binary_sha256[v]
+        url = f"https://registry.npmjs.org/@openai/codex/-/codex-{v}-linux-x64.tgz"
+        directory = "/opt/asr-codex/package/vendor/x86_64-unknown-linux-musl"
+        cmd = (fetch(url, "/tmp/asr-codex.tgz", checksum) +
+               " && mkdir -p /opt/asr-codex && tar -xzf /tmp/asr-codex.tgz -C /opt/asr-codex"
+               f" && (for exe in {directory}/bin/codex {directory}/codex/codex; do "
+               'if test -x "$exe"; then ln -sf "$exe" /usr/local/bin/codex && exit; fi; done; exit 1)'
+               f" && test \"$(codex --version)\" = 'codex-cli {v}'")
+        return [("codex", cmd, 300)]
+
+    def resume_setup(self, meta, base, home="/logs/agent"):
+        relative = self.session_relative_path(meta)
+        provider, model = meta["native_provider"], meta["native_model"]
+        if meta.get("aux_counts", {}).get("model_catalog") != 1:
+            raise ValueError("Codex resume requires a bundled, pinned model catalog")
+        catalog = f'model_catalog_json = {json.dumps(str(Path(home) / "model-catalog.json"))}\n'
+        mode = meta.get("native_sandbox_mode")
+        if mode not in (None, "read-only", "danger-full-access"):
+            raise ValueError("unsupported Codex sandbox policy")
+        policy = f'sandbox_mode = {json.dumps(mode)}\napproval_policy = "never"\n' if mode else ""
+        config = (policy + catalog + f'model = {json.dumps(model)}\nmodel_provider = {json.dumps(provider)}\n'
+                  f'model_reasoning_effort = {json.dumps(meta.get("native_effort") or "max")}\n'
+                  'web_search = "disabled"\nshow_raw_agent_reasoning = true\n'
+                  '[features]\nplugins = false\nremote_plugin = false\n'
+                  '[analytics]\nenabled = false\n[feedback]\nenabled = false\n'
+                  f'[model_providers.{json.dumps(provider)}]\nname = {json.dumps(provider)}\n'
+                  f'base_url = {json.dumps(base + "/v1")}\nwire_api = "responses"\n'
+                  'env_key = "ASR_DUMMY_KEY"\nrequest_max_retries = 0\nstream_max_retries = 0\n')
+        return ({"CODEX_HOME": home, "ASR_DUMMY_KEY": "dummy"}, str(Path(home) / relative),
+                ["codex", "exec", "resume", "--json", "--skip-git-repo-check", meta["session_id"], meta["sentinel"]],
+                home + "/config.toml", config)
+
+
+class CodexSnapshotResumeOptions(NativeOptions, CodexOptions):
+    pass
+
+
+class CodexSnapshotResume(NativeResumeMixin, Codex):
+    options_model = CodexSnapshotResumeOptions
+    adapter = CodexAdapter()
+
+
+def resolve_polled_commands(plan, steps):
+    """Replay a completed foreground command once when its only intervening calls were empty polls."""
+    actions = plan["actions"]
+    events = sorted((e for step in steps for e in step["events"] if e["type"] == "tool_call"),
+                    key=lambda e: e["line"])
+    by_call = {a["call_id"]: a for a in actions}
+    consumed = set()
+    for i, event in enumerate(events):
+        if event["tool"] != "unified_exec":
+            continue
+        start = by_call[event["call_id"]]
+        start["side_effect"] = "other"
+        if not start.get("bg_finished_before_k"):
+            continue
+        polls = []
+        for next_event in events[i+1:]:
+            args = next_event["args"]
+            if (next_event["tool"] != "write_stdin" or args.get("chars", "") != ""
+                    or str(args.get("session_id")) != start["background_task_id"]
+                    or next_event["line"] > start["bg_finished_line"]):
+                break
+            polls.append(by_call[next_event["call_id"]])
+        if not polls or polls[-1]["obs_line"] != start["bg_finished_line"]:
+            continue
+        start.update(tool="Bash", side_effect="exec", duration_s=start.get("bg_duration_s"),
+                     is_error=polls[-1]["is_error"], orig_text="".join(a["orig_text"] for a in [start, *polls]))
+        if start["is_error"]:
+            start["orig_text"] = f"Exit code {start['bg_exit_code']}\n" + start["orig_text"]
+        consumed.update(p["call_id"] for p in polls)
+    plan["actions"] = [a for a in actions if a["call_id"] not in consumed]

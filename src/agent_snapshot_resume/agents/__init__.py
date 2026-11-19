@@ -7,6 +7,8 @@ from __future__ import annotations
 import importlib
 
 ADAPTERS = {
+    "codex": "agent_snapshot_resume.agents.codex:CodexAdapter",
+    "pi": "agent_snapshot_resume.agents.pi:PiAdapter",
     "claude-code": "agent_snapshot_resume.agents.claude_code:ClaudeCodeAdapter",
 }
 

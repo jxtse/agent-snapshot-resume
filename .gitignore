@@ -10,3 +10,8 @@ runs/
 dist/
 build/
 *.egg-info/
+
+.cache/
+.local/
+*.local.*
+.venv-shared

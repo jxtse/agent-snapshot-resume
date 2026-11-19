@@ -239,6 +239,35 @@ def cc_bash_text(r):
     return out or err
 
 
+PI_TRUNC_RE = re.compile(r"\n\n\[Showing lines (\d+)-(\d+) of (\d+)(?: \(50\.0KB limit\))?\. Full output: (/tmp/pi-bash-[0-9a-f]+\.log)\]\Z")
+
+
+def pi_truncated_view(orig, new):
+    """Pi 1.4.0 keeps the tail of a Bash result (2000 lines / 50 KiB) and appends a footer naming a random temp file.
+    If the original observation carries that footer, render the replayed output the same way (same limits, same
+    footer, the recorded temp path substituted) so the comparison sees what the model saw. Otherwise return new."""
+    m = PI_TRUNC_RE.search(orig or "")
+    if not m:
+        return new
+    max_lines, max_bytes = 2000, 50 * 1024
+    lines = new.split("\n")
+    if new.endswith("\n"):
+        lines.pop()
+    kept, size, by_bytes = [], 0, False
+    for line in reversed(lines):
+        if len(kept) >= max_lines:
+            break
+        b = len(line.encode()) + (1 if kept else 0)
+        if size + b > max_bytes:
+            by_bytes = True
+            break
+        kept.insert(0, line)
+        size += b
+    start, total = len(lines) - len(kept) + 1, len(lines)
+    limit = " (50.0KB limit)" if by_bytes else ""
+    return "\n".join(kept) + f"\n\n[Showing lines {start}-{total} of {total}{limit}. Full output: {m[4]}]"
+
+
 def stop_snapshot_background(action):
     """Stop cloned writers identified by the exact CC output fd before rerunning the action.
 
@@ -282,6 +311,32 @@ def stop_snapshot_background(action):
     return sorted(groups)
 
 
+def edit_original_spans(path, edits, originally_failed):
+    """Pi matches each old text against the same input before writing any replacement."""
+    try:
+        with open(path, encoding="utf-8", newline="") as stream:
+            source = stream.read()
+    except FileNotFoundError:
+        return "edit_failed", "error_reproduced" if originally_failed else "edit_target_missing"
+    spans = []
+    for edit in edits:
+        old = edit["old_string"]
+        start = source.find(old)
+        if not old or start == -1 or source.find(old, start+1) != -1:
+            return "edit_failed", "error_reproduced" if originally_failed else "edit_target_missing"
+        spans.append((start, start+len(old), edit["new_string"]))
+    spans.sort()
+    if any(a[1] > b[0] for a, b in zip(spans, spans[1:])):
+        return "edit_failed", "error_reproduced" if originally_failed else "edit_ambiguous"
+    if originally_failed:
+        return "skipped_orig_error", "orig_error_now_applicable"
+    for start, end, replacement in reversed(spans):
+        source = source[:start] + replacement + source[end:]
+    with open(path, "w", encoding="utf-8", newline="") as stream:
+        stream.write(source)
+    return "applied", "exact"
+
+
 def main():
     plan_p, rep_p = sys.argv[1], sys.argv[2]
     cap = 1800
@@ -320,6 +375,8 @@ def main():
                     f.write(args.get("content", ""))
                 rec["status"] = "applied"
                 rec["fidelity"] = "exact" if not a.get("is_error") else "orig_error_but_applied"
+            elif tool == "MultiEdit" and args.get("match_original"):
+                rec["status"], rec["fidelity"] = edit_original_spans(args["file_path"], args["edits"], a.get("is_error"))
             elif tool == "Edit":
                 fp = args["file_path"]
                 old, new = args.get("old_string", ""), args.get("new_string", "")
@@ -402,7 +459,7 @@ def main():
                     rec["stderr_full"] = r["stderr"]
                     rec["orig_full"] = a.get("orig_text")
                     if se == "exec":
-                        new = cc_bash_text(r)
+                        new = pi_truncated_view(a.get("orig_text"), cc_bash_text(r))
                         rec["fidelity"] = compare(a.get("orig_text"), new, r["rc"])
                         if rec["fidelity"] in ("differs", "numbers_differ"):
                             rec["orig_head"] = (a.get("orig_text") or "")[:400]

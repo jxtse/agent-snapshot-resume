@@ -292,6 +292,11 @@ class ClaudeCodeSnapshotResumeOptions(ClaudeCodeOptions):
     upstream_url: str | None = Field(default=None)
     # Extra flags for the in-sandbox passthrough proxy, e.g. ["--drop-fields", "metadata", "--strip-is-error"] to
     # reproduce a route that needed them (whitelisted in proxy.runtime.validate_passthrough_args).
+    passthrough_script: str | None = None
+    passthrough_script_sha256: str | None = None
+    allow_incomplete_evidence: bool = False
+    parity_verdict: str | None = None
+    fake_parity_verdict: str | None = None
     passthrough_args: list[str] | None = Field(default=None)
     # First-request parity gate in the resume proxy (fail closed): "auto" (default: gate whenever the bundle recorded
     # the original request at the cut), "require" (refuse to run without that record), "off".

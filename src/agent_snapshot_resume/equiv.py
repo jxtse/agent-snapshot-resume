@@ -126,6 +126,22 @@ def context_lines(lines):
 def check(session_path, cut, req_path, hint=None, sentinel=None):
     with open(session_path, encoding="utf-8") as f:
         lines = [json.loads(l) for l in f if l.strip()]
+    if lines and lines[0].get("type") in ("session", "session_meta"):
+        from hashlib import sha256
+        from pathlib import Path
+        from .proxy.native_wire import compare_native
+        path = Path(session_path)
+        bundle = path.with_name("bundle.json")
+        problems = ["native equivalence needs the bundle reference for this exact prefix"]
+        if bundle.is_file():
+            meta = json.loads(bundle.read_text())
+            ref = (meta.get("orig_request_at_k") or {}).get("content")
+            if ref and cut == meta["cut_line"] and sha256(path.read_bytes()).hexdigest() == meta.get("prefix_sha256"):
+                rq = json.loads(Path(req_path).read_text())
+                report = compare_native(rq.get("body", rq), ref, [hint] if hint else [])
+                return {"equivalent": report["ok"], **report}
+        return {"equivalent": False, "verdict": "incomplete_evidence", "evidence_complete": False,
+                "content_problems": [], "error": problems[0]}
     ref = blocks_from_session(context_lines(lines[:cut]))
     with open(req_path) as f:
         rq = json.load(f)
@@ -210,6 +226,9 @@ def main(a=None):
     if a.out:
         with open(a.out, "w") as f:
             f.write(s)
+    if "content_problems" in r:
+        print(s)
+        return 0 if r["equivalent"] else 1
     print(json.dumps({k: r[k] for k in ("equivalent", "n_ref_blocks", "n_matched_in_order", "n_missing", "extra_by_class", "sentinel_left", "hint_blocks", "last_message_is_tool_result")}))
     return 0 if r["equivalent"] else 1
 

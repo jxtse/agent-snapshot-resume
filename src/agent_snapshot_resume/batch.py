@@ -90,9 +90,10 @@ class State:
 
 
 class Batch:
-    def __init__(self, *, name: str, work_dir: Path, manifest: Path, tasks_dir: Path, jobs_dir: Path,
+    def __init__(self, *, name: str, work_dir: Path, manifest: Path | None, tasks_dir: Path, jobs_dir: Path,
                  runs_dir: Path, state_dir: Path, agent_env: dict[str, str] | None = None,
                  passthrough_args: list[str] | None = None, model: str | None = None,
+                 passthrough_script=None, passthrough_script_sha256=None, allow_incomplete_evidence=False,
                  upstream_url: str | None = None, hinted_reps: int = 2, control_reps: int = 1,
                  midrun_snapshot_every: float = 1200.0, cut_window: int = 200, max_cut_candidates: int = 16,
                  retry_failed: str = "off", prep_concurrency: int = 6,
@@ -102,13 +103,18 @@ class Batch:
         self.replay_deadline_s = replay_deadline_s
         self.name, self.work = name, Path(work_dir)
         self.batch_dir = self.work / "batch" / name
-        self.manifest_path = Path(manifest)
-        self.rows = load_manifest(self.manifest_path)
+        self.state = State(self.batch_dir)
+        self.manifest_path = Path(manifest) if manifest else None
+        self.rows = load_manifest(self.manifest_path) if self.manifest_path else list(self.state.units.values())
         if only:
             self.rows = [r for r in self.rows if r["task"] in only]
         self.tasks_dir = Path(tasks_dir)
         self.jobs_dir, self.runs_dir, self.state_dir = Path(jobs_dir), Path(runs_dir), Path(state_dir)
         self.agent_env, self.passthrough_args, self.model = agent_env or {}, passthrough_args, model
+        from .proxy.runtime import verified_script
+        self.route_options = dict(passthrough_script=verified_script(passthrough_script, passthrough_script_sha256),
+                                  passthrough_script_sha256=passthrough_script_sha256,
+                                  allow_incomplete_evidence=allow_incomplete_evidence)
         self.upstream_url = upstream_url
         self.hinted_reps, self.control_reps = hinted_reps, control_reps
         self.midrun_every = midrun_snapshot_every
@@ -118,7 +124,6 @@ class Batch:
         self.replay_policy, self.cost_alarm_usd = replay_policy, cost_alarm_usd
         self.prep_concurrency, self.launch_concurrency = prep_concurrency, launch_concurrency
         self.agent_name, self.verifier = agent, verifier
-        self.state = State(self.batch_dir)
         self.log = log
         self._adapter = None
 
@@ -148,6 +153,8 @@ class Batch:
         """Session hash of the source trial (part of the bundle input identity)."""
         src = self.source(row)
         p = Path(src["trial_dir"])
+        if getattr(self.adapter, "wire", None):
+            return __import__("hashlib").sha256(self.adapter.find_session(p).read_bytes()).hexdigest()
         js = p / "agent" / "sessions" / "projects"
         cand = sorted(js.glob("*/*.jsonl"))
         if not cand:
@@ -251,7 +258,7 @@ class Batch:
 
         task = row["task"]
         ud = self.unit_dir(task)
-        hint = Path(row["hint_path"]).read_text().strip()
+        hint = Path(row["hint_path"]).read_text().strip() if self.hinted_reps else ""
         src = self.source(row)
         # Chained round-N unit: `chain.json` names the resumed trial this cut belongs to, the mid-run snapshot the
         # replay continues from, and the hints that run already carried. The new hint is injected at the new cut on
@@ -273,6 +280,10 @@ class Batch:
             control = {"mode": "hint", "hint": "\n\n".join(h.strip() for h in chain_spec["prior_hints"]),
                        "run_id": f"{task}-s{cut}-control"}
         specs = {"hinted": {"mode": "hint", "hint": hint, "run_id": f"{task}-s{cut}-hint"}, "control": control}
+        if not self.hinted_reps:
+            specs.pop("hinted")
+        if not self.control_reps:
+            specs.pop("control")
         # A cached bundle is only reusable if it was built from the same inputs; a changed hint file, cut or source
         # session must rebuild it, and a downstream fake/parity proof must never legitimise the stale one.
         inputs = {"cut_line": cut, "source_trial_dir": str(trial_dir.resolve()),
@@ -281,6 +292,8 @@ class Batch:
                   "chain": {"base_snapshot": (chain_spec.get("base_snapshot") or {}).get("snapshot_id"),
                             "prior_hints_sha256": hashlib.sha256("\n\n".join(
                                 chain_spec.get("prior_hints") or []).encode()).hexdigest()} if chain_spec else None}
+        if self.agent_name == "codex":
+            inputs["sandbox_policy_source"] = "turn_context"
         cached = {}
         if (ud / "bundles.json").is_file():
             try:
@@ -298,7 +311,7 @@ class Batch:
                 bdir, meta = bundle_mod.build(adapter=self.adapter, trial_dir=trial_dir,
                                              atif_step=None, cut_line=cut, out=ud / "bundles",
                                              task_dir=self.task_dir(row), mode=spec["mode"], hint=spec["hint"],
-                                             run_id=spec["run_id"], persist_hint=(spec["mode"] == "hint"),
+                                             run_id=spec["run_id"], persist_hint=(spec["mode"] == "hint" and not getattr(self.adapter, "wire", None)),
                                              force=True,
                                              # only the hinted bundle names the carried hints explicitly; the
                                              # control bundle inherits them from the resumed session's own proxy spec
@@ -358,6 +371,7 @@ class Batch:
         base_tag = f"{task}-s{cut}"
         if not tmpl_id:
             raise RuntimeError("no ready template id for this task")
+        base = bundled.get("bundles", {}).get("hinted") or bundled.get("bundles", {}).get("control") or {}
         tag, attempt = base_tag, 0
         while True:
             out = self.state_dir / f"snapshot-{tag}.json"
@@ -367,7 +381,7 @@ class Batch:
             # a snapshot accepted under another policy was not gated the way this batch gates: never reuse it silently
             same_policy = (rec.get("replay_policy") or "strict") == self.replay_policy
             # a snapshot replayed from a different plan (e.g. the bundle was rebuilt) restores a different state
-            hinted_dir = ((bundled.get("bundles") or {}).get("hinted") or {}).get("dir")
+            hinted_dir = base.get("dir")
             if rec.get("replay_gate_passed") and rec.get("snapshot_id") and hinted_dir and rec.get("cut_identity"):
                 from .bundle import cut_identity_diff, snapshot_cut_identity
                 if cut_identity_diff(snapshot_cut_identity(Path(hinted_dir)), rec["cut_identity"]):
@@ -388,12 +402,12 @@ class Batch:
             out.rename(out.with_name(out.name + f".stale-{attempt}"))
             tag = f"{base_tag}-r{attempt}"
         rec = source.prepare_source(adapter=self.adapter, task_dir=self.task_dir(row),
-                                    bundle=Path(bundled["bundles"]["hinted"]["dir"]),
+                                    bundle=Path(base["dir"]),
                                     template=str(tmpl_id), tag=tag, state_dir=self.state_dir,
                                     replay_policy=self.replay_policy, replay_deadline_s=self.replay_deadline_s,
                                     # a chained bundle's plan holds only the tail after its mid-run snapshot: the
                                     # replay must start from that snapshot, not from a fresh container
-                                    base_snapshot=(json.loads((Path(bundled["bundles"]["hinted"]["dir"])
+                                    base_snapshot=(json.loads((Path(base["dir"])
                                                                / "bundle.json").read_text()).get("base_snapshot")
                                                    or {}).get("snapshot_id"))
         if not rec.get("snapshot_id"):
@@ -412,15 +426,26 @@ class Batch:
         for kind, b in bundled["bundles"].items():
             job = f"{self.job(row, 'fake-' + kind)}"
             cached = (cache.get("runs") or {}).get(kind) or {}
-            if cached.get("parity_ok") and Path(cached.get("first_request", "")).is_file():
+            if cached.get("admitted", cached.get("parity_ok")) and Path(cached.get("first_request", "")).is_file():
                 # the proof is only reusable while it was made against this exact bundle: a changed review set or cut
                 # changes the bundle identity, and the real launch checks identity equality against the fake run
                 from .bundle import cut_identity_diff, snapshot_cut_identity
                 ident = Path(cached["first_request"]).parent.parent.parent / "resume" / "bundle_identity.json"
                 theirs = (json.loads(ident.read_text()).get("cut") if ident.is_file() else None) or {}
                 if not cut_identity_diff(snapshot_cut_identity(Path(b["dir"])), theirs):
-                    out["runs"][kind] = {**cached, "cached": True}
-                    continue
+                    from .launch import frozen_first_request_digest
+                    try:
+                        frozen_first_request_digest(Path(cached["first_request"]), Path(b["dir"]), self.passthrough_args,
+                                                    self.route_options["allow_incomplete_evidence"],
+                                                    self.route_options["passthrough_script_sha256"])
+                    except (ValueError, SystemExit, FileNotFoundError):
+                        pass
+                    else:
+                        cached_report = json.loads(Path(cached["first_request"]).with_name("first_request_parity.json").read_text())
+                        self.state.update(task, parity_verdict=cached_report.get("verdict", "ok"),
+                                          allow_incomplete_evidence=cached_report.get("allow_incomplete_evidence", False))
+                        out["runs"][kind] = {**cached, "cached": True}
+                        continue
                 n = 2
                 while (self.runs_dir / f"{job}-v{n}" / "job.json").is_file():
                     n += 1
@@ -429,7 +454,7 @@ class Batch:
                             jobs_dir=self.jobs_dir, runs_dir=self.runs_dir, snapshot_state=snap_path, fake=True,
                             verifier=False, model=self.model, extra_env=self.agent_env,
                             original_trial_dir=self.source(row).get("trial_dir"),
-                            passthrough_args=self.passthrough_args, parity_gate="require",
+                            passthrough_args=self.passthrough_args, parity_gate="require", **self.route_options,
                             midrun_snapshot_every=0)
             trial = self.find_trial(job)
             if trial is None:
@@ -439,15 +464,19 @@ class Batch:
                 raise RuntimeError(f"fake run {job} wrote no proxy log")
             first = proxies[-1] / "first_request_rewritten.json"
             parity = proxies[-1] / "first_request_parity.json"
-            if not first.is_file() or not parity.is_file():
+            if not parity.is_file():
                 raise RuntimeError(f"fake run {job} missed {first.name}/{parity.name}")
-            ok = bool(json.loads(parity.read_text()).get("ok"))
+            report = json.loads(parity.read_text())
+            ok = bool(report.get("admitted", report.get("ok")))
             (ud / f"fake-parity-{kind}.json").write_text(parity.read_text())  # record for the batch, not for freezing
-            if not ok:
-                raise RuntimeError(f"fake parity failed for {kind}: {parity}")
+            self.state.update(task, allow_incomplete_evidence=self.route_options["allow_incomplete_evidence"],
+                              parity_verdict=report.get("verdict", "ok" if ok else "mismatch"))
+            if not ok or rc or not first.is_file():
+                raise RuntimeError(f"fake parity or job execution failed for {kind}: {parity}")
             # --freeze-first-request resolves the parity report and the bundle identity *next to* this file, so pass
             # the request where the fake run wrote it (inside the trial's resume-proxy log), never a copy.
-            out["runs"][kind] = {"job": job, "first_request": str(first), "parity_ok": True, "trial": str(trial),
+            out["runs"][kind] = {"job": job, "first_request": str(first), "parity_ok": bool(report.get("ok")), "admitted": ok,
+                                 "parity_verdict": report.get("verdict", "ok"), "trial": str(trial),
                                  "parity_report": str(parity)}
         (ud / "fake.json").write_text(json.dumps(out, indent=1))
         return out
@@ -494,7 +523,7 @@ class Batch:
                             snapshot_state=snap_path, fake=False, verifier=self.verifier, model=self.model,
                             upstream_url=self.upstream_url, extra_env=self.agent_env,
                             original_trial_dir=self.source(row).get("trial_dir"),
-                            passthrough_args=self.passthrough_args, parity_gate="require",
+                            passthrough_args=self.passthrough_args, parity_gate="require", **self.route_options,
                             freeze_first_request=item["freeze"],
                             midrun_snapshot_every=self.midrun_every if item["kind"] == "hinted" else 0)
             trials = [p.name for p in (self.jobs_dir / item["job"]).glob("*") if p.is_dir()] \
@@ -503,6 +532,8 @@ class Batch:
             runs[item["job"]] = {"run": item["run"], "kind": item["kind"], "job": item["job"],
                                  "trial": (trials[0] if trials else None), "rc": rc, "launched": _now()}
             self.state.update(task, runs=runs)
+            if rc:
+                raise RuntimeError(f"Harbor job {item['job']} exited {rc}")
             launched.append({**item, "rc": rc, "trial": trials[0] if trials else None})
         return launched
 
@@ -510,7 +541,8 @@ class Batch:
     def prep(self, row: dict[str, Any]) -> dict[str, Any]:
         task = row["task"]
         try:
-            self.state.update(task, stage="screen", group=row.get("group"))
+            self.state.update(task, stage="screen", group=row.get("group"), parity_verdict="pending",
+                              allow_incomplete_evidence=self.route_options["allow_incomplete_evidence"])
             scr = self.stage_screen(row)
             cut = int(scr["cut_line"])
             self.state.update(task, stage="bundles", cut_line=cut, screen_verdict=scr["verdict"],
@@ -636,7 +668,9 @@ class Batch:
                              "state": st.get("stage"), "cut_line": st.get("cut_line"), "error": st.get("error"),
                              "replay_policy": st.get("replay_policy"),
                              "divergent_commands": st.get("divergent_commands"),
-                             "divergences_by_kind": st.get("divergences_by_kind")})
+                             "divergences_by_kind": st.get("divergences_by_kind"),
+                             "allow_incomplete_evidence": st.get("allow_incomplete_evidence"),
+                             "parity_verdict": st.get("parity_verdict")})
         return rows
 
     def run_status(self, row: dict[str, Any], st: dict[str, Any], job: str, info: dict[str, Any]) -> dict[str, Any]:
@@ -647,6 +681,16 @@ class Batch:
                                "hint_counts": [], "n_compactions": 0, "class": None, "error": None,
                                "replay_policy": st.get("replay_policy"),
                                "divergent_commands": st.get("divergent_commands")}
+        out["allow_incomplete_evidence"] = st.get("allow_incomplete_evidence", False)
+        out["parity_verdict"] = "pending"
+        for parity in trial.glob("agent/resume-proxy/*/first_request_parity.json"):
+            try:
+                report = json.loads(parity.read_text())
+            except ValueError:
+                continue
+            out.update(allow_incomplete_evidence=report.get("allow_incomplete_evidence", False),
+                       parity_verdict=report.get("verdict", "ok" if report.get("ok") else "mismatch"),
+                       admitted=report.get("admitted", report.get("ok")))
         res_path = trial / "result.json"
         if not res_path.is_file():
             started = info.get("launched")
@@ -709,7 +753,8 @@ def failed_tests(trial: Path, limit: int = 12) -> list[str]:
 
 
 def print_status(rows: list[dict[str, Any]]) -> None:
-    cols = ("task", "run", "state", "reward", "cost_usd", "hint_counts", "n_compactions", "class", "error")
+    cols = ("task", "run", "state", "reward", "cost_usd", "hint_counts", "n_compactions",
+            "allow_incomplete_evidence", "parity_verdict", "class", "error")
     print("\t".join(cols + ("runaway",)))
     for r in rows:
         tail = "RUNAWAY" if r.get("runaway") else ""

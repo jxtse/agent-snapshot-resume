@@ -191,11 +191,18 @@ def check_files(bundle_dir: str | os.PathLike, request_path: str | os.PathLike,
     meta = json.loads((b / "bundle.json").read_text())
     spec = json.loads((b / "proxy_spec.json").read_text())
     exp = meta.get("orig_request_at_k")
+    if not exp and spec.get("wire"):
+        return {"ok": False, "verdict": "incomplete_evidence", "evidence_complete": False,
+                "content_problems": [], "error": meta.get("orig_request_locate_error") or "missing original request"}
     if not exp:
         return {"ok": False, "error": "bundle has no orig_request_at_k (original proxy log missing?)"}
     rq = json.loads(Path(request_path).read_text())
     body = rq.get("body", rq)
     from .proxy.resume_proxy import check_content, parity_hints, spec_hints
+    if spec.get("wire"):
+        from .proxy.native_wire import compare_native
+        return dict(compare_native(body, exp["content"], spec_hints(spec)), bundle=meta["run_id"],
+                    orig_index=exp.get("index"), locate_method=exp.get("method"))
     rep = compare_parity(body, exp, route_from_passthrough_args(passthrough_args), parity_hints(spec))
     if exp.get("content"):
         rep["content_problems"] = check_content(body, exp["content"], spec_hints(spec))

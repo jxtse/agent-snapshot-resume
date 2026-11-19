@@ -10,7 +10,7 @@ The agent talks to this proxy with a dummy key; the proxy:
     python passthrough_proxy.py --port 4013 --key-file <(printf '%s' "$KEY") --upstream https://api.example.com \
         --log-dir /logs/agent/model-proxy
 """
-import argparse, asyncio, json, logging, os, ssl, time
+import argparse, asyncio, hashlib, json, logging, os, ssl, time
 
 import aiohttp
 from aiohttp import web
@@ -87,6 +87,118 @@ class ThinkTap:
 
 
 
+class ResponsesReceipt:
+    """Read only the completed response ID. Bound memory per SSE event or JSON response."""
+    limit = 16 * 1024 * 1024
+
+    def __init__(self, sse):
+        self.sse = sse
+        self.buf = bytearray()
+        self.data = []
+        self.data_size = 0
+        self.invalid = False
+        self.entry_id = None
+        self.done = False
+
+    def observe(self, data):
+        obj = json.loads(data)
+        if self.sse:
+            if obj.get("type") in {"error", "response.failed", "response.incomplete"}:
+                self.invalid = True
+                return
+            if obj.get("type") != "response.completed":
+                return
+            obj = obj["response"]
+        if obj.get("status") == "completed" and isinstance(obj.get("id"), str) and obj["id"]:
+            if self.entry_id is not None:
+                self.invalid = True
+            self.entry_id = obj["id"]
+
+    def feed(self, chunk):
+        if self.invalid:
+            return
+        if not self.sse:
+            if len(self.buf) + len(chunk) > self.limit:
+                self.invalid = True
+            else:
+                self.buf.extend(chunk)
+            return
+        try:
+            lines = chunk.split(b"\n")
+            for i, line in enumerate(lines):
+                if len(self.buf) + len(line) + self.data_size > self.limit:
+                    self.invalid = True
+                    return
+                self.buf.extend(line)
+                if i == len(lines) - 1:
+                    break
+                line = bytes(self.buf).removesuffix(b"\r")
+                self.buf.clear()
+                if line.startswith(b"data:"):
+                    self.data.append(line[5:].lstrip(b" "))
+                    self.data_size += len(line) + 1
+                elif not line and self.data:
+                    event = b"\n".join(self.data)
+                    if event == b"[DONE]":
+                        self.done = True
+                    else:
+                        self.observe(event)
+                    self.data.clear()
+                    self.data_size = 0
+        except (ValueError, TypeError, AttributeError, KeyError):
+            self.invalid = True
+
+    def finish(self):
+        if not self.invalid and not self.sse:
+            try:
+                self.observe(self.buf)
+            except (ValueError, TypeError, AttributeError, KeyError):
+                return None
+        return None if self.invalid else self.entry_id
+
+
+class ChatReceipt(ResponsesReceipt):
+    """Require a single completion id, a finished choice, and a complete stream."""
+    def observe(self, data):
+        obj = json.loads(data)
+        rid = obj.get("id")
+        if self.done or obj.get("error") or not isinstance(rid, str) or not rid or self.entry_id not in (None, rid):
+            self.invalid = True
+            return
+        self.entry_id = rid
+        for choice in obj["choices"]:
+            if choice.get("index", 0) != 0:
+                self.invalid = True
+            if choice.get("finish_reason"):
+                self.finished = True
+
+    def finish(self):
+        rid = super().finish()
+        if getattr(self, "finished", False) and (not self.sse or self.done and not self.data and not self.buf.strip()):
+            return rid
+        return None
+
+
+def request_digests(body, wire="responses"):
+    # Installed proxy scripts live together; the package import also serves local callers.
+    try:
+        from agent_snapshot_resume.proxy.native_wire import body_reference
+    except ModuleNotFoundError:
+        from native_wire import body_reference
+    obj = json.loads(body)
+    ref = body_reference(wire, obj)
+    ref["raw_sha256"] = hashlib.sha256(body).hexdigest()
+    if wire == "chat":
+        return ref, None
+    ref["item_details"] = [
+        {**{k: item.get(k) if isinstance(item.get(k), str) else None for k in ("type", "role", "call_id")},
+         "sha256": sha}
+        for item, sha in zip(obj["input"], ref["items"])
+    ]
+    metadata = obj.get("client_metadata") or {}
+    return ref, metadata.get("thread_id") if isinstance(metadata, dict) else None
+
+
 def jlog(app, name, rec):
     with open(os.path.join(app["log_dir"], time.strftime(f"{name}-%Y%m%d.jsonl")), "a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -137,8 +249,25 @@ async def handle(request: web.Request) -> web.StreamResponse:
                                                for b in m["content"] if isinstance(b, dict) and b.get("type") == "thinking")}
         except (ValueError, AttributeError):
             pass
+    record_digests = (app.get("record_request_digests", False) and request.method == "POST"
+                      and request.path in {"/v1/responses", "/v1/chat/completions"})
+    if record_digests:
+        try:
+            ref, thread = request_digests(body, "chat" if request.path.endswith("/completions") else "responses")
+            header_thread = request.headers.get("thread-id")
+            session = thread or header_thread or request.headers.get("session-id")
+            meta.update(native_reference=ref, req_bytes=len(body))
+            if isinstance(session, str) and (not thread or not header_thread or thread == header_thread):
+                meta["session_id"] = session
+        except (ValueError, TypeError, AttributeError, KeyError):
+            meta["digest_error"] = "invalid native request"
     headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP | AUTH}
-    headers["x-api-key"] = app["key"]
+    if record_digests:
+        headers["accept-encoding"] = "identity"
+    if request.path in {"/v1/responses", "/v1/chat/completions"}:
+        headers["authorization"] = "Bearer " + app["key"]
+    else:
+        headers["x-api-key"] = app["key"]
     sess_hdr = {k: v for k, v in request.headers.items() if k.lower().startswith("x-claude-code") or k.lower() == "x-app"}
     t0 = time.time()
     rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "port": app["port"], "path": request.path, **meta, "session": sess_hdr, "dropped": dropped}
@@ -168,7 +297,7 @@ async def handle(request: web.Request) -> web.StreamResponse:
                     log.warning("transient 403, retry %d", retries)
                     await asyncio.sleep(10 * (attempt + 1))
                     continue
-                rec.update(status=403, latency_s=round(time.time() - t0, 1), err=txt[:300].decode(errors="replace"))
+                rec.update(status=403, latency_s=round(time.time() - t0, 1), err="upstream 403" if record_digests else txt[:300].decode(errors="replace"))
                 jlog(app, "requests", rec)
                 return web.Response(status=403, body=txt, headers={k: v for k, v in up.headers.items()
                                                                    if k.lower() not in HOP | {"content-encoding"}})
@@ -179,13 +308,19 @@ async def handle(request: web.Request) -> web.StreamResponse:
             enc = (up.headers.get("content-encoding") or "identity").lower()
             tap = ThinkTap("event-stream" in (up.headers.get("content-type") or "")) \
                 if request.path == "/v1/messages" and up.status == 200 and enc == "identity" else None
-            errbuf = b"" if up.status != 200 else None
+            receipt_type = ChatReceipt if request.path.endswith("/completions") else ResponsesReceipt
+            receipt = (receipt_type("event-stream" in up.headers.get("content-type", ""))
+                       if record_digests and "native_reference" in rec and enc == "identity" and up.status == 200
+                       else None)
+            errbuf = b"" if up.status != 200 and not record_digests else None
             await resp.prepare(request)
             ttfb = None
             try:
                 async for chunk in up.content.iter_any():
                     if ttfb is None:
                         ttfb = round(time.time() - t0, 1)
+                    if receipt is not None:
+                        receipt.feed(chunk)
                     if tap is not None:
                         try:
                             tap.feed(chunk)
@@ -194,7 +329,14 @@ async def handle(request: web.Request) -> web.StreamResponse:
                     if errbuf is not None and len(errbuf) < 600:
                         errbuf += chunk
                     await resp.write(chunk)
-                await resp.write_eof()
+                # The receipt describes what the upstream sent, so close it before the client-side EOF: a client
+                # that hangs up after the final event (Pi does) must not lose the binding.
+                if receipt is not None:
+                    rec["response_id" if isinstance(receipt, ChatReceipt) else "entry_id"] = receipt.finish()
+                try:
+                    await resp.write_eof()
+                except (ConnectionResetError, aiohttp.ClientConnectionResetError):
+                    rec["client_closed_before_eof"] = True
             finally:
                 rec.update(status=up.status, latency_s=round(time.time() - t0, 1), ttfb_s=ttfb, dispatch_retries=retries,
                            connect_retries=connect_retries)
@@ -258,6 +400,8 @@ def build_parser():
     ap.add_argument("--cafile", default=None, help="CA bundle (default: system store)")
     ap.add_argument("--log-dir", required=True)
     ap.add_argument("--no-thinking-text", action="store_true", help="log thinking sizes only, not text")
+    ap.add_argument("--record-request-digests", action="store_true",
+                    help="record ordered Responses item and envelope hashes, joined by completed response ID")
     ap.add_argument("--drop-fields", default="", help="comma-separated top-level body keys to strip")
     ap.add_argument("--strip-is-error", action="store_true")
     ap.add_argument("--strip-thinking", action="store_true")
@@ -270,6 +414,7 @@ def main():
     os.makedirs(a.log_dir, exist_ok=True)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     app = web.Application(client_max_size=256 * 1024 * 1024)
+    app["record_request_digests"] = a.record_request_digests
     app["key"] = read_key(a.key_file)
     app["strip_is_error"], app["strip_thinking"] = a.strip_is_error, a.strip_thinking
     app["drop_fields"] = [x for x in a.drop_fields.split(",") if x]

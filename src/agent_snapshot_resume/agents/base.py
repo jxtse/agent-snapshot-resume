@@ -44,6 +44,9 @@ class AgentAdapter(ABC):
     # {"continue_text": ..., "synthetic_assistant_text": ...}; written into proxy_spec.json
     resume_artifacts: dict[str, str] = {}
 
+    def bundle_artifacts(self, cwd, original=None):
+        return dict(self.resume_artifacts)
+
     @abstractmethod
     def find_session(self, trial_dir: Path) -> Path:
         """Path of the agent's native session file in a Harbor trial dir."""
@@ -146,6 +149,20 @@ class SnapshotResumeAgentMixin:
         if spec.get("model"):
             raise ValueError("proxy-side model override is not supported; set the agent model in the job config")
         gate = getattr(self.options, "parity_gate", "auto") or "auto"
+        allow = getattr(self.options, "allow_incomplete_evidence", False)
+        if allow and gate != "require":
+            raise ValueError("allow_incomplete_evidence requires parity_gate=require")
+        checksum = getattr(self.options, "passthrough_script_sha256", None)
+        script = runtime.verified_script(getattr(self.options, "passthrough_script", None), checksum)
+        if script:
+            remote = f"{runtime.PROXY_DIR}/src/{runtime.script_name(checksum)}"
+            await environment.upload_file(script, remote)
+            command = (f"chown root:root {remote} && chmod 0444 {remote} && cd {runtime.PROXY_DIR}/src && "
+                       f"echo '{checksum}  {runtime.script_name(checksum)}' | sha256sum -c -")
+            check = await self.exec_as_root(environment, command=command)
+            if getattr(check, "return_code", 0):
+                raise RuntimeError("sandbox passthrough script SHA-256 mismatch")
+        spec.update(allow_incomplete_evidence=allow, passthrough_script_sha256=checksum)
         from ..bundle import bundle_identity
         (logs / "bundle_identity.json").write_text(json.dumps(bundle_identity(bundle), ensure_ascii=False, indent=1))
         if gate == "require" and not self.options.upstream_fake:
@@ -158,7 +175,7 @@ class SnapshotResumeAgentMixin:
                                    "(asr launch --freeze-first-request)")
             try:
                 digest = frozen_first_request_digest(Path(src), bundle,
-                                                     getattr(self.options, "passthrough_args", None) or [])
+                                                     getattr(self.options, "passthrough_args", None) or [], allow, checksum)
             except SystemExit as exc:
                 raise RuntimeError(str(exc)) from None
             if getattr(self.options, "expected_first_request_sha256", None) not in (None, digest):
@@ -195,10 +212,11 @@ class SnapshotResumeAgentMixin:
             # and from there into the proxy over a pipe. See proxy/runtime.py.
             extra = runtime.validate_passthrough_args(getattr(self.options, "passthrough_args", None) or [])
             await self.exec_as_root(environment, command=runtime.passthrough_start_command(
-                url, self.PASSTHROUGH_PORT, extra=" ".join(shlex.quote(x) for x in extra)),
+                url, self.PASSTHROUGH_PORT, extra=" ".join(shlex.quote(x) for x in extra), script_sha256=checksum),
                 env={runtime.KEY_ENV_IN_SANDBOX: key})
         resume_proxy = Path(runtime.HERE / "resume_proxy.py")
         await self.exec_as_root(environment, command=f"mkdir -p {runtime.PROXY_DIR}/resume/specs")
+        await environment.upload_file(runtime.HERE / "native_wire.py", f"{runtime.PROXY_DIR}/resume/native_wire.py")
         await environment.upload_file(resume_proxy, f"{runtime.PROXY_DIR}/resume/resume_proxy.py")
         await environment.upload_file(logs / "proxy_spec.json", f"{runtime.PROXY_DIR}/resume/specs/{meta['run_id']}.json")
         await self.exec_as_root(environment, command=runtime.resume_start_command(self.RESUME_PORT))

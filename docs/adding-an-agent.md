@@ -19,6 +19,72 @@ Use `agents/claude_code.py` as the reference implementation.
 | Is there an official release artifact with a published sha256? | yes, `downloads.claude.ai/claude-code-releases/<v>/manifest.json` |
 | Does a newer version change the tools or system prompt when resuming an old session? | yes, so the version must be pinned |
 
+### Native CLI answers
+
+| Question | Codex CLI 0.154.0 | Pi 1.4.0 |
+|---|---|---|
+| Session | Harbor exports `agent/sessions/YYYY/MM/DD/rollout-*.jsonl`. A response may contain reasoning, commentary and multiple parallel calls. The token-count event closes that API step. | `agent/pi/sessions/*.jsonl`, v3 tree. Walk parent IDs back from the last entry. Each assistant message is one model response. |
+| Command | `codex exec resume --json --skip-git-repo-check <session-id> <sentinel>` with a private `CODEX_HOME` containing the dated tree. Six recorded HTTP requests exercised this command. | `pi --session <seed.jsonl> --provider <provider> --model <id> --mode json --print -- <sentinel>`. Harbor also offers `--continue` for the most recent session. |
+| Resume additions | The stock CLI inserts a developer message containing skills and permissions, a user environment message, then the sentinel. The proxy validates their adjacency, exact content templates and expected runtime paths. It rejects unrecognized templates. | A single user sentinel message in the two measured requests. The native seed restores the system checkpoint, previous calls and tool results. |
+| Wire | OpenAI Responses, POST `/v1/responses`. Set the named provider's `base_url` and `wire_api = "responses"` in `config.toml`. | Tested with `models.json` provider API `openai-completions`, POST `/v1/chat/completions`. The API is recorded on assistant entries. Other Pi providers need their own validation. |
+| Cut and auxiliary state | Keep through the preceding calls, outputs, token accounting and any explicit `compacted.replacement_history`. Exclude the new assistant's mirrored completion events. Bundle the required model catalog from `agent/model-catalog.json` or the local `.cache/deepseek-models.json`. The adapter verifies its pinned SHA-256 at build and resume, then seeds `model-catalog.json` and selects it via `model_catalog_json`. A unified-exec session ID refers to process state. | Truncate immediately after the target assistant's parent. A compaction entry includes the summary and first retained entry. Built-in fixture tools need only the session, matching cwd and matching provider/tool flags. Branches with abandoned side effects require separate workspace evidence. |
+| Replay mapping | Shell and foreground unified exec → Bash. Custom apply_patch → Bash invoking the pinned native patch engine. A completed command followed solely by empty polls replays once with its combined output. Interactive stdin, interleaved processes and a still-live process at the cut block strict replay. | read → Read, bash → Bash, write → Write, edit → Edit or simultaneous MultiEdit. Unknown tools remain visible in the plan. |
+| Installation pin | Linux x64 npm platform archive SHA-256. The local Darwin probe requires both npm archives and verifies each against its registry SHA-512. | SHA-256 over the distributed paths and contents of the installed 1.4.0 package, checked before npm installs it. The Linux installer verifies Node 22.23.4 by archive SHA-256. npm resolves transitive dependencies during installation. |
+| Evidence at the cut | Original digests bind to session and completed response ID. For older logs, unique usage binds to metadata and the rollout supplies the projected input. For `deepseek-flash`, the catalog sets 10,000 tokens. Codex 0.154.0 grants 120% for history, estimates four UTF-8 bytes per token and retains up to 24,000 bytes at each end of an oversized string. An equal partial reference gives `incomplete_evidence`. A known difference gives `mismatch`. The strict default requires complete evidence. The limited historical exception is described below. | The baseline recorder joins completed upstream response IDs to native assistant entries, binding raw-body SHA-256, per-message and per-field digests. Two native resumes matched the actual forwarded bytes. |
+
+### Native batch runs
+
+A control-only manifest needs the columns `task,cut_line,source_dir`. Use the adapter name in both phases.
+
+```sh
+asr batch prep --name demo --agent pi --manifest manifest.csv --tasks-dir tasks --hinted-reps 0 --control-reps 1
+asr batch launch --name demo --agent pi --manifest manifest.csv --tasks-dir tasks --hinted-reps 0 --control-reps 1
+asr batch status --name demo --agent pi --manifest manifest.csv --json
+```
+
+For a fresh Pi trial, use Harbor agent import path `agent_snapshot_resume.agents.pi:PiBaseline`,
+agent kwarg `version=1.4.0` and model name `asr-reasoning/<model-id>`. This provider enables
+DeepSeek-compatible thinking, requests maximum effort and preserves assistant reasoning content.
+Harbor applies the task timeout. Configure the upstream origin and credential in the Harbor host
+environment and grant the model host through Harbor's agent-phase allowlist. One completed Chat
+response ID must match exactly one assistant's `responseId`. Truncated streams cannot supply receipts.
+Use the resulting trial directory as the manifest source.
+
+For Codex, pass `--agent codex`. A custom translator takes `--passthrough-script PATH` and
+`--passthrough-script-sha256 SHA256` on launch or batch. The required script CLI accepts
+`--host --port --key-file --upstream --cafile --log-dir --proxy` and serves `/_health`.
+The proxy passes an empty outbound proxy setting and supplies the credential through a pipe.
+The host and guest verify the script before it runs. Use the identical script and options for both phases.
+
+`--allow-incomplete-evidence` with `--parity-gate require` (implicit in batch) admits only a
+fully matched historical rollout prefix whose sole documented gap is the original request envelope.
+When historical translation metrics exist, the pinned script must also expose
+`build_chat_request(body) -> (payload, auxiliary, metrics)`. The gate verifies each recorded metric.
+The report retains `verdict=incomplete_evidence`, `ok=false` and `admitted=true`.
+The real run repeats the check and must match its fake run's frozen digest. For a translator that
+demonstrably drops `client_metadata`, that digest binds the remaining Responses fields and the entire
+translated payload. The capture retains the full Responses body and its digest.
+
+The Pi exporter can record the CLI version in `agent/pi/version.txt` or Harbor's
+`result.json.agent_info.version`. For either native adapter, a recorder can write
+`agent/model-proxy/native-reference.jsonl` with one object per original response.
+Use `session_id`, `entry_id` (Pi entry ID or Codex response ID), and `content` from
+`proxy.native_wire.body_reference(wire, original_body)`. Add `raw_sha256` to
+`content` for a byte-level check on the compact JSON sent by the proxy. These
+records contain digests. Capture each original body before generating its response,
+bind it to the entry created by that response, and reject ambiguous joins.
+See [the scripted Pi upstream and recorder](../examples/offline/pi_probe.py).
+
+For original Codex runs, enable `--record-request-digests` on the Responses
+passthrough proxy. The default leaves digest capture off. Each opted-in request
+writes ordered item hashes and their type, role and call ID where present, all
+top-level field hashes (including tools and instructions), and the raw-body SHA-256
+to `agent/model-proxy/requests-YYYYMMDD.jsonl`. The recorder joins only successful,
+completed responses with an identifiable thread. It supports JSON and streamed
+Responses events. A complete reference also checks generated IDs, client metadata
+and compact serialized bytes. Fresh IDs or different envelope fields can therefore
+produce a genuine mismatch. Earlier count-only logs cannot provide these hashes.
+
 If the agent cannot resume a session non-interactively, this approach does not work for it without patching the
 agent.
 
@@ -111,15 +177,16 @@ class CodexSnapshotResume(SnapshotResumeAgentMixin, <HarborAgent>):
 
 ### Wire API
 
-The resume proxy rewrites Anthropic `/v1/messages` bodies (`messages[].content[]` blocks) and forwards everything
-else unchanged. The passthrough proxy works for any HTTP API, because it only swaps the auth header and streams the
-body.
+Existing specs default to Anthropic Messages. Native specs select `responses` or `chat`
+in `proxy_spec.json.wire`. The handler requires the matching endpoint and an exact
+sentinel user turn in the first request. A hint replaces that turn at its original
+position. Every other request field participates in a full captured-body comparison.
+The passthrough uses Bearer authentication on the two OpenAI endpoints.
 
-An agent that uses another API, such as OpenAI Responses or Chat Completions, needs one of these:
-
-- an upstream that serves Anthropic `/v1/messages`, with the agent configured to use it; or
-- a `rewrite()` variant for that API's message shape. Add it under `proxy/`, select it from `proxy_spec.json`, and
-  keep the rule the same: remove only the exact resume artifacts and the sentinel turn, and change nothing else.
+The legacy chained-hint and rendered-attachment logic applies to Claude Code.
+For native `asr equiv`, pass the bundle's exact `session_trunc.jsonl` and
+`cut_line`; the prefix hash binds the reference to those bytes. The offline CLI
+probes exercise the real renderers. They do not rely on a simulated request template.
 
 ## 4. Prove it
 
@@ -130,3 +197,8 @@ An agent that uses another API, such as OpenAI Responses or Chat Completions, ne
 3. Compare the raw first request with a request from a fresh run of the same version to find any other resume-time
    injections. Add them to `resume_artifacts` (and to the rewrite if they are structural).
 4. Add the adapter to `ADAPTERS` and a row to the README.
+
+The Codex adapter reads the selected turn's sandbox policy. A recorded unrestricted guest
+with approval policy `never` and a disabled inner permission profile resumes with that
+same policy inside the task sandbox. The proxy verifies the exact pinned CLI context for
+that mode. A bundle whose seed records different permissions must be rebuilt.

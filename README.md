@@ -16,8 +16,14 @@ lets the agent continue:
 Typical uses: re-run a failure from the step where it went wrong, test whether a hint at step *k* fixes it,
 sample several continuations of the same prefix, or collect on-policy continuations for training data.
 
-Claude Code is the only adapter so far. Agent-specific code is in one module (`agents/claude_code.py`); a new agent,
-for example Codex, needs one more module of the same shape ([docs/adding-an-agent.md](docs/adding-an-agent.md)).
+The adapter registry supports Claude Code, Codex CLI rollouts, and Pi session trees. Pi 1.4.0 has
+offline first-request parity evidence for the four built-in tools with an OpenAI-compatible Chat Completions
+provider. Historical Codex 0.154.0 bundles support cut construction and partial context checks. The
+strict gate requires the original envelope. A matched historical cut can explicitly opt into
+incomplete evidence. Start a fresh Pi trial with Harbor's `agent_snapshot_resume.agents.pi:PiBaseline`
+to record complete request digests. For a single control continuation, use `asr batch prep` and
+`asr batch launch` with `--agent pi` or `--agent codex`, `--hinted-reps 0` and `--control-reps 1`.
+Provider setup, translator pins and gate verdicts are documented in [Adding an agent](docs/adding-an-agent.md#native-batch-runs).
 
 The sandbox side targets **E2B-compatible services**. It was built and tested on Alibaba Cloud Function Compute
 (FC) sandboxes, which support snapshots. Jobs run under [Harbor](https://github.com/laude-institute/harbor)
@@ -422,7 +428,7 @@ src/agent_snapshot_resume/
   equiv.py               context-equivalence checker
   config.py              env-var configuration
   trace/                 trajectory IR (ir.py, agent-agnostic) + per-agent parsers (claude_code.py)
-  agents/                adapter interface (base.py) + Claude Code adapter
+  agents/                adapter interface, native-session helpers, and harness modules
   sandbox/               FC env, snapshot clone env, command recovery, templates, source prep, management
   replay/                stdlib-only in-sandbox replayer, replay gate, fingerprint
   proxy/                 resume rewrite proxy, key passthrough proxy, runtime install/start snippets
