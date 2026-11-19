@@ -89,6 +89,45 @@ class State:
             return u
 
 
+def native_compactions(trial):
+    """Count persisted post-seed events, including split summaries stored as one Pi entry."""
+    from .agents import get_adapter
+    try:
+        meta = json.loads((trial / "agent/resume/bundle.json").read_bytes())
+        adapter = get_adapter(meta["agent"])
+        path = trial / "agent" / adapter.session_relative_path(meta)
+        seed = hashlib.sha256()
+        with path.open("rb") as stream:
+            for _ in range(meta["cut_line"]):
+                seed.update(next(stream))
+            if seed.hexdigest() != meta["prefix_sha256"]:
+                return None
+            event = "compaction" if meta["agent"] == "pi" else "compacted"
+            return sum(json.loads(line).get("type") == event for line in stream)
+    except (ValueError, OSError, KeyError, StopIteration, AttributeError, TypeError):
+        return None
+
+
+def native_metrics(trial, records):
+    """A summary request can finish without Pi persisting a compaction entry."""
+    metrics = dict(n_compactions=native_compactions(trial), n_compaction_requests=None,
+                   hint_counts=None, hint_counts_last=None)
+    if records is None:
+        return metrics
+    main = [r for r in records if r.get("n") is not None]
+    metrics["n_requests"] = len(main)
+    if main and all("compaction_request" in r and r.get("wire") == "chat" for r in main):
+        metrics["n_compaction_requests"] = sum(bool(r["compaction_request"]) for r in main)
+    if main:
+        for key, entry in (("hint_counts", main[0]), ("hint_counts_last", main[-1])):
+            counts = [h["blocks"] for h in entry.get("hint_chain", [])]
+            if counts:
+                metrics[key] = counts
+            elif entry.get("hint_blocks") is not None:
+                metrics[key] = [entry["hint_blocks"]]
+    return metrics
+
+
 class Batch:
     def __init__(self, *, name: str, work_dir: Path, manifest: Path | None, tasks_dir: Path, jobs_dir: Path,
                  runs_dir: Path, state_dir: Path, agent_env: dict[str, str] | None = None,
@@ -175,7 +214,7 @@ class Batch:
         task = row["task"]
         ud = self.unit_dir(task)
         out = ud / "screen.json"
-        if out.is_file():
+        if out.is_file() and not getattr(self.adapter, "wire", None):
             rep = json.loads(out.read_text())
             # a report made under another replay policy is not reusable: the policy decides which risks block a cut
             if rep.get("manifest_cut") == row["cut_line"] and rep.get("policy") == self.replay_policy:
@@ -220,10 +259,12 @@ class Batch:
                                f"line {base_line}: no cut can replay the tail from that image")
         by_cut: dict[int, dict[str, Any]] = {}
         skipped: list[dict[str, Any]] = []
+        evidence_policy = ({"allow_incomplete_evidence": self.route_options["allow_incomplete_evidence"]}
+                           if getattr(self.adapter, "wire", None) else {})
         for c in cands[:self.max_cut_candidates]:
             try:
                 rep = screen.screen_trial(self.adapter, trial_dir, cut_lines=[c], task_dir=self.task_dir(row), ir=ir,
-                                          policy=self.replay_policy)
+                                          policy=self.replay_policy, **evidence_policy)
             except (SystemExit, ValueError) as exc:  # e.g. a step at index 0 has no prefix to replay
                 skipped.append({"cut_line": c, "error": str(exc)[:200]})
                 continue
@@ -294,7 +335,17 @@ class Batch:
                                 chain_spec.get("prior_hints") or []).encode()).hexdigest()} if chain_spec else None}
         if getattr(self.adapter, "wire", None):
             # Older native bundles can omit Pi file effects or use the initial Codex cwd at the cut.
-            inputs["native_bundle_revision"] = 2
+            inputs["native_bundle_revision"] = 3
+            if hasattr(self.adapter, "native_reference"):
+                timeout = bundle_mod.resolve_agent_timeout(trial_dir, task_dir=self.task_dir(row))
+                ir = self.adapter.load_trace(trial_dir, agent_timeout_s=timeout)
+                raw = (trial_dir / ir["sources"]["session_jsonl"]).read_text().splitlines()
+                trim = lambda i: self.adapter.cut_line(raw, ir, i)
+                sid = bundle_mod.step_for_cut_line(ir, cut, trim)
+                k = bundle_mod.trace_ir.step_index(ir, sid)
+                ref, error = self.adapter.native_reference(trial_dir, ir, k, raw[:trim(k)])
+                evidence = json.dumps([ref, error, ir["steps"][k]["elapsed_s"]], sort_keys=True).encode()
+                inputs["cut_request_sha256"] = hashlib.sha256(evidence).hexdigest()
         if self.agent_name == "codex":
             inputs["sandbox_policy_source"] = "turn_context"
         cached = {}
@@ -694,6 +745,16 @@ class Batch:
                                "hint_counts": [], "n_compactions": 0, "class": None, "error": None,
                                "replay_policy": st.get("replay_policy"),
                                "divergent_commands": st.get("divergent_commands")}
+        reqs = sorted((trial / "agent" / "resume-proxy").glob("*/requests.jsonl"))
+        records = None
+        if reqs:
+            try:
+                records = [json.loads(line) for line in reqs[-1].read_text().splitlines() if line.strip()]
+            except (OSError, ValueError):
+                pass  # the writer may still be appending the current request
+        native = self.agent_name in {"pi", "codex"} or any(r.get("wire") for r in records or [])
+        if native:
+            out.update(native_metrics(trial, records))
         out["allow_incomplete_evidence"] = st.get("allow_incomplete_evidence", False)
         out["parity_verdict"] = "pending"
         for parity in trial.glob("agent/resume-proxy/*/first_request_parity.json"):
@@ -725,10 +786,8 @@ class Batch:
             out["class"] = "infra" if any(k in str(exc).lower() for k in
                                           ("sandbox", "snapshot", "connect", "timeout connecting", "http")) else "model"
         out["failed_tests"] = failed_tests(trial)
-        reqs = sorted((trial / "agent" / "resume-proxy").glob("*/requests.jsonl"))
-        if reqs:
-            recs = [json.loads(l) for l in reqs[-1].read_text().splitlines() if l.strip()]
-            main = [r for r in recs if r.get("n") is not None]
+        if records is not None and not native:
+            main = [r for r in records if r.get("n") is not None]
             out["n_requests"] = len(main)
             out["n_compactions"] = sum(1 for r in main if r.get("compact_summary"))
             if main:

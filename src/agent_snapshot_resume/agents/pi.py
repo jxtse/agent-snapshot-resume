@@ -182,6 +182,13 @@ class PiAdapter(NativeAdapter):
                         raise ValueError("unsupported or inconsistent Pi full output path")
                     if log:
                         call["args"]["pi_output_file"] = log
+                        details = msg.get("details") or {}
+                        truncation = details.get("truncation") or {}
+                        expected = {key: truncation[key] for key in ("totalBytes", "totalLines") if key in truncation}
+                        if details.get("fullOutputSha256"):
+                            expected["sha256"] = details["fullOutputSha256"]
+                        if expected:
+                            call["args"]["pi_historical_output"] = expected
                         call["side_effect"] = "exec"
                     timeout = re.search(r"(?:^|\n\n)Command timed out after (\d+(?:\.\d+)?) seconds\s*\Z", text)
                     if call["is_error"] and timeout:
@@ -249,7 +256,7 @@ class PiAdapter(NativeAdapter):
                                 and row.get("path") == "/v1/chat/completions"):
                             matches.append(row.get("native_reference") or {})
         if (len(matches) == 1 and matches[0].get("wire") == self.wire and matches[0].get("complete") is True
-                and matches[0].get("raw_sha256")):
+                and matches[0].get("raw_sha256") and not matches[0].get("pi_compaction_request")):
             return dict(content=matches[0], method="captured-response-id", index=k), None
         return None, "no unique complete receipt for this Pi response"
 

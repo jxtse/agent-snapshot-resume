@@ -182,13 +182,16 @@ class ChatReceipt(ResponsesReceipt):
 def request_digests(body, wire="responses"):
     # Installed proxy scripts live together; the package import also serves local callers.
     try:
-        from agent_snapshot_resume.proxy.native_wire import body_reference
+        from agent_snapshot_resume.proxy.native_wire import body_reference, pi_summary_parts
     except ModuleNotFoundError:
-        from native_wire import body_reference
+        from native_wire import body_reference, pi_summary_parts
     obj = json.loads(body)
     ref = body_reference(wire, obj)
     ref["raw_sha256"] = hashlib.sha256(body).hexdigest()
     if wire == "chat":
+        parts = pi_summary_parts(obj)
+        if parts:
+            ref["pi_compaction_request"] = parts[3]
         return ref, None
     ref["item_details"] = [
         {**{k: item.get(k) if isinstance(item.get(k), str) else None for k in ("type", "role", "call_id")},

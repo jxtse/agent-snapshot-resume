@@ -103,7 +103,7 @@ def original_timeout(text):
     return int(match[1]) * 60 + int(match[2]) if match else None
 
 
-def run_bash(cmd, cwd, timeout, merge_stderr=False, termination_code=None, shell_env=None, pi_output_file=None):
+def run_bash(cmd, cwd, timeout, merge_stderr=False, termination_code=None, shell_env=None, pi_output_file=None, pi_bash=False, pi_user=None):
     """merge_stderr: one capture file for both streams, in write order (how Claude Code captures a background task's
     output file); stderr is then empty."""
     t0 = time.time()
@@ -114,7 +114,8 @@ def run_bash(cmd, cwd, timeout, merge_stderr=False, termination_code=None, shell
     # Do not rewrite shell syntax: redirects, heredocs, pipelines and $! retain their semantics.
     import tempfile
     with tempfile.TemporaryFile() as out_file, tempfile.TemporaryFile() as err_file:
-        p = subprocess.Popen(["bash", "-lc", cmd], env=dict(os.environ, **(shell_env or {})),
+        shell = ["/bin/bash", "-c"] if pi_bash else ["bash", "-lc"]
+        p = subprocess.Popen([*shell, cmd], env=dict(os.environ, **(shell_env or {})),
                              cwd=cwd if cwd and os.path.isdir(cwd) else None,
                              stdin=subprocess.DEVNULL, stdout=out_file,
                              stderr=out_file if merge_stderr else err_file, start_new_session=True)
@@ -137,7 +138,7 @@ def run_bash(cmd, cwd, timeout, merge_stderr=False, termination_code=None, shell
             return os.pread(f.fileno(), os.fstat(f.fileno()).st_size, 0).decode(errors="replace")
         proof = {}
         if pi_output_file:
-            proof = restore_pi_log(pi_output_file, out_file)
+            proof = restore_pi_log(pi_output_file, out_file, pi_user)
         rc = termination_code if timed_out else (128 - p.returncode if p.returncode < 0 else p.returncode)
         return {**proof, "rc": rc, "stdout": read_capture(out_file), "stderr": "" if merge_stderr else read_capture(err_file),
                 "dur": round(time.time() - t0, 2), "timeout": timed_out and termination_code is None,
@@ -254,11 +255,14 @@ def pi_log_path(orig):
     return match[1] if match else None
 
 
-def restore_pi_log(recorded, capture):
+def restore_pi_log(recorded, capture, user=None):
+    import pwd
     import tempfile
     if not re.fullmatch(r"/tmp/pi-bash-[0-9a-f]+\.log", recorded):
         raise ValueError("invalid Pi output path")
     target = os.path.join(PI_LOG_DIR, os.path.basename(recorded))
+    owner = pwd.getpwuid(os.geteuid()) if user is None else (
+        pwd.getpwuid(int(user)) if str(user).isdecimal() else pwd.getpwnam(user))
     digest = hashlib.sha256()
     with tempfile.NamedTemporaryFile(dir=PI_LOG_DIR, delete=False) as part:
         try:
@@ -272,17 +276,24 @@ def restore_pi_log(recorded, capture):
                 part.write(chunk)
                 offset += len(chunk)
             part.flush()
+            if os.geteuid() != owner.pw_uid or os.fstat(part.fileno()).st_gid != owner.pw_gid:
+                os.fchown(part.fileno(), owner.pw_uid, owner.pw_gid)
+            os.fchmod(part.fileno(), 0o600)
             os.replace(part.name, target)
         finally:
             if os.path.exists(part.name):
                 os.unlink(part.name)
-    checked = hashlib.sha256()
-    with open(target, "rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            checked.update(chunk)
-    if checked.digest() != digest.digest():
+    def assume_owner():
+        os.initgroups(owner.pw_name, owner.pw_gid)
+        os.setgid(owner.pw_gid)
+        os.setuid(owner.pw_uid)
+    # The digest is read by the account which will actually open this private file.
+    check = subprocess.run(["shasum", "-a", "256", target] if sys.platform == "darwin" else
+                           ["sha256sum", target], check=True, stdout=subprocess.PIPE,
+                           preexec_fn=assume_owner if os.geteuid() != owner.pw_uid else None)
+    if check.stdout.split()[0].decode() != digest.hexdigest():
         raise IOError("Pi output readback mismatch")
-    return {"pi_output_file": recorded, "pi_output_sha256": digest.hexdigest()}
+    return {"pi_output_file": recorded, "pi_output_sha256": digest.hexdigest(), "pi_output_reader_uid": owner.pw_uid}
 
 
 def pi_truncated_view(orig, new):
@@ -376,20 +387,69 @@ def edit_original_spans(path, edits, originally_failed):
     def lf(text):
         return text.replace("\r\n", "\n").replace("\r", "\n")
     source = lf(source)
+    import unicodedata
+    def fuzzy(text):
+        text = unicodedata.normalize("NFKC", text)
+        text = "\n".join(line.rstrip("\u0009\u000b\u000c\r \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff") for line in text.split("\n"))
+        for chars, plain in (("‘’‚‛", "'"), ("“”„‟", '"'), ("‐‑‒–—―−", "-")):
+            text = text.translate(dict.fromkeys(map(ord, chars), plain))
+        return text
+    original = source
+    fuzzy_original = fuzzy(source)
+    use_fuzzy = any(lf(edit["old_string"]) not in source for edit in edits)
+    if use_fuzzy:
+        source = fuzzy_original
     spans = []
     for edit in edits:
         old = lf(edit["old_string"])
+        if use_fuzzy and old not in source:
+            old = fuzzy(old)
         start = source.find(old)
-        if not old or start == -1 or source.find(old, start+1) != -1:
+        # Pi counts occurrences in normalized space even when the first match was exact.
+        needle = fuzzy(old)
+        if not needle or start == -1 or fuzzy_original.count(needle) != 1:
             return "edit_failed", "error_reproduced" if originally_failed else "edit_target_missing"
         spans.append((start, start+len(old), lf(edit["new_string"])))
     spans.sort()
     if any(a[1] > b[0] for a, b in zip(spans, spans[1:])):
         return "edit_failed", "error_reproduced" if originally_failed else "edit_ambiguous"
+    def replace_ranges(text, replacements, offset=0):
+        chunks = []
+        pos = 0
+        for start, end, replacement in replacements:
+            chunks.extend((text[pos:start-offset], replacement))
+            pos = end - offset
+        return "".join([*chunks, text[pos:]])
+
+    if use_fuzzy:
+        # Pi normalizes an entire touched line, preserving original bytes on all other lines.
+        from bisect import bisect_left, bisect_right
+        from itertools import accumulate
+        original_lines = re.findall(r"[^\n]*\n|[^\n]+$", original)
+        normalized_lines = re.findall(r"[^\n]*\n|[^\n]+$", source)
+        offsets = list(accumulate(map(len, normalized_lines), initial=0))
+        groups = []
+        for span in spans:
+            first = bisect_right(offsets, span[0]) - 1
+            stop = bisect_left(offsets, span[1])
+            if groups and first < groups[-1][1]:
+                groups[-1][1] = max(stop, groups[-1][1])
+                groups[-1][2].append(span)
+            else:
+                groups.append([first, stop, [span]])
+        chunks = []
+        pos = 0
+        for first, stop, edits_in_group in groups:
+            chunks.extend(original_lines[pos:first])
+            chunks.append(replace_ranges(source[offsets[first]:offsets[stop]], edits_in_group, offsets[first]))
+            pos = stop
+        source = "".join(chunks + original_lines[pos:])
+    else:
+        source = replace_ranges(source, spans)
+    if source == original:
+        return "edit_failed", "error_reproduced" if originally_failed else "edit_no_change"
     if originally_failed:
         return "skipped_orig_error", "orig_error_now_applicable"
-    for start, end, replacement in reversed(spans):
-        source = source[:start] + replacement + source[end:]
     payload = (bom + (source.replace("\n", "\r\n") if crlf else source)).encode()
     with open(path, "wb") as stream:
         stream.write(payload)
@@ -404,6 +464,7 @@ def main():
     cap = 1800
     if "--exec-cap" in sys.argv:
         cap = int(sys.argv[sys.argv.index("--exec-cap") + 1])
+    pi_user = sys.argv[sys.argv.index("--pi-user") + 1] if "--pi-user" in sys.argv else None
     dry = "--dry" in sys.argv
     with open(plan_p) as f:
         plan = json.load(f)
@@ -512,10 +573,11 @@ def main():
                     if a.get("bg_inflight_at_snapshot"):
                         rec["snapshot_background_groups_stopped"] = stop_snapshot_background(a)
                         rec["background_resume"] = "rerun_from_snapshot"
-                    capture = {"pi_output_file": pi_log} if pi_log else {}
+                    capture = {"pi_bash": True, "pi_user": pi_user, "pi_output_file": pi_log} if pi_bash else {}
                     r = run_bash(cmd, cwd, to, merge_stderr=(se == "exec_background" or pi_bash),
                                  termination_code=termination_code, shell_env=plan.get("shell_env"), **capture)
-                    rec["shell_environment"] = "captured_path" if plan.get("shell_env") else "login_shell"
+                    rec["shell_environment"] = ("captured_path" if plan.get("shell_env") else
+                                                "nonlogin_shell" if pi_bash else "login_shell")
                     if r.get("termination_reproduced"):
                         rec["termination_reproduced"] = True
                     rec.update({"status": "timeout" if r["timeout"] else "ran", "rc": r["rc"], "dur_s": r["dur"],
@@ -536,7 +598,16 @@ def main():
                             if new.startswith("\ufeff"):
                                 new = new[1:]  # Pi's streaming TextDecoder strips the first BOM.
                             if pi_log:
-                                rec.update(pi_output_file=r["pi_output_file"], pi_output_sha256=r["pi_output_sha256"])
+                                rec.update(pi_output_file=r["pi_output_file"], pi_output_sha256=r["pi_output_sha256"],
+                                           pi_output_reader_uid=r["pi_output_reader_uid"])
+                                rec["pi_output_dimensions"] = {"totalBytes": len(new.encode()),
+                                                               "totalLines": new.count("\n") + int(bool(new) and not new.endswith("\n"))}
+                                historical = args.get("pi_historical_output") or {}
+                                actual = dict(rec["pi_output_dimensions"], sha256=rec["pi_output_sha256"])
+                                rec["pi_output_evidence"] = (
+                                    "historical_mismatch" if any(actual[k] != v for k, v in historical.items())
+                                    else "historical_sha256" if "sha256" in historical else
+                                    "historical_dimensions" if historical else "replay_hash_only")
                                 new = pi_truncated_view(a.get("orig_text"), new)
                             elif r["rc"] and not args.get("pi_timeout_status"):
                                 # The IR canonicalizes Pi's exit trailer to the Bash error prefix.
@@ -546,6 +617,10 @@ def main():
                                     f"Command timed out after {args['pi_timeout_status']} seconds")
                                 comparison_rc = None
                         rec["fidelity"] = compare(a.get("orig_text"), new, comparison_rc)
+                        if pi_log:
+                            rec["fidelity_scope"] = "displayed_observation"
+                            if rec["pi_output_evidence"] == "historical_mismatch":
+                                rec["fidelity"] = "pi_historical_output_mismatch"
                         if rec["fidelity"] in ("differs", "numbers_differ"):
                             rec["orig_head"] = (a.get("orig_text") or "")[:400]
                             rec["new_head"] = new[:400]

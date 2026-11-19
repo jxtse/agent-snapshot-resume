@@ -113,6 +113,74 @@ def check_codex_context(developer, user, artifacts):
         raise ValueError("unrecognized Codex resume environment or filesystem permissions")
 
 
+
+# Exact stock Pi 1.4.0 prompts from core/compaction/{compaction,utils}.js.
+PI_SUMMARY_SYSTEM = 'You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.\n\nDo NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.'
+PI_INSTRUCTIONS = {'summary': '9b00aa68df1a64279bc36e9093367f638701d48ec82e3d08436f65092a515f9b', 'update': '240c52982209146eae47d73c7172f6ba1dab60f44520bcb6a6ec1a883fef2ec7', 'turn_prefix': '7b0a15be5e0fdcce338ce7c1ef1fdd386faed258cc25d03915a05b05e7a6a183'}
+
+
+def single_text(content):
+    if isinstance(content, str):
+        return content
+    if (isinstance(content, list) and len(content) == 1 and isinstance(content[0], dict)
+            and set(content[0]) == {"type", "text"} and content[0]["type"] == "text"):
+        return content[0]["text"]
+    return None
+
+
+def pi_summary_parts(body):
+    """Return the serialized conversation and its exact wrapper for a pinned summary request."""
+    messages = body.get("messages") or []
+    if (not isinstance(messages, list) or len(messages) != 2 or not all(isinstance(m, dict) for m in messages)
+            or messages[0].get("role") not in ("system", "developer") or messages[1].get("role") != "user"
+            or body.get("tools")):
+        return None
+    if single_text(messages[0].get("content")) != PI_SUMMARY_SYSTEM:
+        return None
+    prompt = single_text(messages[1].get("content"))
+    if not isinstance(prompt, str):
+        return None
+    for opening, closing, kind in (("<conversation>\n", "\n</conversation>\n\n", "summary"),
+                                   ("# Conversation\n", "\n\n# Instructions\n", "turn_prefix")):
+        if not prompt.startswith(opening) or prompt.count(closing) != 1:
+            continue
+        transcript, suffix = prompt[len(opening):].split(closing)
+        instructions = suffix
+        if kind == "summary" and suffix.startswith("<previous-summary>\n"):
+            if suffix.count("\n</previous-summary>\n\n") != 1:
+                return None
+            instructions = suffix.split("\n</previous-summary>\n\n")[1]
+            kind = "update"
+        instructions = instructions.partition("\n\nAdditional focus: ")[0]
+        if text_hash(instructions) == PI_INSTRUCTIONS[kind]:
+            return opening, transcript, closing + suffix, kind
+    return None
+
+
+def native_request_metrics(body, spec):
+    wire = spec["wire"]
+    items = body[FIELDS[wire]]
+    parts = pi_summary_parts(body) if wire == "chat" else None
+    hints = list(spec.get("prior_hints") or [])
+    if spec.get("mode") == "hint" and spec.get("hint"):
+        hints.append(spec["hint"])
+    counts = []
+    for hint in hints:
+        if parts:
+            text = parts[1]
+            marker = "[User]: " + hint
+            matches = re.findall(r"(?:\A|\n\n)" + re.escape(marker) + r"(?=\Z|\n\n\[(?:User|Assistant|Assistant tool calls|Tool result)\]: )", text)
+            count = len(matches)
+        else:
+            count = sum(i == user_item(wire, hint) or (i.get("role") == "user" and single_text(i.get("content")) == hint)
+                        for i in items)
+        counts.append(count)
+    return {"wire": wire, "n_items": len(items), "hint_blocks": counts[-1] if counts else 0,
+            "hint_chain": [{"blocks": count} for count in counts],
+            "compaction_request": parts[3] if parts else None}
+
+
+
 def rewrite_native(body, spec, *, first=False):
     wire = spec["wire"]
     field = FIELDS[wire]
@@ -127,6 +195,23 @@ def rewrite_native(body, spec, *, first=False):
         content = item.get("content")
         return content == sentinel or content == [{"type": "text" if wire == "chat" else "input_text", "text": sentinel}]
 
+    parts = pi_summary_parts(body) if wire == "chat" and not first else None
+    if parts and sentinel in parts[1]:
+        opening, transcript, suffix, kind = parts
+        turns = transcript.split("\n\n")
+        marker = "[User]: " + sentinel
+        if turns.count(marker) != 1 or json.dumps(body, ensure_ascii=False).count(sentinel) != 1:
+            raise ValueError("unexpected Pi summary sentinel position")
+        index = turns.index(marker)
+        if ((index and not re.match(r"^\[(?:User|Assistant|Assistant tool calls|Tool result)\]: ", turns[0]))
+                or index + 1 < len(turns) and not re.match(r"^\[(?:User|Assistant|Assistant tool calls|Tool result)\]: ", turns[index+1])):
+            raise ValueError("unexpected Pi summary turn boundary")
+        hint = spec.get("mode") == "hint"
+        turns[index:index+1] = ["[User]: " + spec["hint"]] if hint else []
+        prompt = opening + "\n\n".join(turns) + suffix
+        content = prompt if isinstance(history[-1]["content"], str) else [{"type": "text", "text": prompt}]
+        return {**body, field: [history[0], {**history[1], "content": content}]}, [
+            "replace_summary_sentinel" if hint else "drop_summary_sentinel"]
     hits = [i for i, item in enumerate(history) if exact(item)]
     if any(sentinel in json.dumps(item, ensure_ascii=False) for item in history if not exact(item)):
         raise ValueError("resume sentinel appears outside an exact user turn")

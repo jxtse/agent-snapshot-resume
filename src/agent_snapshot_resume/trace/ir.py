@@ -29,36 +29,45 @@ SIDE_EFFECT_CLASSES = ["read_only", "file_write", "exec", "exec_background", "su
 
 # conservative read-only Bash heuristic: every pipeline segment starts with a whitelisted command,
 # no output redirection to files, no in-place flags, no command substitution writing files.
-_RO_CMDS = {"ls", "cat", "head", "tail", "wc", "grep", "egrep", "fgrep", "rg", "find", "pwd", "echo", "printf",
-            "which", "file", "stat", "du", "df", "nproc", "free", "uname", "whoami", "id", "env", "printenv",
-            "date", "sort", "uniq", "cut", "tr", "awk", "column", "diff", "cmp", "md5sum", "sha256sum", "tree",
-            "less", "more", "xxd", "od", "hexdump", "realpath", "dirname", "basename", "true", "nvidia-smi",
-            "ps", "top", "uptime", "lscpu", "type", "command", "test", "[", "jq", "readlink", "sleep", "cd",
-            "zcat", "gzip", "unzip", "tar", "h5dump", "ncdump", "strings", "nl", "seq", "lsof", "pgrep"}
-_RO_ARG_BLOCK = re.compile(r"(^|\s)(-delete|-exec|-execdir|-i\b|--in-place|-x\b|-c\b.*>|>)")
+_RO_CMDS = {"ls", "cat", "head", "tail", "wc", "grep", "egrep", "fgrep", "pwd", "echo",
+            "which", "stat", "du", "df", "nproc", "free", "uname", "whoami", "id", "printenv",
+            "cut", "tr", "cmp", "md5sum", "sha256sum", "od", "realpath", "dirname", "basename",
+            "true", "uptime", "type", "test", "[", "readlink", "sleep", "zcat", "strings", "nl", "seq"}
 
 
 def bash_is_read_only(cmd: str) -> bool:
-    if not cmd or "<<" in cmd or re.search(r"(?<![<>&0-9])>(?!&)|>>|\btee\b", cmd.replace("2>&1", "").replace(">/dev/null", "").replace("> /dev/null", "").replace("2>/dev/null", "")):
+    """Classify ordinary probes. Retain commands with ambiguous shell syntax or writing options."""
+    if not cmd or re.search(r"[$\x60<>(){}\\!#]|(?<!&)&(?!&)", cmd):
         return False
-    segs = re.split(r"\|\||&&|;|\||\n", cmd)
-    for s in segs:
-        s = s.strip()
-        if not s:
-            continue
-        s = re.sub(r"^(\w+=\S+\s+)+", "", s)  # env assignments
+    for segment in re.split(r"&&|\|\||[;|\n]", cmd.strip()):
         try:
-            tok = shlex.split(s)[0]
-        except (ValueError, IndexError):
+            words = shlex.split(segment)
+        except ValueError:
             return False
-        tok = os.path.basename(tok)
-        if tok not in _RO_CMDS:
+        if not words:
             return False
-        if tok in ("tar", "unzip", "gzip") and not re.search(r"\s-(t|l|tf|tzf|tvf)\b|--list|\s-l\b|\s-c\b", s):
+        exe, *args = words
+        name = os.path.basename(exe)
+        if exe not in (name, "/bin/" + name, "/usr/bin/" + name):
             return False
-        if tok == "find" and re.search(r"-delete|-exec|-execdir|-fprint", s):
+        if name not in _RO_CMDS and any(re.search(r"[*?\[]", arg) for arg in args):
             return False
-        if tok == "awk" and re.search(r"system\(|print\s*>", s):
+        if name == "sort":
+            if any(v.startswith("-") and not re.fullmatch(r"--?|-[bdfghinMnrRsuV]+", v) for v in args):
+                return False
+        elif name == "uniq":
+            if sum(not v.startswith("-") for v in args) > 1 or any(
+                    v.startswith("-") and not re.fullmatch(r"-[cdiu]+", v) for v in args):
+                return False
+        elif name == "rg":
+            if any(v.startswith("-") and not re.fullmatch(r"-[inlovcFHwS]+|--files|--no-heading", v)
+                   for v in args):
+                return False
+        elif name == "find":
+            if any(v.startswith("-") and v not in {"-name", "-iname", "-type", "-maxdepth", "-mindepth",
+                                                   "-print", "-print0", "-size", "-mtime"} for v in args):
+                return False
+        elif name not in _RO_CMDS:
             return False
     return True
 

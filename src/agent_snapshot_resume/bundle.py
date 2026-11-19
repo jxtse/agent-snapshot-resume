@@ -369,6 +369,9 @@ def build(*, adapter, trial_dir: Path, atif_step: int | None, out: Path, mode: s
         atif_step = step_for_cut_line(ir, int(cut_line), lambda i: adapter.cut_line(raw_lines, ir, i))
     k = trace_ir.step_index(ir, atif_step)
     st = ir["steps"][k]
+    if model and getattr(adapter, "wire", None):
+        adapter.validate_model(dict(native_model=st.get("native_model") or ir.get("model"),
+                                    native_provider=st.get("native_provider") or ir.get("provider")), model)
     if st["source"] != "agent":
         raise SystemExit("resume step must be an agent step")
     prev = ir["steps"][k - 1]

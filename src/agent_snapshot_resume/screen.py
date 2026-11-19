@@ -176,7 +176,7 @@ def screen_plan(plan: dict[str, Any], rp: dict[str, Any] | None = None, *, n_com
 
 def screen_trial(adapter, trial_dir: Path, *, cut_lines: list[int] | None = None, steps: list[int] | None = None,
                  agent_timeout_s: float | None = None, task_dir: Path | None = None,
-                 ir: dict[str, Any] | None = None, policy: str = "strict") -> list[dict[str, Any]]:
+                 ir: dict[str, Any] | None = None, policy: str = "strict", allow_incomplete_evidence: bool = False) -> list[dict[str, Any]]:
     from . import parity
     from .bundle import plan_with_observations, resolve_agent_timeout, step_for_cut_line
     trial_dir = Path(trial_dir)
@@ -205,6 +205,14 @@ def screen_trial(adapter, trial_dir: Path, *, cut_lines: list[int] | None = None
             loc = parity.locate_request(ir, k, reqs)
         rep = screen_plan(plan, rps.get(k), n_compactions=n_comp, orig_request=loc.get("record"),
                           policy=policy)
+        if reqs is None:
+            from .proxy.native_wire import envelope_only_gap
+            content = (ref or {}).get("content") or {}
+            if not (content.get("wire") == adapter.wire and (content.get("complete") is True or
+                    (allow_incomplete_evidence and envelope_only_gap(content)))):
+                rep["verdict"] = BLOCK
+                rep["counts"][BLOCK] += 1
+                rep["risks"].append({"rule": "incomplete_evidence", "severity": BLOCK})
         rep.update(trial=trial_dir.name, atif_step=sid, cut_line=adapter.cut_line(raw, ir, k),
                    step_first_line=ir["steps"][k]["line_range"][0],
                    elapsed_s=ir["steps"][k].get("elapsed_s"), remaining_s=ir["steps"][k].get("remaining_s"),

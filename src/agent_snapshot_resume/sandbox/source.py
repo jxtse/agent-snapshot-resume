@@ -111,21 +111,23 @@ def _write_in_parts(sbx, remote: str, data: bytes, part: int = 8 * 1024 * 1024) 
         raise RuntimeError(f"part upload of {remote} produced an empty file")
 
 
-def dispatch_replay(sbx, cwd: str, exec_cap: int, replay_deadline_s: int = REPLAY_DEADLINE_S) -> int:
+def dispatch_replay(sbx, cwd: str, exec_cap: int, replay_deadline_s: int = REPLAY_DEADLINE_S, pi_user=None) -> int:
     """Start the replay exactly once in SDK background mode; completion is signalled by an atomic rc file.
 
     The replay runs in a LOGIN shell, as the original agent's shell did (Harbor's task healthcheck installs the
     task's environment through /etc/profile.d/*.sh). A plain `bash -c` inherits only the image's ENV PATH, whose
     first entry is typically the base conda environment, so a task whose image selects another env replays with the
     wrong interpreter (e.g. /opt/conda/bin/python3 without numpy instead of /opt/conda/envs/stereo/bin/python3)."""
+    user_arg = "" if pi_user is None else " --pi-user " + shlex.quote(str(pi_user))
     command = (f'cd {shlex.quote(cwd)} && timeout -s TERM -k 10s {int(replay_deadline_s)}s '
                f'python3 {REPLAY_DIR}/replay_inside.py {REPLAY_DIR}/plan.json '
-               f'{REPLAY_DIR}/replay_report.json --exec-cap {int(exec_cap)} '
+               f'{REPLAY_DIR}/replay_report.json --exec-cap {int(exec_cap)}{user_arg} '
                f'> {REPLAY_DIR}/replay_stdout.log 2>&1; rc=$?; '
                f'printf "%s\\n" "$rc" > {REPLAY_DIR}/rc.tmp; '
                f'mv {REPLAY_DIR}/rc.tmp {REPLAY_DIR}/rc')
     # One dispatch only. SDK-background detaches the process; a shell '&' did not.
-    return sbx.commands.run(f'bash -lc {shlex.quote(command)}', user='root', background=True, timeout=0).pid
+    shell = "/bin/bash -c" if pi_user is not None else "bash -lc"
+    return sbx.commands.run(f'{shell} {shlex.quote(command)}', user='root', background=True, timeout=0).pid
 
 
 def retain_for_audit(requested: bool, plan: dict, report: dict, rc) -> bool:
@@ -394,7 +396,11 @@ print(json.dumps({"killed": killed}))
             run(sbx, "mkdir -p " + shlex.quote(str(Path(sess_path).parent)))
             _write_in_parts(sbx, sess_path, transcript_prefix(meta, bundle))
         cwd = meta.get("initial_cwd") or meta.get("cwd") or "/app"
-        rec["replay_pid"] = dispatch_replay(sbx, cwd, exec_cap, replay_deadline_s)
+        replay_options = {}
+        if meta.get("agent") == "pi":
+            agent_settings = tomllib.loads((task_dir / "task.toml").read_text()).get("agent", {})
+            replay_options["pi_user"] = agent_settings.get("user", "root")
+        rec["replay_pid"] = dispatch_replay(sbx, cwd, exec_cap, replay_deadline_s, **replay_options)
         step("replay_dispatched_once", t, pid=rec["replay_pid"])
         while True:
             time.sleep(15)

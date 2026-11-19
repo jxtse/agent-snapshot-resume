@@ -249,7 +249,8 @@ def cmd_screen(a):
     from . import screen
     reps = screen.screen_trial(_adapter(a.agent), Path(a.trial_dir), cut_lines=a.cut_line, steps=a.step,
                                agent_timeout_s=a.agent_timeout,
-                               task_dir=Path(a.task_dir) if a.task_dir else None, policy=a.replay_policy)
+                               task_dir=Path(a.task_dir) if a.task_dir else None, policy=a.replay_policy,
+                               allow_incomplete_evidence=a.allow_incomplete_evidence)
     print(screen.main_json(reps, a.full))
     if a.out:
         Path(a.out).write_text(json.dumps(reps, ensure_ascii=False, indent=1))
@@ -496,6 +497,8 @@ def build_parser():
     p.add_argument("--out", help="write the full reports as JSON")
     p.add_argument("--replay-policy", choices=["strict", "lenient"], default="strict",
                    help="lenient treats pace-dependent reads of finished background jobs as a warning, not a block")
+    p.add_argument("--allow-incomplete-evidence", action="store_true",
+                   help="allow a Codex projection with only the original envelope missing")
     p.set_defaults(fn=cmd_screen)
 
     p = sub.add_parser("parity", help="first rewritten request vs the original run's request at the cut")

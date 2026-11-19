@@ -11,6 +11,11 @@ from .base import AgentAdapter, SnapshotResumeAgentMixin, bounded_remote_command
 class NativeAdapter(AgentAdapter):
     resume_artifacts = {"prompt": "sentinel_user_message"}
 
+    @staticmethod
+    def validate_model(meta, model):
+        if model and model not in (meta.get("native_model"), f"{meta.get('native_provider')}/{meta.get('native_model')}"):
+            raise ValueError("model override conflicts with the native bundle model")
+
     def session_relative_path(self, meta):
         relative = Path(meta["session_relpath"])
         if (".." in relative.parts or relative.is_absolute() or relative.suffix != ".jsonl"
@@ -82,8 +87,9 @@ def align_atif_step_ids(trial, steps, call_ids, sources):
     for step, calls, source in zip(steps, call_ids, sources):
         ids = set().union(*(by_call[c] for c in calls))
         if not ids:
-            matches = by_message.get((source, step["timestamp"])) or []
-            ids.update(matches)
+            timestamp = step.get("atif_message_timestamp", step["timestamp"])
+            if timestamp:
+                ids.update(by_message.get((source, timestamp), []))
         candidates.append(ids)
     owners = Counter(i for ids in candidates for i in ids)
     for step, ids in zip(steps, candidates):
@@ -107,7 +113,18 @@ class NativeResumeMixin(SnapshotResumeAgentMixin):
 
     async def run(self, instruction, environment, context):
         bundle, meta = self._bundle()
+        self.adapter.validate_model(meta, getattr(self, "model_name", None))
         self.adapter.sanity_check_bundle(bundle, meta)
+        if self.adapter.name == "pi":
+            plan = json.loads((bundle / "plan.json").read_bytes())
+            for action in plan["actions"]:
+                path = action["args"].get("pi_output_file")
+                if path:
+                    quoted = shlex.quote(path)
+                    # The source records the digest and the clone gate checks it as root.
+                    # Also prove this exact private file can be opened by Harbor's actual agent user.
+                    await self.exec_as_agent(environment, command=(
+                        f'test "$(stat -c %u:%a {quoted})" = "$(id -u):600" && sha256sum {quoted} >/dev/null'))
         env, remote, args, config_path, config = self.adapter.resume_setup(meta, self._resume_base_url(meta["run_id"]))
         dirs = {str(Path(remote).parent), str(Path(config_path).parent)}
         await self.exec_as_agent(environment, command="mkdir -p " + shlex.join(sorted(dirs)), env=env)

@@ -12,8 +12,8 @@ from harbor.models.trajectories import FinalMetrics
 
 from ..proxy.native_wire import digest
 from ..proxy.runtime import fetch
-from ..trace.ir import bash_is_read_only
-from .native import NativeAdapter, NativeOptions, NativeResumeMixin
+from ..trace.ir import _ts, bash_is_read_only
+from .native import align_atif_step_ids, NativeAdapter, NativeOptions, NativeResumeMixin
 
 
 CATALOG_SHA256 = "b7d04bd6ed29640ac4a80cd6ffbda125d94dd5f8ccb95d29721099d4118ec873"
@@ -126,9 +126,13 @@ def tool_action(payload, cwd):
     return name, args, "other", cwd
 
 
-def decode_output(output):
+def decode_output(output, *, custom=None):
     if not isinstance(output, str):
         return json.dumps(output, ensure_ascii=False), None, None, None
+    if custom is not False:
+        header = re.match(r"\AExit code: (-?\d+)\nWall time: (\d+(?:\.\d+)?)(?: seconds)?\nOutput:\n", output)
+        if header:
+            return output[header.end():], int(header[1]), None, float(header[2])
     if output.startswith("Chunk ID:"):
         marker = re.search(r"(?m)^(?:Final output|Output):(?:\n|$)", output)
         if marker:
@@ -192,12 +196,14 @@ class CodexAdapter(NativeAdapter):
                 continue
             if subtype == "message" and p["role"] in ("developer", "system", "user"):
                 current = None
-                steps.append(dict(source="user", line_range=[i], timestamp=ts,
+                steps.append(dict(source="user", atif_source={"developer": "system"}.get(p["role"], p["role"]), line_range=[i], timestamp=ts,
                                   events=[dict(type="user_text", text=p["content"])]))
                 continue
             if subtype in ("function_call_output", "custom_tool_call_output"):
                 event, step = calls[p["call_id"]]
-                text, rc, session_id, duration = decode_output(p["output"])
+                text, rc, session_id, duration = decode_output(p["output"], custom=subtype == "custom_tool_call_output")
+                if subtype == "custom_tool_call_output" and event["tool"] == "Bash" and rc is not None:
+                    event["args"]["codex_exit_code"] = rc
                 if rc not in (None, 0) and event["tool"] == "Bash":
                     text = f"Exit code {rc}\n" + text
                 event.update(is_error=rc != 0 if rc is not None else None, duration_s=duration)
@@ -215,7 +221,7 @@ class CodexAdapter(NativeAdapter):
                                            timestamp=ts, is_error=event["is_error"]))
                 continue
             if current is None:
-                current = dict(source="agent", timestamp=ts, line_range=[i], events=[],
+                current = dict(source="agent", timestamp=ts, atif_message_timestamp=None, line_range=[i], events=[],
                                native_model=model, native_cwd=cwd, native_effort=context.get("effort"),
                                native_sandbox_mode=recorded_sandbox_mode(context))
                 steps.append(current)
@@ -225,39 +231,31 @@ class CodexAdapter(NativeAdapter):
                              call_id=p["call_id"], line=i, timestamp=ts)
                 calls[p["call_id"]] = event, current
             elif subtype in ("message", "reasoning"):
+                if subtype == "message":
+                    current["atif_message_timestamp"] = current["atif_message_timestamp"] or ts
                 event = dict(type="assistant_text" if subtype == "message" else "assistant_reasoning",
                              text="\n".join(b.get("text", "") for b in p.get("content") or []))
             else:
                 raise ValueError(f"unsupported Codex response item {subtype!r}")
             current["events"].append(event)
-        atif = trial / "agent/trajectory.json"
-        if atif.is_file():
-            # Harbor can omit a reasoning-only response. Bind steps by exact tool ids or message timestamp.
-            exported = json.loads(atif.read_text())["steps"]
-            by_call = {c["tool_call_id"]: s["step_id"] for s in exported for c in s.get("tool_calls", [])}
-            by_message = {}
-            for s in exported:
-                by_message.setdefault((s["source"], s.get("timestamp")), []).append(s["step_id"])
-            for step in steps:
-                ids = {by_call[e["call_id"]] for e in step["events"] if e["type"] == "tool_call"
-                       and e["call_id"] in by_call}
-                if not ids:
-                    i = step["line_range"][0]
-                    while i < len(rows):
-                        row = rows[i]
-                        p = row["payload"]
-                        if row["type"] == "response_item" and p["type"] == "message":
-                            src = {"assistant": "agent", "developer": "system"}.get(p["role"], p["role"])
-                            matches = by_message.get((src, row["timestamp"]), [])
-                            if matches:
-                                ids.add(matches.pop(0))
-                            break
-                        if row["type"] == "event_msg" and p.get("type") == "token_count":
-                            break
-                        i += 1
-                step["atif_step_id"] = ids.pop() if len(ids) == 1 else None
+        flags = align_atif_step_ids(
+            trial, steps, [[e["call_id"] for e in st["events"] if e["type"] == "tool_call"] for st in steps],
+            [st.get("atif_source", st["source"]) for st in steps])
+        records = self.request_records(trial)
+        for st in steps:
+            if st["source"] != "agent":
+                continue
+            hits, _ = self.match_records(records, st, header["id"])
+            if len(hits) == 1 and hits[0][1].get("ts"):
+                value = hits[0][1]["ts"]
+                try:
+                    ts = float(value) if type(value) in (float, int) else _ts(value)
+                except (TypeError, ValueError, AttributeError):
+                    continue
+                if ts is not None and math.isfinite(ts) and ts <= _ts(st["timestamp"]):
+                    st["request_start_s"] = max(ts, _ts(rows[0]["timestamp"]))
         return self.trace(path, trial, rows, header["id"], header["cwd"], self.version, steps, agent_timeout_s,
-                          task=task, reward=reward, model=model, provider=header["model_provider"])
+                          flags=flags, task=task, reward=reward, model=model, provider=header["model_provider"])
 
     def cut_line(self, raw_lines, ir, k_index):
         cut = super().cut_line(raw_lines, ir, k_index)
@@ -271,32 +269,43 @@ class CodexAdapter(NativeAdapter):
                 break
         return cut
 
-    def native_reference(self, trial, ir, k, prefix):
-        if (trial / "agent/model-proxy/native-reference.jsonl").exists():
-            return super().native_reference(trial, ir, k, prefix)
-        usage = ir["steps"][k].get("usage") or {}
-        records = [json.loads(line) for p in sorted((trial/"agent/model-proxy").glob("requests-*.jsonl"))
-                   for line in p.read_text().splitlines()]
-        entry = ir["steps"][k].get("message_id")
-        model = ir["steps"][k]["native_model"]
-        identities = {"session": ir["session_id"], "session_id": ir["session_id"], "thread_id": ir["session_id"],
+    @staticmethod
+    def request_records(trial):
+        return [json.loads(line) for p in sorted((trial/"agent/model-proxy").glob("requests-*.jsonl"))
+                for line in p.read_text().splitlines() if line.strip()]
+
+    @staticmethod
+    def match_records(records, step, session_id):
+        usage = step.get("usage") or {}
+        entry = step.get("message_id")
+        model = step.get("native_model")
+        identities = {"session": session_id, "session_id": session_id, "thread_id": session_id,
                       "response_id": entry, "entry_id": entry, "model": model}
         records = [(i, row) for i, row in enumerate(records)
                    if all(not row.get(key) or expected is None or row[key] == expected
                           for key, expected in identities.items())]
-        captured = [(i, r["native_reference"]) for i, r in records
-                    if entry and r.get("entry_id") == entry and r.get("session_id") == ir["session_id"]
-                    and r.get("status") == 200 and r.get("native_reference")]
+        captured = [(i, r) for i, r in records if entry and r.get("entry_id") == entry
+                    and r.get("session_id") == session_id and r.get("status") == 200 and r.get("native_reference")]
         if captured:
-            if len(captured) != 1:
-                return None, "ambiguous captured Codex request"
-            i, ref = captured[0]
-            if ref.get("wire") != self.wire or ref.get("complete") is not True:
-                return None, "invalid captured Codex reference"
-            return dict(index=i, method="captured-entry-id", content=ref), None
+            return captured, True
         keys = ("input_tokens", "output_tokens")
         hits = [(i, r) for i, r in records if r.get("status") == 200 and
                 all(usage.get(key) is not None and usage[key] == (r.get("usage") or {}).get(key) for key in keys)]
+        return hits, False
+
+    def native_reference(self, trial, ir, k, prefix):
+        if (trial / "agent/model-proxy/native-reference.jsonl").exists():
+            return super().native_reference(trial, ir, k, prefix)
+        model = ir["steps"][k]["native_model"]
+        hits, captured = self.match_records(self.request_records(trial), ir["steps"][k], ir["session_id"])
+        if captured:
+            if len(hits) != 1:
+                return None, "ambiguous captured Codex request"
+            i, record = hits[0]
+            ref = record["native_reference"]
+            if ref.get("wire") != self.wire or ref.get("complete") is not True:
+                return None, "invalid captured Codex reference"
+            return dict(index=i, method="captured-entry-id", content=ref), None
         if len(hits) != 1:
             return None, "no unique Codex usage match"
         index, record = hits[0]

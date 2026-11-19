@@ -921,7 +921,7 @@ async def handle(request):
         rec.update({"n": n, "model": nd.get("model"), "n_messages_in": len(d.get("messages") or []),
                     "n_messages_out": len(nd.get("messages") or []), "actions": acts, "bytes": len(out_body)})
         if wire:
-            rec.update(wire=wire, n_items=len(nd[native_wire.FIELDS[wire]]))
+            rec.update(native_wire.native_request_metrics(nd, spec))
         else:
             rec.update(request_fingerprint(nd, spec))
         if any(isinstance(a, str) and a.startswith("reinject_hint_after_compaction") for a in acts):

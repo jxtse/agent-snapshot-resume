@@ -196,6 +196,11 @@ def build_job_config(*, adapter, bundle: Path, task_dir: Path, job_name: str, jo
     bundle, meta = load_bundle(bundle)
     bundle = bundle.resolve()
     task_dir = task_dir.resolve()
+    requested_model = model or config.model_override()
+    if getattr(adapter, "wire", None):
+        native_model = meta.get("native_model")
+        adapter.validate_model(meta, requested_model)
+        requested_model = requested_model or native_model
     if not (task_dir / "task.toml").is_file():
         raise SystemExit(f"{task_dir} is not a Harbor task dir (no task.toml)")
     env_kwargs: dict[str, Any] = {"owner": config.owner_tag(), "job": job_name}
@@ -257,7 +262,7 @@ def build_job_config(*, adapter, bundle: Path, task_dir: Path, job_name: str, jo
         from .proxy.runtime import validate_passthrough_args
         kwargs["passthrough_args"] = validate_passthrough_args(passthrough_args)
     agent: dict[str, Any] = {"import_path": adapter.harbor_import_path,
-                             "model_name": model or config.model_override() or meta.get("model"),
+                             "model_name": requested_model or meta.get("model"),
                              "override_timeout_sec": float(meta["agent_budget_s"]),
                              "override_setup_timeout_sec": float(setup_timeout_s), "kwargs": kwargs, "env": agent_env}
     if not fake:
