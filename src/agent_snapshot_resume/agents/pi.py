@@ -172,8 +172,13 @@ class PiAdapter(NativeAdapter):
             version = version_file.read_text().strip()
         if version != self.version:
             raise ValueError("record the pinned Pi CLI version in agent/pi/version.txt")
+        from .native import align_atif_step_ids
+        flags = align_atif_step_ids(
+            trial, steps, [[e["call_id"] for e in s["events"] if e["type"] == "tool_call"] for s in steps],
+            [s["source"] if s["source"] == "agent" else "user" for s in steps])
         return self.trace(path, trial, records, header["id"], header["cwd"], version, steps, agent_timeout_s,
-                          task=task, reward=reward, model=model, provider=provider, abandoned_effects=abandoned_effects)
+                          flags=flags, task=task, reward=reward, model=model, provider=provider,
+                          abandoned_effects=abandoned_effects)
 
     def cut_line(self, raw_lines, ir, k_index):
         parent = ir["steps"][k_index]["cut_parent"]

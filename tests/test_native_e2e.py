@@ -355,3 +355,32 @@ def test_pi_bash_truncation_rendering_matches_pi_1_4_0():
     assert ri.compare(orig, ri.pi_truncated_view(orig, full), 0) == "exact"
     assert ri.pi_truncated_view("plain", full) == full  # untouched without Pi's footer
     assert ri.compare(orig, ri.pi_truncated_view(orig, full.replace("line 03999", "line 0399X")), 0) != "exact"
+
+
+def test_pi_steps_follow_harbor_atif_ids(tmp_path):
+    """With agent/trajectory.json, Pi step ids come from the export, never from position (Codex review P1)."""
+    import json as _json
+    import shutil
+    import pytest
+    from agent_snapshot_resume.agents.pi import PiAdapter
+    fixture = Path(__file__).resolve().parents[1] / "examples/fixtures/pi-native-trial"
+    trial = tmp_path / "trial"
+    shutil.copytree(fixture, trial)
+    a = PiAdapter()
+    positional = a.load_trace(trial, 3600)
+    assert "atif_missing_step_ids_positional" in positional["flags"]
+    steps = positional["steps"]
+    agent = [s for s in steps if s["source"] == "agent"]
+    # Harbor export that drops the first agent step and numbers the rest non-positionally.
+    exported = []
+    for n, s in enumerate(agent[1:], start=100):
+        calls = [dict(tool_call_id=e["call_id"]) for e in s["events"] if e["type"] == "tool_call"]
+        exported.append(dict(step_id=n, source="agent", timestamp=s["timestamp"], tool_calls=calls))
+    (trial / "agent/trajectory.json").write_text(_json.dumps({"steps": exported}))
+    ir = a.load_trace(trial, 3600)
+    got = {s["line_range"][0]: s["atif_step_id"] for s in ir["steps"] if s["source"] == "agent"}
+    assert got[agent[0]["line_range"][0]] is None  # dropped by the export: refused, not guessed
+    for n, s in enumerate(agent[1:], start=100):
+        assert got[s["line_range"][0]] == n
+    assert any(f.startswith("atif_unbound_steps:") for f in ir["flags"])
+    assert "atif_missing_step_ids_positional" not in ir["flags"]

@@ -43,17 +43,47 @@ class NativeAdapter(AgentAdapter):
             return None, "no unique complete captured request for this native entry"
         return dict(content=refs[0], method="captured-entry-id", index=k), None
 
-    def trace(self, path, trial, records, sid, cwd, version, steps, timeout, **fields):
+    def trace(self, path, trial, records, sid, cwd, version, steps, timeout, flags=None, **fields):
         start = records[0]["timestamp"]
+        flags = list(flags or [])
+        if not (trial / "agent/trajectory.json").is_file() and any("atif_step_id" not in s for s in steps):
+            # No Harbor ATIF export: the 1-based position of each step is its id (as for Claude Code).
+            flags.append("atif_missing_step_ids_positional")
         for i, step in enumerate(steps):
             elapsed = round(_ts(step["timestamp"]) - _ts(start), 3)
             step.update(index=i, elapsed_s=elapsed, remaining_s=timeout-elapsed)
             step.setdefault("atif_step_id", i+1)
             step["line_range"].append(steps[i+1]["line_range"][0] if i+1 < len(steps) else len(records))
         return dict(trial=trial.name, session_id=sid, cwd=cwd, project_slug=cwd.replace("/", "-"),
-                    cc_version=version, start_ts=start, flags=[], sidechains=[], steps=steps,
+                    cc_version=version, start_ts=start, flags=flags, sidechains=[], steps=steps,
                     sources=dict(session_jsonl=str(path.relative_to(trial)), session_sha256=_sha256(path)),
                     **fields)
+
+
+def align_atif_step_ids(trial, steps, call_ids, sources):
+    """Bind native steps to Harbor ATIF step ids when ``agent/trajectory.json`` exists.
+
+    A step is bound by the ATIF step that owns its tool call ids, else by (source, timestamp). An unbound or ambiguous
+    step gets ``atif_step_id = None`` so ``bundle --step`` refuses it instead of resolving to a positional guess.
+    ``call_ids[i]`` lists step i's tool call ids; ``sources[i]`` is its ATIF source. Returns flags."""
+    atif = trial / "agent/trajectory.json"
+    if not atif.is_file():
+        return []
+    exported = json.loads(atif.read_text()).get("steps") or []
+    by_call = {c["tool_call_id"]: s["step_id"] for s in exported for c in s.get("tool_calls") or []}
+    by_message = {}
+    for s in exported:
+        by_message.setdefault((s.get("source"), s.get("timestamp")), []).append(s["step_id"])
+    unbound = 0
+    for step, calls, source in zip(steps, call_ids, sources):
+        ids = {by_call[c] for c in calls if c in by_call}
+        if not ids:
+            matches = by_message.get((source, step["timestamp"])) or []
+            if len(matches) == 1:
+                ids = {matches[0]}
+        step["atif_step_id"] = ids.pop() if len(ids) == 1 else None
+        unbound += step["atif_step_id"] is None
+    return [f"atif_unbound_steps:{unbound}"] if unbound else []
 
 
 class NativeResumeMixin(SnapshotResumeAgentMixin):
